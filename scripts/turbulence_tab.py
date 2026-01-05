@@ -1,9 +1,9 @@
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread, Signal, QMetaObject
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread, Signal, QMetaObject, Q_ARG
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QWidget,
     QLabel, QFrame,
     QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
-    QListWidget, QSpinBox
+    QListWidget, QSpinBox, QTableWidget, QTableWidgetItem
 )
 
 import json
@@ -11,11 +11,12 @@ from pathlib import Path
 
 import scripts.utilities as ut
 from scripts.config_table import Config_table
-from scripts.pgcanvas import PGCanvas
-from scripts.wrap_tab import WrappedTabs
-from scripts.utilities import PhaseMap_tools
+from scripts.pgcanvas import PGCanvas, PGCanvasWithBoxes
+from scripts.wrap_tab import WrappedTabs, DetachableTabWidget
+from scripts.utilities import PhaseMap_tools, WFSensor_tools, Pupil_tools
 from scripts.worker import FrameWorker
 
+from pyqtgraph import ImageItem
 import cupy as cp
 import queue
 
@@ -23,7 +24,10 @@ class Turbulence_tab(QWidget):
 
     def __init__(self, config_dict):
         super().__init__()
+        
+        self.current_sensor = None
         self.params = config_dict
+        self.sensors = {}
 
         self.available_funcs = {
             "AOtools InfiniteKolmogorov": PhaseMap_tools.generate_phase_map
@@ -44,23 +48,43 @@ class Turbulence_tab(QWidget):
         # initalize tab/page for each loaded screen
         self.turbPages = []
         for i, screen in enumerate(self.turbulence_screens):
-            turbPage = TurbulencePage(screen["function"], screen["data"], screen["name"])
+            turbPage = TurbulencePage(screen["function"], screen["data"], self.params, screen["name"])
             self.turbPages.append(turbPage)
 
         main_layout = QHBoxLayout(self)
 
         # left -- final psf viewer
-        left_layout = QVBoxLayout()
-        fleft = QFrame()
-        fleft.setFrameShape(QFrame.Box)
-        fleft.setLineWidth(1)
-        left_lay1 = QVBoxLayout(fleft)
-        self.total_canvas = PGCanvas()
 
-        left_lay1.addWidget(self.total_canvas)
-        left_lay1.addWidget(QLabel("Placeholder"))
+        left_frame = QFrame()
+        left_frame.setFrameShape(QFrame.Box)
+        left_frame.setLineWidth(1)
 
-        left_layout.addWidget(fleft)
+
+        left_layout = QVBoxLayout(left_frame)
+        self.sensor_tabs = DetachableTabWidget()
+        self.sensor_tabs.setMovable(True)
+        self.sensor_tabs.currentChanged.connect(lambda idx: setattr(self, "current_sensor", self.sensor_tabs.widget(idx).sensor))
+        self.sensor_tabs.currentChanged.connect(lambda idx: self.plot_active())
+
+        self.sensor_tab_list = {}
+        
+
+        left_layout.addWidget(self.sensor_tabs)
+
+        
+        corr_layout = QVBoxLayout()
+
+        self.image_corr = QLabel("WFS Science Image correlation: Loading")
+        corr_layout.addWidget(self.image_corr)
+
+        N = max(1,len(self.sensors))
+        self.corr_table = QTableWidget(N, N)
+        for i in range(N):
+            for j in range(N):
+                self.corr_table.setItem(i, j, QTableWidgetItem("0.00"))
+        corr_layout.addWidget(self.corr_table)
+
+        left_layout.addLayout(corr_layout)
 
         func_sel_layout = QHBoxLayout()
 
@@ -79,7 +103,7 @@ class Turbulence_tab(QWidget):
 
         left_layout.addLayout(func_sel_layout)
 
-        main_layout.addLayout(left_layout)
+        main_layout.addWidget(left_frame)
 
         # middle -- layered turbulence viewer
         fmiddle = QFrame()
@@ -144,6 +168,7 @@ class Turbulence_tab(QWidget):
         # Add tabs
         for i, page in enumerate(self.turbPages):
             self.tab_widget.add_tab(page)
+            page.screen_params_changed.connect(lambda pm: self.update_sensor_tabs(self.sensors))
 
         right_top_layout.addWidget(self.tab_widget)
 
@@ -151,6 +176,33 @@ class Turbulence_tab(QWidget):
         main_layout.addLayout(right_layout)
 
         QTimer.singleShot(0, self.start_turbulence_worker)
+
+    @Slot(dict)
+    def update_sensor_tabs(self, sensors):
+        if sensors != self.sensors:
+            self.sensors = sensors
+
+        max_angle = 0.0
+        for name, sensor in sensors.items():
+            if self.sensor_tab_list.get(sensor) is None:
+                tab = sensor_psf(sensor, None)
+
+                self.sensor_tab_list[sensor] = tab
+                self.sensor_tabs.addTab(tab, name) 
+
+            sen_angle = sensor.sen_angle
+            if max_angle < sen_angle:
+                max_angle = sen_angle
+
+        for turb_tab in self.turbPages:
+            extra = self.calc_extra_phase_pad(turb_tab, max_angle)
+            turb_tab.set_extra_grid_size(int(extra.get()))
+
+    def calc_extra_phase_pad(self, turb_tab, sensor_angle):
+        return cp.ceil(cp.tan(sensor_angle) * turb_tab.params.get("altitude") / (self.params.get("telescope_diameter")/self.params.get("grid_size")))
+        
+        
+          
 
     def load_turb(self, func):
         content = None
@@ -163,9 +215,25 @@ class Turbulence_tab(QWidget):
                 content_name = file_path.stem
                 content_data = {k: v for k, v in content.items() if k != "function"}
 
-        page = TurbulencePage(self.available_funcs[content["function"]], content_data, content_name)
+        page = TurbulencePage(self.available_funcs[content["function"]], content_data, self.params, content_name)
 
         page = self.check_dup(page)
+
+        max_angle = 0.0
+        for name, sensor in self.sensors.items():
+            if self.sensor_tab_list.get(sensor) is None:
+                tab = sensor_psf(sensor, None)
+
+                self.sensor_tab_list[sensor] = tab
+                self.sensor_tabs.addTab(tab, name) 
+
+            sen_angle = sensor.sen_angle
+            if max_angle < sen_angle:
+                max_angle = sen_angle
+
+        extra = self.calc_extra_phase_pad(page, max_angle)
+        page.set_extra_grid_size(int(extra.get()))
+
         self.turbulence_screens.append({"name": page.title, "data": page.params, "function": page.function})
         
         self.turbPages.append(page)
@@ -216,10 +284,10 @@ class Turbulence_tab(QWidget):
         thread.started.connect(worker.step) # initialize threads/pages on startup
 
         page._worker = worker
+
         page._thread = thread
         self._threads.append((thread, worker))
-
-   
+ 
     # update pages and layered screen viewer when threads finish
     def _process_frames(self):
         updated = False
@@ -227,6 +295,8 @@ class Turbulence_tab(QWidget):
         while not self._frame_queue.empty():
             page, frame = self._frame_queue.get()
             page.current_screen = frame
+            page.grid_size_display.setText(str(page.params.get("grid_size")))
+
 
             updated = True
 
@@ -242,18 +312,74 @@ class Turbulence_tab(QWidget):
                     item.current_screen for item in self.turb_selector.active_items()
                     if hasattr(item, "current_screen")
                  ]
-        active = cp.asarray(active)
-        return cp.sum(active, axis=0)
+        return active
+    
+    def get_active_pages(self):
+        active = [
+                    item for item in self.turb_selector.active_items()
+                    if hasattr(item, "current_screen")
+                 ]
+        return active
     
     def plot_active(self):
-        total_active = self.get_active_screens()
-        self.active_canvas.set_image(total_active)
+        active = self.get_active_pages()
+        
+        for turbPage in self.turb_selector.available_items():
+            turbPage.clear_sensor_rects()
 
-        # calculate final PSF for active screens
-        self.total_science, self.total_science_strehl = ut.Analysis.generate_science_image(phase_map=total_active)
-        self.normalized_image = self.total_science/self.total_science.sum()
-        self.total_science_plot = cp.log10(self.normalized_image + 1e-12)
-        self.total_canvas.set_image(self.total_science_plot)
+        final_imgs = []
+        for sensor_tab in self.sensor_tab_list.values():
+            sensor = sensor_tab.sensor
+
+            science_screens = []
+            for i, turbPage in enumerate(active):
+                if turbPage.current_screen is None:
+                    continue
+
+                extra = int(turbPage.extra_grid_size)
+
+                shift_x = int(self.calc_extra_phase_pad(turbPage, -sensor.dx))
+                shift_y = int(self.calc_extra_phase_pad(turbPage, sensor.dy))
+                
+                right_pad = -extra+shift_x
+                bottom_pad = -extra+shift_y
+
+                if right_pad == 0: right_pad = turbPage.current_screen.shape[0]
+                if bottom_pad == 0: bottom_pad = turbPage.current_screen.shape[1]
+
+
+                new_screen = turbPage.current_screen[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad]
+                if sensor == self.current_sensor:
+
+                    if turbPage in self.turb_selector.active_items():
+                        turbPage.draw_sensor_rect(Pupil_tools.generate_pupil(),shift_x,shift_y)
+
+                science_screens.append(new_screen)
+
+            total_active = cp.sum(cp.asarray(science_screens), axis=0)
+            final_imgs.append(total_active)
+
+            if sensor == self.current_sensor:
+                self.active_canvas.set_image(total_active)
+
+            # calculate final PSF for active screens
+            self.total_science, self.total_science_strehl = ut.Analysis.generate_science_image(phase_map=total_active)
+            self.normalized_image = self.total_science/self.total_science.sum()
+            self.total_science_plot = cp.log10(self.normalized_image + 1e-12)
+            sensor_tab.total_canvas.set_image(self.total_science_plot)
+
+        N = len(self.sensors)
+        if self.corr_table.rowCount() < N:
+            self.corr_table.setRowCount(N)
+        if self.corr_table.columnCount() < N:
+            self.corr_table.setColumnCount(N)
+
+        X = cp.stack([img.ravel() for img in final_imgs])
+        X = cp.corrcoef(X)
+        self.image_corr.setText("WFS Science Image correlation: ")
+        for i in range(N):
+            for j in range(N):
+                self.corr_table.setItem(i, j, QTableWidgetItem(f"{X[i,j]:.2f}"))
 
     # for run/stop buttons
     def run_active(self):
@@ -276,19 +402,39 @@ class Turbulence_tab(QWidget):
         for page in self.turb_selector.active_items():
             page.reset()
 
+    @Slot(dict)
+    def load_sensor_dict(self, sensors):
+        self.sensors = sensors
 
+class sensor_psf(QWidget):
+    def __init__(self, sensor, image):
+        super().__init__()
+        self.sensor = sensor
+        self.image = image
+
+        main = QVBoxLayout(self)
+        self.total_canvas = PGCanvas()
+
+        main.addWidget(self.total_canvas)
+        main.addWidget(QLabel(f"Field Angle (arcsec): ({sensor.dx * WFSensor_tools.RAD2ARCSEC}, {sensor.dy * WFSensor_tools.RAD2ARCSEC})"))
 
 class TurbulencePage(QWidget):
     new_frame = Signal(object) 
+    screen_params_changed = Signal(dict)
 
-    def __init__(self, function, params, title, parent=None):
+    def __init__(self, function, params, defaults, title, parent=None):
         super().__init__(parent)
         self.function = function
         self.params = params
         self.title = title
+        self.map_grid_size = defaults.get("grid_size")
+        self.extra_grid_size = 0.0
+        self.params["grid_size"] = self.map_grid_size + 2 * self.extra_grid_size
+        self.params["px_scale"] = defaults.get("telescope_diameter")/self.params["grid_size"]
 
         self.current_screen = None
         self.displayed = False
+        self.pupil_overlay = None
 
         self._worker = None
         self._thread = None
@@ -299,9 +445,12 @@ class TurbulencePage(QWidget):
         tab_layout = QVBoxLayout(tab_frame)
 
         # screen view
-        self.turb_canvas = PGCanvas()
+        self.turb_canvas = PGCanvasWithBoxes()
 
         tab_layout.addWidget(self.turb_canvas)
+
+        self.grid_size_display = QLabel(str(self.params.get("grid_size")))
+        tab_layout.addWidget(self.grid_size_display)
 
         # --- Controls ---
         phase_b_layout = QHBoxLayout()
@@ -336,6 +485,7 @@ class TurbulencePage(QWidget):
         tab_layout.addWidget(self.config_table)
 
         self.config_table.params_changed.connect(lambda pc: setattr(self, "params", pc))
+        self.config_table.params_changed.connect(self.screen_params_changed.emit)
         self.config_table.params_changed.connect(self.page_reset_button_clicked)
 
         outer = QVBoxLayout(self)
@@ -343,6 +493,44 @@ class TurbulencePage(QWidget):
         outer.addWidget(tab_frame)
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+    @Slot()
+    def clear_sensor_rects(self):
+        if self.pupil_overlay is not None:
+            self.turb_canvas.vb.removeItem(self.pupil_overlay)
+            self.pupil_overlay = None
+
+    @Slot(object, int, int)
+    def draw_sensor_rect(self, pupil, shift_x, shift_y):
+        if self.current_screen is None:
+            return
+        
+        self.clear_sensor_rects()
+
+        if self.current_screen.shape > pupil.shape:
+            extra = self.extra_grid_size
+
+            right_pad = -extra+shift_x
+            bottom_pad = -extra+shift_y
+
+            if right_pad == 0: right_pad = self.current_screen.shape[0]
+            if bottom_pad == 0: bottom_pad = self.current_screen.shape[1]
+
+            rgba_mask = cp.zeros((self.current_screen.shape[0],self.current_screen.shape[1], 4))
+            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 0][pupil == 1] = 0
+            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 1][pupil == 1] = 0
+            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 2][pupil == 1] = 1
+            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 3][pupil == 1] = 0.5
+
+            self.pupil_overlay = ImageItem(rgba_mask.get())
+        
+
+            self.pupil_overlay.setZValue(10)  # make sure it’s on top
+            self.turb_canvas.vb.addItem(self.pupil_overlay)
+
+        return
+        
+
 
     # refresh viewer when tab/page is shown
     def showEvent(self, event):
@@ -371,8 +559,21 @@ class TurbulencePage(QWidget):
     def page_reset_button_clicked(self):
         # stop worker then recreate generator inside worker thread:
         if hasattr(self, "_worker"):
-            QMetaObject.invokeMethod(self._worker, "stop", Qt.QueuedConnection)
             QMetaObject.invokeMethod(self._worker, "reset", Qt.QueuedConnection)
+
+    @Slot(int)
+    def set_extra_grid_size(self, extra):
+        if self.extra_grid_size == extra:
+            return
+        self.extra_grid_size = extra
+        self.params["grid_size"] = self.map_grid_size +  2 * self.extra_grid_size
+        
+        if hasattr(self, "_worker"):
+            QMetaObject.invokeMethod(self._worker, "change_grid_size", Qt.QueuedConnection, Q_ARG(int, int(self.params["grid_size"])))
+        self.grid_size_display.setText(str(self.params.get("grid_size")) + ", Generating new grid")
+
+
+
 
     # allow for main widget to activate threads
     @Slot()

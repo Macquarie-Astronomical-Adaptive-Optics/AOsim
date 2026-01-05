@@ -336,6 +336,7 @@ class DetachableTabBar(QTabBar):
 
 class DetachableTabWidget(QTabWidget):
     """QTabWidget that supports popping out tabs into windows."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         bar = DetachableTabBar(self)

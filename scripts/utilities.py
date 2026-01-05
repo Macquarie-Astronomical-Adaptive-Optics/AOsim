@@ -16,7 +16,7 @@ def set_params(new_params):
 
 class PhaseMap_tools:
     @staticmethod
-    def generate_phase_map(grid_size=None, telescope_diameter=None, r0=None, L0=None, Vwind=None, altitude=None, random_seed=None):
+    def generate_phase_map(grid_size=None, telescope_diameter=None, r0=None, L0=None, Vwind=None, px_scale=None, random_seed=None, **kwargs):
         # read current params when values not provided
         if grid_size is None:
             grid_size = params.get("grid_size")
@@ -28,9 +28,10 @@ class PhaseMap_tools:
             L0 = params.get("L0")
         if random_seed is None:
             random_seed = params.get("random_seed")
-
-        # create ohase screen
-        phase_screen = aotools.turbulence.infinitephasescreen.PhaseScreenKolmogorov(grid_size, telescope_diameter/grid_size, r0, L0, random_seed=random_seed)
+        if px_scale is None:
+            px_scale = telescope_diameter/grid_size
+        # create phase screen
+        phase_screen = aotools.turbulence.infinitephasescreen.PhaseScreenKolmogorov(int(cp.ceil(grid_size)), px_scale, r0, L0, random_seed=random_seed)
         phase_map = phase_screen.add_row
 
         # generate next rows based on wind vel and dt
@@ -211,10 +212,13 @@ class Analysis:
 import threading
 gpu_lock = threading.Lock()
 
-
 class WFSensor_tools:
+    ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
+    RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
+
+
     class ShackHartmann:
-        def __init__(self, n_sub = None, wavelength = None, noise=0.0, pupil=None, grid_size=None):
+        def __init__(self, n_sub = None, wavelength = None, dx = None, dy = None, noise=0.0, pupil=None, grid_size=None):
             if n_sub is None:
                 n_sub = params.get("sub_apertures")
             if wavelength is None:
@@ -223,6 +227,10 @@ class WFSensor_tools:
                 grid_size = params.get("grid_size")
             if pupil is None:
                 pupil = Pupil_tools.generate_pupil(grid_size=grid_size)
+            if dx is None:
+                dx = 0.0
+            if dy is None:
+                dy = 0.0
 
             self.n_sub = n_sub
             self.wavelength = wavelength
@@ -230,9 +238,14 @@ class WFSensor_tools:
             self.pupil = pupil
             self.grid_size = grid_size
 
+            self.dx = dx * WFSensor_tools.ARCSEC2RAD
+            self.dy = dy * WFSensor_tools.ARCSEC2RAD
+            self.field_angle = (self.dx, self.dy)
+            self.sen_angle = cp.sqrt(self.field_angle[0]**2 + self.field_angle[1]**2)
+
             self.active_sub_aps, self.sub_aps, self.sub_aps_idx, self.sub_ap_width, self.sub_slice, self.sub_pupils = self.generate_sub_apertures(pupil, grid_size)
             
-        def recompute(self, n_sub=None, wavelength=None, noise=0.0, pupil=None, grid_size=None):
+        def recompute(self, n_sub=None, wavelength=None,  dx = None, dy = None, noise=0.0, pupil=None, grid_size=None):
             if n_sub is not None:
                 self.n_sub = n_sub
             if wavelength is not None:
@@ -243,6 +256,13 @@ class WFSensor_tools:
                 self.pupil = pupil
             if grid_size is not None:
                 self.grid_size = grid_size
+            if dx is not None:
+                self.dx = dx * WFSensor_tools.ARCSEC2RAD
+            if dy is not None:
+                self.dy = dy * WFSensor_tools.ARCSEC2RAD
+
+            self.field_angle = (self.dx, self.dy)
+            self.sen_angle = cp.sqrt(self.field_angle[0]**2 + self.field_angle[1]**2)
 
             self.active_sub_aps, self.sub_aps, self.sub_aps_idx, self.sub_ap_width, self.sub_slice, self.sub_pupils = self.generate_sub_apertures(self.pupil, self.grid_size)
             
@@ -268,7 +288,7 @@ class WFSensor_tools:
             return active_sub_aps, sub_aps, sub_aps_idx, sub_ap_width, sub_slice, sub_pupils
 
         # for each subaperture find the centroid and generate an image per input phase map in phase map list 
-        def measure(self, pupil=None, phase_map=None, poke_amplitude=None, pad=None):
+        def measure(self, pupil=None, phase_map=None, phase_map_alt=None, poke_amplitude=None, pad=None):
             if poke_amplitude is None:
                 poke_amplitude = params.get("poke_amplitude")
             if pad is None:

@@ -57,10 +57,13 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.setMovable(True)
 
-        tabs.addTab(Poke_tab(self.params), "Poke Diagnostics")
-        tabs.addTab(Turbulence_tab(self.params), "Turbulence")
+        tabs.addTab(poke := Poke_tab(self.params), "Poke Diagnostics")
+        tabs.addTab(turb := Turbulence_tab(self.params), "Turbulence")
 
+        poke.sensors_changed.connect(turb.update_sensor_tabs)
+        
         self.setCentralWidget(tabs)
+        print("MAIN init done!")
 
 # start application
 if __name__ == "__main__":

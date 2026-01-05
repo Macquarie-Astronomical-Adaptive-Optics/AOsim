@@ -73,7 +73,6 @@ class PGCanvas(QWidget):
             self.vb.addItem(arrow)
             self.quivers.append(arrow)
 
-
     def set_image(self, img, cmap="viridis"):
         """img: numpy array (H,W)"""
         # Ensure numpy
@@ -141,37 +140,36 @@ class PGCanvas(QWidget):
 
 
 
+from PySide6.QtGui import QColor, QBrush, QPen
+from PySide6.QtWidgets import QGraphicsRectItem
 
+class PGCanvasWithBoxes(PGCanvas):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.wfs_boxes = []
 
-class SubapWorker(QObject):
-    finished = Signal(object, int)  # emit (result, job_id)
+    def add_wfs_box(self, x_start, x_end, y_start, y_end, color=(0,255,0,100)):
+        """
+        Draw a semi-transparent rectangle for a WFS FOV
+        x_start, x_end, y_start, y_end : indices on the phase screen
+        color : RGBA tuple (0-255)
+        """
+        # remove old box if needed
+        rect = QGraphicsRectItem(x_start, y_start, x_end-x_start, y_end-y_start)
+        pen = QPen(QColor(*color))
+        pen.setWidth(2)
+        rect.setPen(pen)
+        brush = QBrush(QColor(*color))
+        rect.setBrush(brush)
+        self.vb.addItem(rect)
+        self.wfs_boxes.append(rect)
 
-    def __init__(self, pupil, influence_maps, active_sub_aps, sub_aps, sub_aps_idx, sub_ap_width, sub_pupils):
-        super().__init__()
-        # stash inputs (CuPy arrays expected)
-        self.pupil = pupil
-        self.influence_maps = influence_maps
-        self.active_sub_aps = active_sub_aps
-        self.sub_aps = sub_aps
-        self.sub_aps_idx = sub_aps_idx
-        self.sub_ap_width = sub_ap_width
-        self.sub_pupils = sub_pupils
-
-    @Slot(int, int)
-    def process(self, k, job_id):
-        """Run heavy computation on worker thread.
-           k: actuator index
-           job_id: identifier to mark request freshness"""
-        # run your existing function
-        result = Analysis.generate_subaperture_images(
-            int(k),
-            pupil=self.pupil,
-            influence_maps=self.influence_maps,
-            active_sub_aps=self.active_sub_aps,
-            sub_aps=self.sub_aps,
-            sub_aps_idx=self.sub_aps_idx,
-            sub_ap_width=self.sub_ap_width,
-            sub_pupils=self.sub_pupils
-        )
-        # emit result (still CuPy) + job id
-        self.finished.emit(result, job_id)
+    def remove_rect(self, rect):
+        if rect in self.wfs_boxes:
+            self.vb.removeItem(rect)
+            self.wfs_boxes.remove(rect)
+            
+    def clear_wfs_boxes(self):
+        for rect in self.wfs_boxes:
+            self.vb.removeItem(rect)
+        self.wfs_boxes = []

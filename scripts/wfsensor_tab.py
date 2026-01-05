@@ -22,6 +22,7 @@ class SensorTabWidget(QWidget):
     """
 
     actuator_changed = Signal(int, int)  # (actuator index, job_id)
+    sensor_changed = Signal(object)
 
     def __init__(self, params: dict, sensor_name: str = "main_sensor", sensor=None, parent=None):
         super().__init__(parent)
@@ -172,6 +173,7 @@ class SensorTabWidget(QWidget):
     def _schedule_update(self, v):
         self.pending_index = int(v)
         self.debounce_timer.start()
+        self.sensor_changed.emit(self.sensor)
 
     def _emit_worker_request(self):
         self.job_id += 1
@@ -269,6 +271,7 @@ class SensorTabWidget(QWidget):
         
         CalculateWorker.instance().request_recompute(self.sensor, params)
         self._schedule_update(self.act_select_spinbox.value())
+        
 
     @Slot(object)
     def main_params_changed(self, params):

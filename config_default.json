@@ -15,4 +15,5 @@
     "random_seed":12,
     "use_gpu": true,
     "data_path": "data/"
+	
 }

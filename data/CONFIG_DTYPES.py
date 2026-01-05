@@ -14,7 +14,8 @@ CONFIG_DTYPES = {
     "poke_amplitude": float,
     "random_seed": int,
     "use_gpu": bool,
-    "data_path": str
+    "data_path": str,
+    "altitude": float,
 }
 
 def enforce_config_types(config):

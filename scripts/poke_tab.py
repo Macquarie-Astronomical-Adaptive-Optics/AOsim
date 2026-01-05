@@ -17,6 +17,7 @@ from data.CONFIG_DTYPES import CONFIG_DTYPES, enforce_config_types
 
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
+    sensors_changed = Signal(dict)
 
     def __init__(self, config_dict):
         super().__init__()
@@ -24,7 +25,11 @@ class Poke_tab(QWidget):
         self.wfsensors = {}
 
         self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann()
-        self.wfsensors["test_sensor"] = ut.WFSensor_tools.ShackHartmann(n_sub=20)
+        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=45, dy=0)
+        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=-45, dy=0)
+        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=45)
+        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=-45)
+        self.sensors_changed.emit(self.wfsensors)
 
         # calculation jobs bookkeeping
         self.job_id = 0
@@ -64,6 +69,8 @@ class Poke_tab(QWidget):
         self.tab_pages = []
         for key, val in self.wfsensors.items():
             tab = SensorTabWidget(dict(self.params), key, val)
+            tab.sensor_changed.connect(self.update_sensor)
+
             self.tab_pages.append(tab)
             sensor_tabs.addTab(tab, key)
             
@@ -73,9 +80,15 @@ class Poke_tab(QWidget):
         main_middle_layout.addLayout(sensor_selector_h)
         main_layout.addLayout(main_middle_layout)
 
+        self.sensors_changed.emit(self.wfsensors)
+
     def update_tabs(self, params):
         for tab in self.tab_pages:
             tab.main_params_changed(params)
+
+    def update_sensor(self, sensor):
+        self.sensors_changed.emit(self.wfsensors)
+            
 
         
 

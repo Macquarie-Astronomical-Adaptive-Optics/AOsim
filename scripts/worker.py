@@ -47,6 +47,16 @@ class FrameWorker(QObject):
             self._gen = obj
             self._next_frame = next_fn
 
+    @Slot(dict)
+    def change_params(self, new_params):
+        self.params = new_params
+        self.reset()
+        
+    @Slot(int)
+    def change_grid_size(self, new_size):
+        self.params["grid_size"] = new_size
+        self.reset()
+
     @Slot()
     def step(self):
         try:
