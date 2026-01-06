@@ -54,16 +54,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AOsim")
         cp.cuda.Device(0).use()
             
+        print("> Starting!")
         tabs = QTabWidget()
         tabs.setMovable(True)
 
+        print("> Starting Poke diagnostic tab building")
         tabs.addTab(poke := Poke_tab(self.params), "Poke Diagnostics")
-        tabs.addTab(turb := Turbulence_tab(self.params), "Turbulence")
+        print("> Poke diagnostic tab done!")
 
-        poke.sensors_changed.connect(turb.update_sensor_tabs)
-        
+        print("> Starting Turbulence tab building")
+        tabs.addTab(turb := Turbulence_tab(self.params), "Turbulence")
+        print("> Turbulence tab done!")
+
+
         self.setCentralWidget(tabs)
-        print("MAIN init done!")
+        print("> MAIN init done!")
 
 # start application
 if __name__ == "__main__":
