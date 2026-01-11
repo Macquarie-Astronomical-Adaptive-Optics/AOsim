@@ -1,6 +1,7 @@
 import aotools
 import cupy as cp
 import numpy as np
+#import scripts.AOtools_cuda.AOtools_infinitephasescreen_cuda as aot_cp
 
 from pathlib import Path
 import json
@@ -15,6 +16,7 @@ def set_params(new_params):
     params = new_params
 
 class PhaseMap_tools:
+
     @staticmethod
     def generate_phase_map(grid_size=None, telescope_diameter=None, r0=None, L0=None, Vwind=None, px_scale=None, random_seed=None, **kwargs):
         # read current params when values not provided
@@ -31,7 +33,7 @@ class PhaseMap_tools:
         if px_scale is None:
             px_scale = telescope_diameter/grid_size
         # create phase screen
-        phase_screen = aotools.turbulence.infinitephasescreen.PhaseScreenKolmogorov(int(cp.ceil(grid_size)), px_scale, r0, L0, random_seed=random_seed)
+        phase_screen = aotools.infinitephasescreen.PhaseScreenKolmogorov(int(cp.ceil(grid_size)), px_scale, r0, L0, random_seed=random_seed)
         phase_map = phase_screen.add_row
 
         # generate next rows based on wind vel and dt
@@ -65,13 +67,7 @@ class PhaseMap_tools:
 
 class Pupil_tools:
     @staticmethod
-    def generate_pupil(grid_size=None, telescope_center_obscuration=None):
-        if grid_size is None:
-            grid_size = params.get("grid_size")
-        if telescope_center_obscuration is None:
-            telescope_center_obscuration = params.get("telescope_center_obscuration")
-
-        def circle(radius, grid_size, center=None):
+    def circle(radius, grid_size, center=None):
             if center is None:
                 center = (grid_size / 2, grid_size / 2)
 
@@ -81,8 +77,15 @@ class Pupil_tools:
             mask = (dist2 <= radius**2).astype(cp.float32)
             return mask
 
-        outer = circle(grid_size/2, grid_size)
-        inner = circle(grid_size/2 * telescope_center_obscuration, grid_size)
+    @staticmethod
+    def generate_pupil(grid_size=None, telescope_center_obscuration=None):
+        if grid_size is None:
+            grid_size = params.get("grid_size")
+        if telescope_center_obscuration is None:
+            telescope_center_obscuration = params.get("telescope_center_obscuration")
+
+        outer = Pupil_tools.circle(grid_size/2, grid_size)
+        inner = Pupil_tools.circle(grid_size/2 * telescope_center_obscuration, grid_size)
         return cp.asarray(outer - inner)
 
     # generate actuator positions on pupil
@@ -160,6 +163,8 @@ class Analysis:
             science_lambda = params.get("science_lambda")
         if pupil is None:
             pupil = Pupil_tools.generate_pupil()
+        if phase_map is None:
+            phase_map = cp.zeros_like(pupil)
 
         field = pupil * cp.exp(1j * phase_map)
         field_p = cp.pad(field,((pad,pad) , (pad,pad)), mode='constant')

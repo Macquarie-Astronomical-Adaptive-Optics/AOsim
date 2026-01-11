@@ -1,141 +1,120 @@
-from PySide6.QtCore import Qt, Signal, Slot, QThread, Signal, QMetaObject, Q_ARG
+from PySide6.QtCore import Signal, Slot, QThread
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QWidget,
     QLabel, QFrame,
-    QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
-    QListWidget, QSpinBox,
+    QListWidget, QPushButton, QSizePolicy,
+    QSpinBox,
 )
 
 import json
 from pathlib import Path
 
-import scripts.utilities as ut
+from scripts.utilities import Pupil_tools
 from scripts.config_table import Config_table
-from scripts.pgcanvas import PGCanvas
 from scripts.wrap_tab import DetachableTabWidget
-from scripts.utilities import PhaseMap_tools
-from scripts.schedulerGPU import GPUScheduler
+from scripts.pgcanvas import PGCanvas
+from scripts.phase_screen.infinite_kolmogorov import LayeredInfinitePhaseScreen
+from scripts.schedulerGPU import SimWorker
+from scripts.dual_list_selector import DualListSelector
+from scripts.sensor_view_tab import SensorView_tab
 
-from pyqtgraph import ImageItem
 import cupy as cp
-import queue
+
+ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
+
 
 class Turbulence_tab(QWidget):
-    request_add_layer  = Signal(str, object, dict)
-    request_regenerate = Signal(str)
-    request_active = Signal(str, bool)
+    active_changed = Signal(object)
+    req_overview_enabled = Signal(bool)
+    req_emit_overview = Signal()
+    req_visible_sensor = Signal(int)
 
-    def __init__(self, config_dict):
+    def __init__(self, config_dict, sensors):
         super().__init__()
-        
+
         self.params = config_dict
+        self.sensors = sensors
 
-        # start GPU Scheduler
-        print("Starting GPU Scheduler")
-        self.scheduler_thread = QThread()
-        self.scheduler = GPUScheduler(downsample_factor=1)
-        self.scheduler.moveToThread(self.scheduler_thread)
-        self.scheduler_thread.start()
-        
-        # connect scheduler signals to update tabs:
-        self.scheduler.frame_ready.connect(self.on_scheduler_frame)  # receives (name, np.ndarray)
-        self.request_regenerate.connect(self.scheduler.regenerate_layer)  # receives (name, np.ndarray)
-        self.request_add_layer.connect(self.scheduler.add_layer)  # queued
-        self.request_active.connect(self.scheduler.set_active)  # queued
+        self.available_funcs = {"InfKolmogorov": LayeredInfinitePhaseScreen}
 
-        print("GPU Scheduler started!")
+        screen_directory = Path(__file__).parent.parent / "turbulence"
 
-
-        self.available_funcs = {
-            "AOtools InfiniteKolmogorov": PhaseMap_tools.generate_phase_map
-        } # add more in the future
-        print("Available Turbulence Generators:")
-        [print(" -",i) for i in list(self.available_funcs.keys())]
-
-        screen_directory = Path(__file__).parent.parent/ "turbulence"
-
-        # load turbulence screens from "/turbulence" folder
-        print("Loading configs from /turbulence")
+        # load turbulence configs
         self.turbulence_screens = []
         for file_path in screen_directory.iterdir():
-            if file_path.is_file():   # skip subdirectories
+            if file_path.is_file():
                 with file_path.open("r") as f:
-                    content = json.load(f)       
-                    content_name = file_path.stem
-                    content_data = {k: v for k, v in content.items() if k != "function"}
-                    print(" - Loaded:", content_name)
-                    self.turbulence_screens.append({"name": content_name, "data": content_data, "function": self.available_funcs[content["function"]]})   
+                    content = json.load(f)
+                content_name = file_path.stem
+                content_data = {k: v for k, v in content.items() if k != "function"}
+                self.turbulence_screens.append({
+                    "name": content_name,
+                    "data": content_data,
+                    "function": self.available_funcs[content["function"]],
+                })
 
-        # initalize tab/page for each loaded screen
-        print("Starting turbulence widgets:")
+        # pick first config for now
+        screen = self.turbulence_screens[0]
+        data = screen["data"]
+
+        # split base kwargs vs layer list (IMPORTANT: avoids double-adding layers)
+        layers = list(data.get("layers", []))
+        base_kwargs = {k: v for k, v in data.items() if k != "layers"}
+        N = int(base_kwargs["N"])
+        base_kwargs["N"] = N*3
+
         self.turbWidgets = {}
-        for i, screen in enumerate(self.turbulence_screens):
-            turbWidget = TurbulenceWidget(screen["function"], screen["data"], self.params, screen["name"])
-            self.turbWidgets[screen["name"]] = turbWidget
-            turbWidget.scheduler = self.scheduler
-            turbWidget.request_regenerate.connect(self.scheduler.regenerate_layer)
-            turbWidget.request_edit.connect(self.scheduler.edit_layer_param)
-            turbWidget.request_active.connect(self.scheduler.set_active)  # queued
+        self.layer_last = {}  # cache numpy layer frames
 
-            print(" -", turbWidget.title)
+        # build widgets from layer configs (GUI side only)
+        for i, layer in enumerate(layers):
+            name = f"{screen['name']} Layer {i}"
+            turbWidget = TurbulenceWidget(name, screen["function"], layer)
+            self.turbWidgets[i] = turbWidget
 
-            self.request_add_layer.emit(screen["name"], screen["function"], screen["data"])
-            # self.add_layer(screen["name"], screen["function"], screen["data"])
-            
+        # sensors -> angles (radians)
+        thetas = [s.field_angle for s in self.sensors.values()]  # list of (theta_x, theta_y) rad
+        print("Loaded sensors at angles")
+        for t in thetas:
+            print(f" - ({t[0]*RAD2ARCSEC:.0f}, {t[1]*RAD2ARCSEC:.0f}) arcsec")
 
-        print("Creating Turbulence tab layout")
+        # ---------- UI ----------
         main_layout = QHBoxLayout(self)
 
-        # left -- final psf viewer
+        # left: combined view
         left_frame = QFrame()
         left_frame.setFrameShape(QFrame.Box)
         left_frame.setLineWidth(1)
-
         left_layout = QVBoxLayout(left_frame)
+
         self.science_canvas = PGCanvas()
-
         left_layout.addWidget(self.science_canvas)
-        func_sel_layout = QHBoxLayout()
 
-        self.func_selector = QListWidget()
-        self.func_selector.addItems(list(self.available_funcs.keys()))
-        self.func_selector.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-
-        func_sel_layout.addWidget(self.func_selector)
-
-        func_options_layout = QVBoxLayout()
-        for i in range(5):
-            func_options_layout.addWidget(QLabel(f"Placeholder {i}"))
-
-        func_sel_layout.addLayout(func_options_layout)
-
-
-        left_layout.addLayout(func_sel_layout)
+        self.psf_r0_label = QLabel(f"r0_total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
+        left_layout.addWidget(self.psf_r0_label)
 
         main_layout.addWidget(left_frame)
 
-        # middle -- layered turbulence viewer
+        # middle: controls + another view (optional; keep showing combined)
         fmiddle = QFrame()
         fmiddle.setFrameShape(QFrame.Box)
         fmiddle.setLineWidth(1)
-
-        ## plot canvas
         middle_layout = QVBoxLayout(fmiddle)
-        self.active_canvas = PGCanvas()
 
+        self.active_canvas = PGCanvas()
         middle_layout.addWidget(self.active_canvas)
 
         phase_b_layout = QHBoxLayout()
         middle_layout.addLayout(phase_b_layout)
 
-        ## run/stop buttons
         self.next_button = QPushButton("Next Step")
         self.run_x_button = QPushButton("Run X Frames")
-        self.run_inf_button = QPushButton("Run Indefinitely")
         self.spin = QSpinBox()
-        self.spin.setRange(1, 1000)
+        self.spin.setRange(1, 100000)
         self.spin.setValue(10)
-        self.stop_button = QPushButton("Stop")
+        self.run_inf_button = QPushButton("Run Indefinitely")
+        self.stop_button = QPushButton("Pause")
         self.reset_button = QPushButton("Reset")
 
         phase_b_layout.addWidget(self.next_button)
@@ -144,201 +123,162 @@ class Turbulence_tab(QWidget):
         phase_b_layout.addWidget(self.run_inf_button)
         phase_b_layout.addWidget(self.stop_button)
         phase_b_layout.addWidget(self.reset_button)
-
-        # self.next_button.clicked.connect(self.step_active)
-        # self.run_x_button.clicked.connect(self.run_x_active)
-        # self.run_inf_button.clicked.connect(self.run_active)
-        # self.stop_button.clicked.connect(self.stop_active)
-        # self.reset_button.clicked.connect(self.reset_active)
- 
-        ## list selectors for active/inactive screens
-        print("Populating function selector")
-        self.turb_selector = DualListSelector(available=list(self.turbWidgets.values())[1:], active=list(self.turbWidgets.values())[:1], text_key="title")
-
-        self.turb_selector.activeChanged.connect(self.set_active)
-        # self.func_selector.itemDoubleClicked.connect(lambda it: self.turb_selector._add_item(self.turb_selector.available_list, self.load_turb(it.text())))
-
-        middle_layout.addWidget(self.turb_selector)
-
 
         main_layout.addWidget(fmiddle)
 
- 
-        # right -- turbulence editor
+        # right: per-layer tabs (your plan)
         right_layout = QVBoxLayout()
-
         fright_top = QFrame()
         fright_top.setFrameShape(QFrame.Box)
         fright_top.setLineWidth(1)
-
         right_top_layout = QVBoxLayout(fright_top)
+
         self.tab_widget = DetachableTabWidget()
         self.tab_widget.setMovable(True)
 
-        print("Adding subtabs")
-        # Add tabs
-        for i, page in enumerate(self.turbWidgets.values()):
+        for i in range(len(layers)):
+            page = self.turbWidgets[i]
             self.tab_widget.addTab(page, page.title)
-            print(" -", page.title)
-        
-        right_top_layout.addWidget(self.tab_widget)
 
+        right_top_layout.addWidget(self.tab_widget)
         right_layout.addWidget(fright_top)
         main_layout.addLayout(right_layout)
-
-    def set_active(self, a):
-        QMetaObject.invokeMethod(self.scheduler, "redraw", Qt.QueuedConnection)
-
-    # get currently active screens
-    def get_active_screens(self):
-        active = [
-                    item.current_screen for item in self.turb_selector.active_items()
-                    if hasattr(item, "current_screen")
-                 ]
-        return active
-    
-    def get_active_pages(self):
-        active = [
-                    item for item in self.turb_selector.active_items()
-                    if hasattr(item, "current_screen")
-                 ]
-        return active
-    
-    def get_active_names(self):
-        active = [
-                    item.title for item in self.turb_selector.active_items()
-                    if hasattr(item, "current_screen")
-                 ]
-        return active
-
-    def regen_active(self):
-        for name in self.get_active_names():
-            self.request_regenerate.emit(name)
-
-    def on_scheduler_frame(self, names, host_preview):
-
-        science_screens = []
-        active = self.get_active_names()
-        for name in self.turbWidgets:
-            turbWidget = self.turbWidgets[name]
-
-            if not hasattr(turbWidget, "current_screen"):
-                print("WARN Turbulence_tab.on_scheduler_frame : No Turbulence widget found!")
-                return 
-            
-            if name in host_preview:
-                new_screen = host_preview[name]
-
-                turbWidget.current_screen = new_screen
-                turbWidget.turb_canvas.set_image(new_screen)
-
-            if name not in active:
-                continue
-
-            extra = int(turbWidget.extra_grid_size)
-            
-            right_pad = -extra
-
-            if right_pad == 0: right_pad = turbWidget.current_screen.shape[0]
-
-            new_screen = turbWidget.current_screen[extra:right_pad, extra:right_pad]
-
-            science_screens.append(new_screen)
-
-        science_screens = cp.asarray(science_screens)
-
-        if science_screens.shape[0] == 0:
-            return
-        else:
-            total_active = cp.sum(science_screens, axis=0)
-            
-        # self.total_science, self.total_science_strehl = ut.Analysis.generate_science_image(phase_map=total_active)
-        # self.normalized_image = self.total_science/self.total_science.sum()
-        # self.total_science_plot = cp.log10(self.normalized_image + 1e-12)
-
-        # self.science_canvas.set_image(self.total_science_plot)
-        self.active_canvas.set_image(total_active)
         
+        # ---------- Worker thread ----------
+        print("Starting GPU Scheduler")
+        self.scheduler_thread = QThread(self)
+
+        print("Building Turbulence Screen Generator")
+        self.scheduler = SimWorker(
+            sim_factory=screen["function"],
+            sim_kwargs=base_kwargs,
+            layers=layers,
+            pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
+            thetas_xy_rad=thetas,
+            patch_size_px= N,
+            patch_M= N,
+            dt_s=0.001,
+            emit_psf=True,
+        )
+        self.scheduler.moveToThread(self.scheduler_thread)
+        print("Scheduler moved to thread!")
+
+
+        # build once thread starts, then emit a first frame
+        self.req_overview_enabled.connect(self.scheduler.set_overview_enabled)
+        self.req_emit_overview.connect(self.scheduler.emit_overview_once)
+        self.req_visible_sensor.connect(self.scheduler.set_visible_sensor)
+
+
+        self.scheduler_thread.started.connect(self.scheduler.build_sim)
+        self.scheduler_thread.started.connect(self.scheduler.step_once)
+
+        self.scheduler.finished.connect(self.scheduler_thread.quit)
+
+        # signals -> UI
+        self.scheduler.status.connect(print)
+        self.scheduler.fpsReady.connect(lambda fps: self.setWindowTitle(f"Turbulence — {fps:.1f} FPS"))
+        self.scheduler.combined_ready.connect(self.on_combined_frame)
+        self.scheduler.layer_ready.connect(self.on_layer_frame)
+        self.scheduler.sensor_psf_ready.connect(self.on_sensor_psf)
+
+        self.req_visible_sensor.emit(0)
+
+
+        # controls -> worker (queued automatically across threads)
+        self.next_button.clicked.connect(self.scheduler.step_once)
+        self.run_inf_button.clicked.connect(self.scheduler.start)
+        self.stop_button.clicked.connect(self.scheduler.pause)
+        self.reset_button.clicked.connect(self.scheduler.reset)
+
+        self.run_x_button.clicked.connect(self._run_x_clicked)
+
+        # tab changes => only update visible layer
+        self.tab_widget.currentChanged.connect(self._tab_changed)
+
+        # layer editor changes => apply safely in worker thread
+        for i, w in self.turbWidgets.items():
+            w.screen_params_changed.connect(lambda p, idx=i: self.scheduler.apply_layer_params(idx, p))
+
+        self.scheduler_thread.start()
+
+        # worker emits stacks
+        N /= 2
+        self.overview_tab = SensorView_tab(config_dict, layers, thetas, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
+        
+        self.scheduler.all_sensor_psf_ready.connect(self.overview_tab.psf_grid.update_psfs)
+        self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
+
+        # enable and render once (queued)
+        self.req_overview_enabled.emit(True)
+        self.req_emit_overview.emit()
+
+
+    # ----------- UI slots -----------
+    @Slot()
+    def _run_x_clicked(self):
+        n = int(self.spin.value())
+        # emit final only (fast). If you want animation: emit_every=1
+        self.scheduler.step_n(n, 0)
+
+    @Slot(int)
+    def _tab_changed(self, idx: int):
+        # request updates for just the visible layer tab
+        self.scheduler.set_visible_layer(idx)
+
+        # show cached layer immediately if we have it
+        if idx in self.layer_last:
+            self.turbWidgets[idx].update_screen(self.layer_last[idx])
+
+    @Slot(object)
+    def on_combined_frame(self, img_np):
+        # show combined in both canvases (pick one if you prefer)
+        self.active_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
+    
+    @Slot(int, object)
+    def on_sensor_psf(self, idx, img_np):
+        # show on whatever canvas you want for that sensor
+        self.science_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
+
+
+    @Slot(int, object)
+    def on_layer_frame(self, idx: int, img_np):
+        self.layer_last[int(idx)] = img_np
+        # only update visible tab widget (saves UI work)
+        if int(idx) == int(self.tab_widget.currentIndex()):
+            self.turbWidgets[int(idx)].update_screen(img_np)
 
     def closeEvent(self, event):
         # stop scheduler and wait
-        self.scheduler.stop()
-        self.scheduler_thread.quit()
-        self.scheduler_thread.wait(3000)
+        if self.scheduler is not None:
+            self.scheduler.stop()
+        if self.scheduler_thread is not None:
+            self.scheduler_thread.quit()
+            self.scheduler_thread.wait(3000)
         super().closeEvent(event)
 
-   
+
 class TurbulenceWidget(QWidget):
-    new_frame = Signal(object) 
     screen_params_changed = Signal(dict)
-    request_regenerate = Signal(str)
-    request_edit = Signal(str, dict)
-    request_active = Signal(str, bool)
 
-
-    def __init__(self, function, params, defaults, title, parent=None):
+    def __init__(self, title, function, params, parent=None):
         super().__init__(parent)
+        self.title = title
         self.function = function
         self.params = params
-        self.title = title
-        self.map_grid_size = defaults.get("grid_size")
-        self.extra_grid_size = 0.0
-        self.params["grid_size"] = self.map_grid_size + 2 * self.extra_grid_size
-        self.params["px_scale"] = defaults.get("telescope_diameter")/self.params["grid_size"]
-
         self.current_screen = None
-        self.pupil_overlay = None
 
-        self.scheduler = None
+        tab_frame = QFrame(self)
+        self.tab_layout = QVBoxLayout(tab_frame)
 
-        # layout
-        tab_frame = QFrame(self)  
-        tab_layout = QVBoxLayout(tab_frame)
-
-        # screen view
         self.turb_canvas = PGCanvas()
+        self.tab_layout.addWidget(self.turb_canvas)
 
-        tab_layout.addWidget(self.turb_canvas)
-
-        self.grid_size_display = QLabel(str(self.params.get("grid_size")))
-        tab_layout.addWidget(self.grid_size_display)
-
-        # --- Controls ---
-        phase_b_layout = QHBoxLayout()
-        tab_layout.addLayout(phase_b_layout)
-
-        self.next_button = QPushButton("Next Step")
-        self.run_x_button = QPushButton("Run X Frames")
-        self.run_inf_button = QPushButton("Run Indefinitely")
-        self.spin = QSpinBox()
-        self.spin.setRange(1, 1000)
-        self.spin.setValue(10)
-        self.stop_button = QPushButton("Stop")
-        self.reset_button = QPushButton("Reset")
-
-        phase_b_layout.addWidget(self.next_button)
-        phase_b_layout.addWidget(self.run_x_button)
-        phase_b_layout.addWidget(self.spin)
-        phase_b_layout.addWidget(self.run_inf_button)
-        phase_b_layout.addWidget(self.stop_button)
-        phase_b_layout.addWidget(self.reset_button)
-
-        self.next_button.clicked.connect(self.page_next_button_clicked)
-        self.run_x_button.clicked.connect(self.page_run_x_button_clicked)
-        self.run_inf_button.clicked.connect(self.page_run_button_clicked)
-        self.stop_button.clicked.connect(self.page_stop_button_clicked)
-        self.reset_button.clicked.connect(self.page_reset_button_clicked)
-
-
-        # --- Config table ---
         table_config_key = list(self.params.keys())
         self.config_table = Config_table(table_config_key, self.params)
-        tab_layout.addWidget(self.config_table)
+        self.tab_layout.addWidget(self.config_table)
 
-        self.config_table.params_changed.connect(lambda pc: setattr(self, "params", pc))
-        self.config_table.params_changed.connect(lambda pc: self.request_edit.emit(self.title, pc))
-        self.config_table.params_changed.connect(self.screen_params_changed.emit)
-        self.config_table.params_changed.connect(self.page_reset_button_clicked)
+        self.config_table.params_changed.connect(self._on_params_changed)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -346,258 +286,17 @@ class TurbulenceWidget(QWidget):
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
-    @Slot()
-    def clear_sensor_rects(self):
-        if self.pupil_overlay is not None:
-            self.turb_canvas.vb.removeItem(self.pupil_overlay)
-            self.pupil_overlay = None
+    @Slot(dict)
+    def _on_params_changed(self, pc: dict):
+        self.params = pc
+        self.screen_params_changed.emit(pc)
 
-    @Slot(object, int, int)
-    def draw_sensor_rect(self, pupil, shift_x, shift_y):
-        if self.current_screen is None:
-            return
-        
-        self.clear_sensor_rects()
+    @Slot(object)
+    def update_screen(self, new_screen):
+        self.current_screen = new_screen
+        self.turb_canvas.queue_image(new_screen, cmap="viridis", auto_levels=True)
 
-        if self.current_screen.shape > pupil.shape:
-            extra = self.extra_grid_size
-
-            right_pad = -extra+shift_x
-            bottom_pad = -extra+shift_y
-
-            if right_pad == 0: right_pad = self.current_screen.shape[0]
-            if bottom_pad == 0: bottom_pad = self.current_screen.shape[1]
-
-            rgba_mask = cp.zeros((self.current_screen.shape[0],self.current_screen.shape[1], 4))
-            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 0][pupil == 1] = 0
-            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 1][pupil == 1] = 0
-            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 2][pupil == 1] = 1
-            rgba_mask[(extra+shift_y):bottom_pad, (extra+shift_x):right_pad, 3][pupil == 1] = 0.5
-
-            self.pupil_overlay = ImageItem(rgba_mask.get())
-        
-
-            self.pupil_overlay.setZValue(10)  # make sure it’s on top
-            self.turb_canvas.vb.addItem(self.pupil_overlay)
-
-        return
-        
-
-
-    # refresh viewer when tab/page is shown
     def showEvent(self, event):
         super().showEvent(event)
-
         if self.current_screen is not None:
-            self.turb_canvas.set_image(self.current_screen)
-
-    def page_next_button_clicked(self):
-        # if hasattr(self, "_worker"):
-        #     QMetaObject.invokeMethod(self._worker, "step", Qt.QueuedConnection)
-        self.request_active.emit(self.title, True)
-        QMetaObject.invokeMethod(self.scheduler, "step_layer", Qt.QueuedConnection)
-
-        return # TODO
-
-    def page_run_x_button_clicked(self):
-        # if hasattr(self, "_worker"):
-        #     for i in range(self.spin.value()):
-        #         QMetaObject.invokeMethod(self._worker, "step", Qt.QueuedConnection)
-        self.request_active.emit(self.title, True)
-        QMetaObject.invokeMethod(self.scheduler, "step_layer_N", Qt.QueuedConnection, 
-                                 Q_ARG(int, int(self.spin.value())),
-                                 Q_ARG(float, 0.03)
-                                 )
-
-        return # TODO
-
-
-    def page_run_button_clicked(self):
-        # if hasattr(self, "_worker"):
-        #     QMetaObject.invokeMethod(self._worker, "run", Qt.QueuedConnection)
-        self.request_active.emit(self.title, True)
-        QMetaObject.invokeMethod(self.scheduler, "run_loop", Qt.QueuedConnection, Q_ARG(float, 0.03))
-
-
-        return # TODO
-
-
-    def page_stop_button_clicked(self):
-        # if hasattr(self, "_worker"):
-        #     QMetaObject.invokeMethod(self._worker, "stop", Qt.QueuedConnection)
-        self.request_active.emit(self.title, False)
-        
-        return # TODO
-
-
-    def page_reset_button_clicked(self):
-        # stop worker then recreate generator inside worker thread:
-        # if hasattr(self, "_worker"):
-        #     QMetaObject.invokeMethod(self._worker, "reset", Qt.QueuedConnection)
-        self.request_regenerate.emit(self.title)
-
-
-        return # TODO
-
-    @Slot(int)
-    def set_extra_grid_size(self, extra):
-        if self.extra_grid_size == extra:
-            return
-        self.extra_grid_size = extra
-        self.params["grid_size"] = self.map_grid_size +  2 * self.extra_grid_size
-        
-        # if hasattr(self, "_worker"):
-        #     QMetaObject.invokeMethod(self._worker, "change_grid_size", Qt.QueuedConnection, Q_ARG(int, int(self.params["grid_size"])))
-        self.grid_size_display.setText(str(self.params.get("grid_size")) + ", Generating new grid")
-
-
-
-
-    # allow for main widget to activate threads
-    @Slot()
-    def stop(self):
-        self.page_stop_button_clicked()
-
-    @Slot()
-    def step_once(self):
-        self.page_next_button_clicked() 
-        
-    @Slot()
-    def run(self):
-        self.page_run_button_clicked()
-
-    @Slot(int)
-    def run_x(self, n):
-        if hasattr(self, "_worker"):
-            for i in range(self.spin.value()):
-                return  # TODO
-
-
-    @Slot()
-    def reset(self):
-        self.page_reset_button_clicked() 
-
-    # ---- kill page ----
-    def kill(self):
-        return # TODO
-
-    def cleanup(self):
-        try:
-            self.new_frame.disconnect()
-        except TypeError:
-            pass
-
-
-
-
-class DualListSelector(QWidget):
-    activeChanged = Signal(list)
-    def __init__(self, available=None, active=None, text_key=None, parent=None):
-        super().__init__(parent)
-
-        available = available or []
-        active = active or []
-
-        self.text_key = text_key  # can be a dict key, attribute, or function
-
-        # Lists
-        self.available_list = QListWidget()
-        self.active_list = QListWidget()
-
-        self.available_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.active_list.setSelectionMode(QListWidget.ExtendedSelection)
-
-        # Buttons
-        self.btn_add = QPushButton("→")
-        self.btn_remove = QPushButton("←")
-        self.btn_add.clicked.connect(self.move_to_active)
-        self.btn_remove.clicked.connect(self.move_to_available)
-
-        # Layouts
-        button_layout = QVBoxLayout()
-        button_layout.addStretch()
-        button_layout.addWidget(self.btn_add)
-        button_layout.addWidget(self.btn_remove)
-        button_layout.addStretch()
-
-        left_layout = QVBoxLayout()
-        left_layout.addWidget(QLabel("Available"))
-        left_layout.addWidget(self.available_list)
-
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(QLabel("Active"))
-        right_layout.addWidget(self.active_list)
-
-        main_layout = QHBoxLayout(self)
-        main_layout.addLayout(left_layout)
-        main_layout.addLayout(button_layout)
-        main_layout.addLayout(right_layout)
-
-        # Populate lists
-        for obj in available:
-            self._add_item(self.available_list, obj)
-        for obj in active:
-            self._add_item(self.active_list, obj)
-
-        # Optional: double-click moves
-        self.available_list.itemDoubleClicked.connect(lambda _: self.move_to_active())
-        self.active_list.itemDoubleClicked.connect(lambda _: self.move_to_available())
-
-    # --- Internal helpers ---
-    def _get_text(self, obj):
-        """Determine display text for an object."""
-        if self.text_key is None:
-            return str(obj)
-        elif callable(self.text_key):
-            return str(self.text_key(obj))
-        elif isinstance(obj, dict):
-            return str(obj.get(self.text_key, str(obj)))
-        else:
-            return str(getattr(obj, self.text_key, str(obj)))
-
-    def _add_item(self, list_widget, obj):
-        item = QListWidgetItem(self._get_text(obj))
-        item.setData(Qt.UserRole, obj)
-        list_widget.addItem(item)
-
-    def remove_item(self, obj):
-        removed_from_active = False
-
-        for lst in (self.available_list, self.active_list):
-            for i in reversed(range(lst.count())):
-                item = lst.item(i)
-                if item.data(Qt.UserRole) is obj:
-                    lst.takeItem(i)
-                    if lst is self.active_list:
-                        removed_from_active = True
-
-        if removed_from_active:
-            self.activeChanged.emit(self.active_items())
-
-    # --- Moving items ---
-    def move_to_active(self):
-        for item in self.available_list.selectedItems():
-            obj = item.data(Qt.UserRole)
-            self._add_item(self.active_list, obj)
-            self.available_list.takeItem(self.available_list.row(item))
-
-        self.activeChanged.emit(self.active_items())
-
-    def move_to_available(self):
-        for item in self.active_list.selectedItems():
-            obj = item.data(Qt.UserRole)
-            self._add_item(self.available_list, obj)
-            self.active_list.takeItem(self.active_list.row(item))
-
-        self.activeChanged.emit(self.active_items())
-
-    # --- Accessor methods ---
-    def active_items(self):
-        return [self.active_list.item(i).data(Qt.UserRole) for i in range(self.active_list.count())]
-
-    def available_items(self):
-        return [self.available_list.item(i).data(Qt.UserRole) for i in range(self.available_list.count())]
-
-
-
-
+            self.turb_canvas.queue_image(self.current_screen, cmap="viridis", auto_levels=True)

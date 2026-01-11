@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 
 from scripts.poke_tab import Poke_tab
 from scripts.turbulence_tab import Turbulence_tab
+from scripts.sensor_view_tab import SensorView_tab
 
 import cupy as cp
 import sys
@@ -63,8 +64,13 @@ class MainWindow(QMainWindow):
         print("> Poke diagnostic tab done!")
 
         print("> Starting Turbulence tab building")
-        tabs.addTab(turb := Turbulence_tab(self.params), "Turbulence")
+        tabs.addTab(turb := Turbulence_tab(self.params, poke.wfsensors), "Turbulence")
+        # poke.sensors_changed.connect(turb.update_sensor_tabs)
         print("> Turbulence tab done!")
+        
+        print("> Starting SensorView tab building")
+        tabs.addTab(sensview := turb.overview_tab, "SensorView")
+        print("> SensorView tab done!")
 
 
         self.setCentralWidget(tabs)

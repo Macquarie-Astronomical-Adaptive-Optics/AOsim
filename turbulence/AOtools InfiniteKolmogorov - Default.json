@@ -1,8 +1,0 @@
-{
-    "function": "AOtools InfiniteKolmogorov",
-	"r0": 0.4,
-    "L0": 25.0,
-    "Vwind": 4.0,
-	"altitude": 200.0,
-    "random_seed":12
-}

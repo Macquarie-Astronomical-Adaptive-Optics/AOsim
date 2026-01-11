@@ -3,9 +3,9 @@ CONFIG_DTYPES = {
     "telescope_center_obscuration": float,
     "wfs_lambda": float,
     "science_lambda": float,
-    "r0": float,
-    "L0": float,
-    "Vwind": float,
+    "r0_total": float,
+    "N": float,
+    "wind": float,
     "actuators": int,
     "sub_apertures": int,
     "frame_rate": int,
@@ -16,6 +16,12 @@ CONFIG_DTYPES = {
     "use_gpu": bool,
     "data_path": str,
     "altitude": float,
+    "name": str,
+    "altitude_m": float,
+    "weight": float,
+    "L0": float,
+    "wind": list,         # expects JSON like [6.0, 1.0]
+    "seed_offset": int,
 }
 
 def enforce_config_types(config):

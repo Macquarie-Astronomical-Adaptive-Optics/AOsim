@@ -1,173 +1,212 @@
 import json
+from typing import Any, Dict, Iterable, List
 
-from PySide6.QtCore import Qt, Signal, Signal, Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QWidget,
     QTableWidget, QTableWidgetItem, QPushButton,
     QFileDialog, QMessageBox,
 )
 
-import scripts.utilities as ut
 from data.CONFIG_DTYPES import CONFIG_DTYPES
 
+
 class Config_table(QWidget):
+    """
+    Simple key/value editor for a dict-like config section.
+
+    - Keys are fixed to `section_key` order.
+    - Values are edited as text but converted using CONFIG_DTYPES:
+        * bool: accepts true/false/1/0/yes/no
+        * list/tuple/dict: accepts JSON (e.g. [1,2], {"a": 1})
+        * other types: dtype(value_str)
+      If conversion fails, stores the raw string.
+    """
     params_changed = Signal(dict)
 
-    def __init__(self, section_key, config_dict):
-        super().__init__()
-        self.section_key = list(section_key)          # original keys in order
-        self.config = config_dict
-        self.loading_config = False
+    def __init__(self, section_key: Iterable[str], config_dict: Dict[str, Any], parent=None):
+        super().__init__(parent)
 
-        # mapping: readable header -> original key
-        self.header_map = {}
-        # row index -> original key (fast lookup)
-        self.row_keys = list(self.section_key)
+        self.row_keys: List[str] = list(section_key)
+        self.config: Dict[str, Any] = config_dict
 
-        # parameter table
-        table_layout = QVBoxLayout(self)
-        self.table = QTableWidget(len(self.row_keys), 2)
+        self._loading = False  # guard to ignore itemChanged during programmatic updates
+        self._header_map: Dict[str, str] = {}  # readable -> key
+
+        # ---- UI ----
+        outer = QVBoxLayout(self)
+
+        self.table = QTableWidget(len(self.row_keys), 2, self)
         self.table.setHorizontalHeaderLabels(["Parameter", "Value"])
         self.table.setWordWrap(True)
+        self.table.itemChanged.connect(self._on_item_changed)
+        outer.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        self.btn_save = QPushButton("Save")
+        self.btn_load = QPushButton("Load")
+        btn_row.addWidget(self.btn_save)
+        btn_row.addWidget(self.btn_load)
+        outer.addLayout(btn_row)
+
+        self.btn_save.clicked.connect(self.save_file)
+        self.btn_load.clicked.connect(self.open_file)
+
+        self._populate_table()
+
+    # -------------------------
+    # Table population
+    # -------------------------
+    def _populate_table(self):
+        """Fill/refresh table from self.config for the configured keys."""
+        self._loading = True
+        self.table.blockSignals(True)
+
+        self._header_map.clear()
 
         for row, key in enumerate(self.row_keys):
-            value = self.config.get(key, "")
-
-            readable = " ".join(str(key).split("_")).title()
-            # save mapping
-            self.header_map[readable] = key
+            readable = self._readable_key(key)
+            self._header_map[readable] = key
 
             key_item = QTableWidgetItem(readable)
-            key_item.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
+            key_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
 
-            val_item = QTableWidgetItem(str(value))
+            val = self.config.get(key, "")
+            val_item = QTableWidgetItem(self._format_value(val))
 
             self.table.setItem(row, 0, key_item)
             self.table.setItem(row, 1, val_item)
 
         self.table.resizeRowsToContents()
-        self.table.itemChanged.connect(self.param_change)
 
-        table_layout.addWidget(self.table)
+        self.table.blockSignals(False)
+        self._loading = False
 
-        config_save_load_layout = QHBoxLayout()
-        self.config_save_b = QPushButton("Save")
-        self.config_load_b = QPushButton("Load")
-        config_save_load_layout.addWidget(self.config_save_b)
-        config_save_load_layout.addWidget(self.config_load_b)
-        table_layout.addLayout(config_save_load_layout)
+    @staticmethod
+    def _readable_key(key: str) -> str:
+        return " ".join(str(key).split("_")).title()
 
-        self.config_save_b.clicked.connect(self.save_file)
-        self.config_load_b.clicked.connect(self.open_file)
+    @staticmethod
+    def _format_value(val: Any) -> str:
+        # Prefer JSON formatting for containers so users can round-trip edit.
+        if isinstance(val, (list, tuple, dict)):
+            try:
+                return json.dumps(val)
+            except Exception:
+                return str(val)
+        return str(val)
 
-    def param_change(self, item):
-        # only respond to edits in the Value column
-        if self.loading_config:
+    # -------------------------
+    # Editing
+    # -------------------------
+    def _on_item_changed(self, item: QTableWidgetItem):
+        if self._loading:
             return
         if item.column() != 1:
             return
 
         row = item.row()
-        # get original key for this row
-        if row < 0 or row >= len(self.row_keys):
+        if not (0 <= row < len(self.row_keys)):
             return
+
         key = self.row_keys[row]
+        value_str = item.text()
 
-        value_str = self.table.item(row, 1).text()
+        value = self._convert_value(key, value_str)
+        self.config[key] = value
 
-        # convert to correct type (default to string)
+        # Emit a copy to avoid accidental shared-mutable surprises downstream
+        self.params_changed.emit(dict(self.config))
+
+    @staticmethod
+    def _convert_value(key: str, value_str: str) -> Any:
+        """
+        Convert using CONFIG_DTYPES[key] if present.
+        Adds JSON parsing for list/tuple/dict automatically.
+        """
         dtype = CONFIG_DTYPES.get(key, str)
 
+        s = value_str.strip()
+
         try:
+            # bool
             if dtype is bool:
-                value = value_str.lower() in ["true", "1", "yes"]
-            else:
-                value = dtype(value_str)
+                return s.lower() in ("true", "1", "yes", "y", "on")
+
+            # JSON containers (common in your turbulence config: wind=[vx,vy])
+            if dtype in (list, tuple, dict):
+                parsed = json.loads(s)  # expects valid JSON: [..] or {..}
+                if dtype is tuple:
+                    return tuple(parsed)
+                if dtype is list:
+                    return list(parsed)
+                return dict(parsed)
+
+            # If dtype isn't container but the user typed JSON anyway, optionally accept it.
+            # (Handy when CONFIG_DTYPES is incomplete)
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    return json.loads(s)
+                except Exception:
+                    pass
+
+            # numeric / other cast
+            return dtype(s)
         except Exception:
-            value = value_str
+            # fallback to raw string
+            return value_str
 
-        # update shared config and emit
-        self.config[key] = value
-        self.params_changed.emit(self.config)
-
-    def show_config_dtypes(self):
-        text = "\n".join(f"{k}: {type(v).__name__}" for k, v in self.config.items())
-        QMessageBox.information(self, "Config Types", text)
-
+    # -------------------------
+    # Save / Load
+    # -------------------------
     def open_file(self):
-        self.loading_config = True
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select config file",
-            "",
-            "JSON Files (*.json);;All Files (*)"
+            self, "Select config file", "", "JSON Files (*.json);;All Files (*)"
         )
         if not file_path:
-            self.loading_config = False
             return
 
-        with open(file_path, "r") as f:
-            loaded = json.load(f)
+        try:
+            with open(file_path, "r") as f:
+                loaded = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Load Failed", f"Could not load JSON:\n{e}")
+            return
 
-        # update only keys in this section (if they exist in the loaded file)
+        # update only known keys
         for key in self.row_keys:
             if key in loaded:
                 self.config[key] = loaded[key]
 
-        # refresh table display (use existing row_keys order)
-        for row, key in enumerate(self.row_keys):
-            value = self.config.get(key, "")
-
-            readable = " ".join(str(key).split("_")).title()
-            key_item = QTableWidgetItem(readable)
-            key_item.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
-            key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
-
-            val_item = QTableWidgetItem(str(value))
-
-            # block signals while updating items to avoid param_change firing
-            self.table.blockSignals(True)
-            self.table.setItem(row, 0, key_item)
-            self.table.setItem(row, 1, val_item)
-            self.table.blockSignals(False)
-
-        self.params_changed.emit(self.config)
-        self.loading_config = False
+        self._populate_table()
+        self.params_changed.emit(dict(self.config))
 
     def save_file(self):
-        # build a dict with only the listed keys (in this section)
-        new_section = {}
-        for row in range(self.table.rowCount()):
-            key_readable = self.table.item(row, 0).text()
-            orig_key = self.header_map.get(key_readable, "_".join(key_readable.lower().split()))
-            value_str = self.table.item(row, 1).text()
-            new_section[orig_key] = self._convert_value(orig_key, value_str)
+        # build a dict with only keys in this section (preserving row order)
+        section_out = {key: self.config.get(key, "") for key in self.row_keys}
 
         file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            f"Save {self.section_key} Config",
-            f"{self.section_key}_config.json",
-            "JSON Files (*.json)"
+            self, "Save Config", "config.json", "JSON Files (*.json)"
         )
         if not file_path:
             return
 
-        with open(file_path, "w") as f:
-            json.dump(new_section, f, indent=4)
-
-        # update the shared config only for these keys
-        for k, v in new_section.items():
-            self.config[k] = v
-
-        self.params_changed.emit(self.config)
-
-    @staticmethod
-    def _convert_value(key, val_str):
-        dtype = CONFIG_DTYPES.get(key, str)
         try:
-            if dtype is bool:
-                return val_str.lower() in ["true", "1", "yes"]
-            return dtype(val_str)
-        except Exception:
-            return val_str
+            with open(file_path, "w") as f:
+                json.dump(section_out, f, indent=4)
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", f"Could not write file:\n{e}")
+            return
+
+        self.params_changed.emit(dict(self.config))
+
+    # -------------------------
+    # Optional debug helper
+    # -------------------------
+    def show_config_dtypes(self):
+        lines = []
+        for k in self.row_keys:
+            v = self.config.get(k, None)
+            lines.append(f"{k}: {type(v).__name__}")
+        QMessageBox.information(self, "Config Types", "\n".join(lines))
