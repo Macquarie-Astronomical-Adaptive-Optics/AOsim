@@ -1,8 +1,8 @@
-# CuPy-only "infinite phase screen" (Assemat & Wilson style) + layered AO sampling
+# CuPy-only "infinite phase screen" (Assemat & Wilson) + layered AO sampling
 #
 # Key idea: keep NxN window and extend by generating new rows/cols:
 #   X = A Z + B b
-# where A, B derived from covariance matrices. :contentReference[oaicite:2]{index=2}
+# where A, B derived from covariance matrices.
 
 import math
 from dataclasses import dataclass
@@ -17,8 +17,7 @@ from scipy.special import kv
 def _kv(v, arg):
     return cp.asarray(kv(cp.asnumpy(v), cp.asnumpy(arg)))
 
-# ---------- von Karman phase covariance (CuPy) ----------
-# Matches AOtools' implementation of "equation 5" used by Assemat & Wilson. :contentReference[oaicite:3]{index=3}
+# ---------- von Karman phase covariance ----------
 def phase_covariance_vk_cp(r: cp.ndarray, r0: float, L0: float, dtype=cp.float32) -> cp.ndarray:
     r = cp.asarray(r, dtype=dtype)
     r0 = float(r0)
@@ -464,81 +463,128 @@ class InfiniteVonKarmanScreen2D:
 
 
 
-# ---------- Multi-layer wrapper matching your existing API ----------
+# ---------- Multi-layer wrapper API ----------
 @dataclass
 class _Layer:
     name: str
     altitude_m: float
-    weight: float
+    r0_layer: float
     L0: float
     wind: Tuple[float, float]
     seed_offset: int
-    r0_layer: float
     screen: InfiniteVonKarmanScreen2D
-    phi: Optional[cp.ndarray] = None  # current NxN window
+    active: bool = True
+    phi: Optional[cp.ndarray] = None # current NxN window
 
 
 class LayeredInfinitePhaseScreen:
-    """
-    Drop-in replacement for your LayeredPhaseScreen but using non-periodic infinite screens.
-    """
 
-    def __init__(self, N: int, dx: float, r0_total: float, seed: int = 0, n_columns: int = 2, dtype=cp.float32, **_):
+    def __init__(self, N: int, dx: float, seed: int = 0, n_columns: int = 2, dtype=cp.float32, **_):
         self.N = int(N)
         self.dx = float(dx)
-        self.r0_total = float(r0_total)
         self.seed = int(seed)
         self.n_columns = int(n_columns)
         self.dtype = dtype
 
-        self.layers: List[dict] = []   # keep dicts for compatibility with your SimWorker
-        self._layers_obj: List[_Layer] = []
+        self.layers: List[dict] = []        # dict view (GUI/worker)
+        self._layers_obj: List[_Layer] = [] # object view (sampling)
 
-    def _r0_from_weight(self, w: float) -> float:
-        # r0_i^{-5/3} = w * r0_total^{-5/3} => r0_i = r0_total / w^{3/5}
-        return self.r0_total / (float(w) ** (3.0 / 5.0))
+        self.r0_total = None
 
-    def add_layer(self, name: str, altitude_m: float, weight: float, L0: float = 30.0,
-                  wind: Sequence[float] = (0.0, 0.0), seed_offset: int = 0):
-        w = float(weight)
-        if w <= 0:
-            raise ValueError("weight must be > 0")
+    def _compute_r0_total(self) -> float:
+        s = 0.0
+        for L in self._layers_obj:
+            if not L.active:
+                continue
+            s += float(L.r0_layer) ** (-5.0/3.0)
+        return float("inf") if s == 0 else s ** (-3.0/5.0)
 
-        r0_i = self._r0_from_weight(w)
+    def _compute_weights(self):
+        # for display/debug only
+        vals = [float(L.r0_layer) ** (-5.0 / 3.0) for L in self._layers_obj]
+        denom = sum(vals)
+        if denom <= 0:
+            return [0.0] * len(vals)
+        return [v / denom for v in vals]
+
+    def _refresh_totals(self):
+        self.r0_total = self._compute_r0_total()
+        ws = self._compute_weights()
+        for i, w in enumerate(ws):
+            self.layers[i]["w"] = float(w)
+
+        return self.r0_total
+
+    def _rebuild_name_map(self):
+        self._name_to_idx = {}
+        for i, L in enumerate(self._layers_obj):
+            self._name_to_idx[L.name] = i
+
+    def _idx_from_name(self, name: str) -> int:
+        if not self._name_to_idx:
+            self._rebuild_name_map()
+        if name not in self._name_to_idx:
+            # fallback: rebuild in case names changed
+            self._rebuild_name_map()
+        if name not in self._name_to_idx:
+            raise KeyError(f"Unknown layer name: {name!r}. Available: {list(self._name_to_idx.keys())}")
+        return int(self._name_to_idx[name])
+
+    def add_layer(self, name: str, altitude_m: float, r0: float,
+              L0: float = 30.0, wind: Sequence[float] = (0.0, 0.0),
+              seed_offset: int = 0):
+        r0_i = float(r0)
+        if r0_i <= 0:
+            raise ValueError("r0_layer must be > 0")
+
         scr = InfiniteVonKarmanScreen2D(
             N=self.N, dx=self.dx, r0=r0_i, L0=float(L0),
             seed=self.seed + int(seed_offset),
             n_columns=self.n_columns,
-            dtype=self.dtype
+            dtype=self.dtype,
         )
 
         layer_obj = _Layer(
             name=name,
             altitude_m=float(altitude_m),
-            weight=w,
             L0=float(L0),
             wind=(float(wind[0]), float(wind[1])),
             seed_offset=int(seed_offset),
             r0_layer=r0_i,
             screen=scr,
-            phi=scr.scrn
+            phi=scr.scrn,
         )
         self._layers_obj.append(layer_obj)
 
-        # expose dict view compatible with your existing code paths
+        # dict view
         self.layers.append({
             "name": name,
             "h": layer_obj.altitude_m,
-            "w": layer_obj.weight,
             "r0": layer_obj.r0_layer,
             "L0": layer_obj.L0,
             "vx": layer_obj.wind[0],
             "vy": layer_obj.wind[1],
+            "active": True,
             "phi": layer_obj.phi,
-            "phi_t": None,
         })
 
+
+        self._refresh_totals()
+        self._rebuild_name_map()
+
     # ----- updates -----
+    def set_layer_active(self, idx: int, active: bool):
+        idx = int(idx)
+        a = bool(active)
+        self._layers_obj[idx].active = a
+        self.layers[idx]["active"] = a
+        self._refresh_totals()  # if your total r0 depends on active layers
+
+    def set_layer_active_name(self, name: str, active: bool):
+        i = self._idx_from_name(name)
+        self.set_layer_active(i, active)
+
+
     def set_layer_altitude(self, idx: int, altitude_m: float):
         idx = int(idx)
         h = float(altitude_m)
@@ -555,36 +601,18 @@ class LayeredInfinitePhaseScreen:
         self.layers[idx]["vx"] = float(vx)
         self.layers[idx]["vy"] = float(vy)
 
-    def set_layer_weight(self, idx: int, w_new: float, renormalize: bool = True):
+    def set_layer_r0(self, idx: int, r0_new: float):
         idx = int(idx)
-        w_new = float(w_new)
-        if w_new <= 0:
-            raise ValueError("weight must be > 0")
+        r0_new = float(r0_new)
+        if r0_new <= 0:
+            raise ValueError("r0_layer must be > 0")
 
-        ws = [L.weight for L in self._layers_obj]
-        if renormalize:
-            total_other = sum(ws) - ws[idx]
-            if total_other <= 0:
-                ws = [0.0] * len(ws)
-                ws[idx] = 1.0
-            else:
-                remaining = max(1e-12, 1.0 - w_new)
-                scale = remaining / total_other
-                ws = [w * scale for w in ws]
-                ws[idx] = w_new
-        else:
-            ws[idx] = w_new
+        L = self._layers_obj[idx]
+        L.r0_layer = r0_new
+        L.screen.rescale_r0(r0_new)
 
-        # apply: weights change => each layer r0 changes
-        for i, L in enumerate(self._layers_obj):
-            old_r0 = L.r0_layer
-            L.weight = ws[i]
-            new_r0 = self._r0_from_weight(L.weight)
-            L.r0_layer = new_r0
-            L.screen.rescale_r0(new_r0)
-
-            self.layers[i]["w"] = L.weight
-            self.layers[i]["r0"] = new_r0
+        self.layers[idx]["r0"] = r0_new
+        self._refresh_totals()
 
     def set_layer_L0(self, idx: int, L0_new: float):
         idx = int(idx)
@@ -596,27 +624,19 @@ class LayeredInfinitePhaseScreen:
         L.screen.rebuild_L0(L0_new)
         self.layers[idx]["L0"] = L0_new
 
-    def update_global_r0(self, r0_total_new: float):
-        r0_total_new = float(r0_total_new)
-        if r0_total_new == self.r0_total:
-            return
-        self.r0_total = r0_total_new
-        for i, L in enumerate(self._layers_obj):
-            new_r0 = self._r0_from_weight(L.weight)
-            L.r0_layer = new_r0
-            L.screen.rescale_r0(new_r0)
-            self.layers[i]["r0"] = new_r0
-
     # ----- time step -----
     def advance(self, dt: float):
         dt = float(dt)
         for i, L in enumerate(self._layers_obj):
+            if not L.active:
+                continue
             vx, vy = L.wind
             L.screen.advance(vx, vy, dt)
             L.phi = L.screen.scrn
-            self.layers[i]["phi"] = L.phi  # keep dict view updated
+            self.layers[i]["phi"] = L.phi
 
-    # ----- batched sampling (same shape/meaning as your current function) -----
+
+    # ----- batched sampling -----
     def sample_patches_batched(
         self,
         thetas_xy_rad,          # (S,2) radians
@@ -657,6 +677,9 @@ class LayeredInfinitePhaseScreen:
             outL = cp.zeros((L, S, M, M), dtype=self.dtype)
 
             for li, Lyr in enumerate(self._layers_obj):
+                if not Lyr.active:
+                    continue
+
                 h = float(Lyr.altitude_m)
                 sx = (h * thetas[:, 0]) / self.dx
                 sy = (h * thetas[:, 1]) / self.dx
@@ -678,6 +701,8 @@ class LayeredInfinitePhaseScreen:
         # combined (S,M,M)
         out = cp.zeros((S, M, M), dtype=self.dtype)
         for Lyr in self._layers_obj:
+            if not Lyr.active:
+                continue
             h = float(Lyr.altitude_m)
             sx = (h * thetas[:, 0]) / self.dx
             sy = (h * thetas[:, 1]) / self.dx
@@ -698,6 +723,7 @@ class LayeredInfinitePhaseScreen:
     
     def get_layer_view(self, idx: int, center_xy_pix=None, size_pixels=None, M=None, angle_deg=0.0, return_gpu=True):
         idx = int(idx)
+        
         if center_xy_pix is None:
             c = ( (self.N - 1) / 2.0, (self.N - 1) / 2.0 )
         else:

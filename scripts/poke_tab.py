@@ -15,6 +15,9 @@ from scripts.worker import CalculateWorker
 from scripts.config_table import Config_table
 from data.CONFIG_DTYPES import CONFIG_DTYPES, enforce_config_types
 
+ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
+
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
     sensors_changed = Signal(dict)
@@ -24,12 +27,14 @@ class Poke_tab(QWidget):
         self.params = config_dict
         self.wfsensors = {}
 
+        print("Creating sensors")
         self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann()
         self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=45, dy=0)
         self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=-45, dy=0)
         self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=45)
         self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=-45)
         self.sensors_changed.emit(self.wfsensors)
+        [print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec") for i,j in self.wfsensors.items()]
 
         # calculation jobs bookkeeping
         self.job_id = 0
@@ -66,8 +71,10 @@ class Poke_tab(QWidget):
         sensor_tabs = DetachableTabWidget()
         sensor_tabs.setMovable(True)
         
+        print("Starting sensor tab editor: ")
         self.tab_pages = []
         for key, val in self.wfsensors.items():
+            print(" -", key)
             tab = SensorTabWidget(dict(self.params), key, val)
             tab.sensor_changed.connect(self.update_sensor)
 

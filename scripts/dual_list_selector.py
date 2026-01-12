@@ -6,6 +6,9 @@ from PySide6.QtWidgets import (
 
 class DualListSelector(QWidget):
     activeChanged = Signal(list)
+    availableChanged = Signal(list)
+    itemsChanged = Signal(list, bool)
+
     def __init__(self, available=None, active=None, text_key=None, parent=None):
         super().__init__(parent)
 
@@ -87,23 +90,38 @@ class DualListSelector(QWidget):
 
         if removed_from_active:
             self.activeChanged.emit(self.active_items())
+            self.availableChanged.emit(self.available_items())
+            self.itemsChanged.emit([obj], False)
 
     # --- Moving items ---
     def move_to_active(self):
+        change_list = []
         for item in self.available_list.selectedItems():
             obj = item.data(Qt.UserRole)
+            change_list.append(obj)
+
             self._add_item(self.active_list, obj)
             self.available_list.takeItem(self.available_list.row(item))
 
         self.activeChanged.emit(self.active_items())
+        self.availableChanged.emit(self.available_items())
+        self.itemsChanged.emit(change_list, True)
+
 
     def move_to_available(self):
+        change_list = []
+
         for item in self.active_list.selectedItems():
             obj = item.data(Qt.UserRole)
+            change_list.append(obj)
+
             self._add_item(self.available_list, obj)
             self.active_list.takeItem(self.active_list.row(item))
 
         self.activeChanged.emit(self.active_items())
+        self.availableChanged.emit(self.available_items())
+        self.itemsChanged.emit(change_list, False)
+
 
     # --- Accessor methods ---
     def active_items(self):

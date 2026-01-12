@@ -13,7 +13,7 @@ from scripts.utilities import Pupil_tools
 from scripts.config_table import Config_table
 from scripts.wrap_tab import DetachableTabWidget
 from scripts.pgcanvas import PGCanvas
-from scripts.phase_screen.infinite_kolmogorov import LayeredInfinitePhaseScreen
+from scripts.phase_screen.infinite_vonkarman import LayeredInfinitePhaseScreen
 from scripts.schedulerGPU import SimWorker
 from scripts.dual_list_selector import DualListSelector
 from scripts.sensor_view_tab import SensorView_tab
@@ -26,6 +26,7 @@ RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
 
 class Turbulence_tab(QWidget):
     active_changed = Signal(object)
+    req_add_layer = Signal(object)
     req_overview_enabled = Signal(bool)
     req_emit_overview = Signal()
     req_visible_sensor = Signal(int)
@@ -36,7 +37,7 @@ class Turbulence_tab(QWidget):
         self.params = config_dict
         self.sensors = sensors
 
-        self.available_funcs = {"InfKolmogorov": LayeredInfinitePhaseScreen}
+        self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
 
         screen_directory = Path(__file__).parent.parent / "turbulence"
 
@@ -69,7 +70,7 @@ class Turbulence_tab(QWidget):
 
         # build widgets from layer configs (GUI side only)
         for i, layer in enumerate(layers):
-            name = f"{screen['name']} Layer {i}"
+            name = f"Layer {i+1}"
             turbWidget = TurbulenceWidget(name, screen["function"], layer)
             self.turbWidgets[i] = turbWidget
 
@@ -91,8 +92,21 @@ class Turbulence_tab(QWidget):
         self.science_canvas = PGCanvas()
         left_layout.addWidget(self.science_canvas)
 
-        self.psf_r0_label = QLabel(f"r0_total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
+        self.psf_r0_label = QLabel(f"R0 total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
         left_layout.addWidget(self.psf_r0_label)
+
+        self.layer_selector = DualListSelector(active=self.turbWidgets.values(), text_key="title")
+        self.layer_selector.itemsChanged.connect(self.active_change)
+
+        left_layout.addWidget(self.layer_selector)
+
+        add_layer_btn = QPushButton("Add Layer")
+        add_layer_btn.clicked.connect(self.add_layer)
+
+        left_layout.addWidget(add_layer_btn)
+
+        print("Active layers: ")
+        [print(" -", i.title) for i in self.layer_selector.active_items()]
 
         main_layout.addWidget(left_frame)
 
@@ -168,6 +182,7 @@ class Turbulence_tab(QWidget):
         self.req_overview_enabled.connect(self.scheduler.set_overview_enabled)
         self.req_emit_overview.connect(self.scheduler.emit_overview_once)
         self.req_visible_sensor.connect(self.scheduler.set_visible_sensor)
+        self.req_add_layer.connect(self.scheduler.add_layer)
 
 
         self.scheduler_thread.started.connect(self.scheduler.build_sim)
@@ -208,18 +223,40 @@ class Turbulence_tab(QWidget):
         
         self.scheduler.all_sensor_psf_ready.connect(self.overview_tab.psf_grid.update_psfs)
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
+        self.scheduler.sim_signal.connect(self.overview_tab.layer_grid.set_layers_cfg)
+        
+        self.scheduler.update_r0.connect(lambda r: self.psf_r0_label.setText(f"R0 total: {r:.3f}"))
 
         # enable and render once (queued)
         self.req_overview_enabled.emit(True)
         self.req_emit_overview.emit()
 
+    def add_layer(self):
+        layer_params = self.turbulence_screens[0]["data"]["layers"][0].copy()
+
+
+        i = len(self.turbWidgets)
+        name = f"Layer {i+1}"
+        layer_params['name'] = name
+        layer_params['seed_offset'] = i+1
+
+        self.req_add_layer.emit(layer_params)
+
+        turbWidget = TurbulenceWidget(name, self.turbulence_screens[0]["function"], layer_params)
+        self.turbWidgets[i] = turbWidget
+        self.layer_selector._add_item(self.layer_selector.available_list, turbWidget)
+        self.tab_widget.addTab(turbWidget, name)
+        turbWidget.screen_params_changed.connect(lambda p, idx=i: self.scheduler.apply_layer_params(idx, p))
+
+
+    def active_change(self, items, active):
+        self.scheduler.set_active([turbWidg.title for turbWidg in items], active)   
 
     # ----------- UI slots -----------
     @Slot()
     def _run_x_clicked(self):
         n = int(self.spin.value())
-        # emit final only (fast). If you want animation: emit_every=1
-        self.scheduler.step_n(n, 0)
+        self.scheduler.step_n(n, 2)
 
     @Slot(int)
     def _tab_changed(self, idx: int):

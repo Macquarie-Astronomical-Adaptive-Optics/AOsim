@@ -17,6 +17,8 @@ class SimWorker(QObject):
 
     # main outputs
     combined_ready = Signal(object)       # np (N,N)
+    update_r0 = Signal(float)
+    sim_signal = Signal(object)
 
     # single views (for tabs)
     layer_ready = Signal(int, object)     # (layer_idx, np (H,W))
@@ -138,7 +140,7 @@ class SimWorker(QObject):
         [self.status.emit("     "+str((i, j))) for i, j in self.sim_kwargs.items()]
 
         for k, layer in enumerate(self.layer_cfgs):
-            self.status.emit(f"   Adding layer {k}...")
+            self.status.emit(f"   Adding layer {k+1}...")
             [self.status.emit("     "+str((i, j))) for i, j in layer.items()]
 
             self.sim.add_layer(**layer)
@@ -150,6 +152,17 @@ class SimWorker(QObject):
         self._pupil_mask_psf = self._build_circular_pupil(self.psf_M)
 
         self.status.emit(f"Built sim with {len(self.layer_cfgs)} layers.")
+        self.update_r0.emit(self.sim.r0_total)
+        self._emit_once()
+
+    @Slot(dict)
+    def add_layer(self, layer_cfgs):
+
+        self.status.emit(f"Adding layer...")
+        self.sim.add_layer(**layer_cfgs)
+        self.layer_cfgs.append(layer_cfgs) 
+
+        self.sim_signal.emit(self.sim.layers)
         self._emit_once()
 
     @Slot()
@@ -197,6 +210,7 @@ class SimWorker(QObject):
         if self.sim is None:
             self.build_sim()
         self.timer.stop()
+        self._ensure_cache()
         self._advance(1)
         self._emit_once()
 
@@ -234,6 +248,15 @@ class SimWorker(QObject):
         self._emit_visible_sensor_products()
 
     # ------------------ layer edits ------------------
+    @Slot(list, bool)
+    def set_active(self, names: list, active: bool):
+        for i, name in enumerate(names):
+            self.sim.set_layer_active_name(name, active)
+
+        self.update_r0.emit(self.sim.r0_total)
+        self.sim_signal.emit(self.sim.layers)
+        self._emit_once()
+        
     @Slot(int, object)
     def apply_layer_params(self, idx: int, params: dict):
         if self.sim is None:
@@ -270,16 +293,14 @@ class SimWorker(QObject):
                 self.sim.layers[i]["phi_t"] = None
 
         # weight
-        if "weight" in p:
-            w = float(p["weight"])
-            if hasattr(self.sim, "set_layer_weight"):
-                self.sim.set_layer_weight(i, w, renormalize=True)
-            elif hasattr(self.sim, "update_weights"):
-                ws = [float(L.get("w", L.get("weight"))) for L in self.sim.layers]
-                ws[i] = w
-                self.sim.update_weights(ws)
+        if "r0" in p:
+            r0 = float(p["r0"])
+            if hasattr(self.sim, "set_layer_r0"):
+                self.sim.set_layer_r0(i, r0)
             else:
-                self.sim.layers[i]["w"] = w
+                self.sim.layers[i]["r0"] = r0
+
+            self.update_r0.emit(self.sim.r0_total)
 
         # seed_offset: rebuild just that layer if supported; otherwise rebuild sim
         if "seed_offset" in p:
@@ -337,7 +358,7 @@ class SimWorker(QObject):
 
         # (L, N, N)
         stack = cp.stack(
-            [
+            [ 
                 self.sim.get_layer_view(
                     i,
                     center_xy_pix=((N - 1) / 2.0, (N - 1) / 2.0),
@@ -346,7 +367,9 @@ class SimWorker(QObject):
                     angle_deg=0.0,
                     return_gpu=True,
                 )
-                for i in range(L)
+                if self.sim._layers_obj[i].active 
+                else cp.zeros((N, N,), dtype=cp.float32)
+                for i in range(L) 
             ],
             axis=0,
         )
@@ -451,7 +474,12 @@ class SimWorker(QObject):
         self.combined_ready.emit(cp.asnumpy(self._combined_gpu().astype(cp.float16)))
         self._emit_visible_layer()
         self._emit_visible_sensor_products()
+        psfs = self._compute_all_sensor_psfs()
+        self.all_sensor_psf_ready.emit(cp.asnumpy(psfs.astype(cp.float16)))
+        
+        self._overview_enabled = True # Temporarily override once
         self._emit_overview()
+        self._overview_enabled = False
 
     @Slot()
     def emit_overview_once(self):
@@ -494,8 +522,9 @@ class SimWorker(QObject):
     # ------------------ main tick ------------------
     @Slot()
     def _tick(self):
-        self._advance(1)
         self._ensure_cache()
+        self._advance(1)
+
         self._tick_count += 1
 
         # always emit combined (cheap-ish; still a copy)
@@ -516,18 +545,7 @@ class SimWorker(QObject):
                 self.all_sensor_psf_ready.emit(cp.asnumpy(psfs.astype(cp.float16)))
 
             if (self._tick_count % self._overview_layer_period) == 0:
-                phases = self.sim.sample_patches_batched(
-                    thetas_xy_rad=self.thetas_gpu,
-                    center_xy_pix=self.patch_center,
-                    size_pixels=self.patch_size_px,
-                    M=self.psf_M,
-                    angle_deg=0.0,
-                    remove_piston=True,
-                    return_gpu=True,
-                    return_per_layer=True,
-                    layer_first=True,
-                )  # (S,M,M)
-                self.all_layers_ready.emit(cp.asnumpy(phases.astype(cp.float16)))
+                self._emit_overview()
 
         # fps
         now = time.perf_counter()
