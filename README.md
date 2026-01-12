@@ -13,7 +13,7 @@ Poke matrix diagnostics:
 - FWHM, Diffraction Limit, Strehl Calculations
 - Parameter config save/load
 
-<img width="2560" height="1540" alt="image" src="https://github.com/user-attachments/assets/fa3c901e-8ecb-40d8-9afb-ba5eec5ac2a0" />
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/bb720d5d-3636-4416-85ae-2811e8903c8e" />
 
 Turbulence 
 - Turbulence phase screen generator/editor
