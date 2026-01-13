@@ -7,9 +7,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget
 )
 
-from scripts.poke_tab import Poke_tab
-from scripts.turbulence_tab import Turbulence_tab
-from scripts.sensor_view_tab import SensorView_tab
+from scripts.window_tabs.poke_tab import Poke_tab
+from scripts.window_tabs.turbulence_tab import Turbulence_tab
+from scripts.window_tabs.sensor_view_tab import SensorView_tab
 
 import cupy as cp
 import sys

@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 )
 
 
-from scripts.grids import LayerFootprintGrid, SensorPSFGrid
+from scripts.widgets.grids import LayerFootprintGrid, SensorPSFGrid
 
 class SensorView_tab(QWidget):
 

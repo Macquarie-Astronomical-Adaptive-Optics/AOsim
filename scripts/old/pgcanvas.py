@@ -8,7 +8,7 @@ import cupy as cp
 
 import matplotlib.cm as cm
 
-from scripts.pg_colormaps import apply_mpl_cmap
+from scripts.widgets.pg_colormaps import apply_mpl_cmap
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 

@@ -2,7 +2,7 @@ from PySide6.QtWidgets import QWidget, QGridLayout, QLabel, QVBoxLayout, QSizePo
 import numpy as np
 import cupy as cp
 
-from scripts.pgcanvas import PGCanvas
+from scripts.widgets.pgcanvas import PGCanvas
 from scripts.utilities import Pupil_tools
 
 class SensorPSFGrid(QWidget):
@@ -11,7 +11,7 @@ class SensorPSFGrid(QWidget):
 
     thetas_xy_rad: list/array shape (S,2) with theta_x, theta_y in radians.
     """
-    def __init__(self, thetas_xy_rad, parent=None, title="Sensor PSFs"):
+    def __init__(self, thetas_xy_rad, title="Sensor PSFs", parent=None):
         super().__init__(parent)
         self.thetas = np.asarray(thetas_xy_rad, dtype=np.float32)  # (S,2)
         self.S = self.thetas.shape[0]

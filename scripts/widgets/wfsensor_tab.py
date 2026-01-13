@@ -8,9 +8,9 @@ from PySide6.QtWidgets import (
 import numpy as np
 
 import scripts.utilities as ut
-from scripts.pgcanvas import PGCanvas
+from scripts.widgets.pgcanvas import PGCanvas
 from scripts.worker import CalculateWorker  # singleton shared worker
-from scripts.config_table import Config_table
+from scripts.widgets.config_table import Config_table
 from data.CONFIG_DTYPES import enforce_config_types
 
 ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)

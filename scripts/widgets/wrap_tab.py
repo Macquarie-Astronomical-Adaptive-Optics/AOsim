@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QPalette
 from PySide6.QtGui import QFontMetrics
-from scripts.popout_window import PopoutWindow
+from scripts.widgets.popout_window import PopoutWindow
 
 # modified code found online
 # allows Widgets to wrap if there is not enough space horizontally

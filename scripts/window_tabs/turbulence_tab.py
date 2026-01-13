@@ -10,13 +10,13 @@ import json
 from pathlib import Path
 
 from scripts.utilities import Pupil_tools
-from scripts.config_table import Config_table
-from scripts.wrap_tab import DetachableTabWidget
-from scripts.pgcanvas import PGCanvas
+from scripts.widgets.config_table import Config_table
+from scripts.widgets.wrap_tab import DetachableTabWidget
+from scripts.widgets.pgcanvas import PGCanvas
 from scripts.phase_screen.infinite_vonkarman import LayeredInfinitePhaseScreen
 from scripts.schedulerGPU import SimWorker
-from scripts.dual_list_selector import DualListSelector
-from scripts.sensor_view_tab import SensorView_tab
+from scripts.widgets.dual_list_selector import DualListSelector
+from scripts.window_tabs.sensor_view_tab import SensorView_tab
 
 import cupy as cp
 
@@ -39,7 +39,7 @@ class Turbulence_tab(QWidget):
 
         self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
 
-        screen_directory = Path(__file__).parent.parent / "turbulence"
+        screen_directory = Path(__file__).parent.parent.parent / "turbulence"
 
         # load turbulence configs
         self.turbulence_screens = []

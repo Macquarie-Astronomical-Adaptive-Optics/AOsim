@@ -10,12 +10,12 @@ import json
 from pathlib import Path
 
 import scripts.utilities as ut
-from scripts.config_table import Config_table
-from scripts.pgcanvas import PGCanvas
-from scripts.wrap_tab import DetachableTabWidget
+from scripts.widgets.config_table import Config_table
+from scripts.widgets.pgcanvas import PGCanvas
+from scripts.widgets.wrap_tab import DetachableTabWidget
 from scripts.utilities import PhaseMap_tools, Pupil_tools
 from scripts.schedulerGPU import GPUScheduler
-from scripts.dual_list_selector import DualListSelector
+from scripts.widgets.dual_list_selector import DualListSelector
 
 from pyqtgraph import ImageItem
 import cupy as cp

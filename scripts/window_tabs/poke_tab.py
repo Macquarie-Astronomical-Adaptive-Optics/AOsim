@@ -5,9 +5,9 @@ from PySide6.QtWidgets import (
 )
 
 import scripts.utilities as ut
-from scripts.wrap_tab import DetachableTabWidget
-from scripts.wfsensor_tab import SensorTabWidget
-from scripts.config_table import Config_table
+from scripts.widgets.wrap_tab import DetachableTabWidget
+from scripts.widgets.wfsensor_tab import SensorTabWidget
+from scripts.widgets.config_table import Config_table
 
 ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
 RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
