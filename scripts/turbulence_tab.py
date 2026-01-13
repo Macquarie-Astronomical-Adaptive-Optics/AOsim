@@ -2,7 +2,7 @@ from PySide6.QtCore import Signal, Slot, QThread
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QWidget,
     QLabel, QFrame,
-    QListWidget, QPushButton, QSizePolicy,
+    QPushButton, QSizePolicy,
     QSpinBox,
 )
 
@@ -92,7 +92,7 @@ class Turbulence_tab(QWidget):
         self.science_canvas = PGCanvas()
         left_layout.addWidget(self.science_canvas)
 
-        self.psf_r0_label = QLabel(f"R0 total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
+        self.psf_r0_label = QLabel(f"Synthetic R0 total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
         left_layout.addWidget(self.psf_r0_label)
 
         self.layer_selector = DualListSelector(active=self.turbWidgets.values(), text_key="title")
@@ -225,7 +225,7 @@ class Turbulence_tab(QWidget):
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
         self.scheduler.sim_signal.connect(self.overview_tab.layer_grid.set_layers_cfg)
         
-        self.scheduler.update_r0.connect(lambda r: self.psf_r0_label.setText(f"R0 total: {r:.3f}"))
+        self.scheduler.update_r0.connect(lambda r: self.psf_r0_label.setText(f"Synthetic R0 total: {r:.3f}"))
 
         # enable and render once (queued)
         self.req_overview_enabled.emit(True)

@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel,
     QSpinBox, QSlider, QTableWidget, QTableWidgetItem
 )
-import cupy as cp
 import numpy as np
 
 import scripts.utilities as ut
@@ -14,6 +13,8 @@ from scripts.worker import CalculateWorker  # singleton shared worker
 from scripts.config_table import Config_table
 from data.CONFIG_DTYPES import enforce_config_types
 
+ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
 
 class SensorTabWidget(QWidget):
     """
@@ -38,13 +39,26 @@ class SensorTabWidget(QWidget):
             )
 
         self.sensor = sensor
+        self.params["dx"] = self.sensor.dx * RAD2ARCSEC
+        self.params["dy"] = self.sensor.dy * RAD2ARCSEC
+        print(" -", self.sensor_name)
 
         params["sub_apertures"] = self.sensor.n_sub
         params["wfs_lambda"] = self.sensor.wavelength 
+        print("    ", self.sensor.n_sub, "sub apertures")
+        print("     at wavelength/lambda:", self.sensor.wavelength, "m")
 
+        enforce_config_types(self.params)
 
         self.job_id = 0
         self.pending_index = 0
+
+        # Cached CPU-side plotting data (avoid repeated GPU->CPU transfers / recomputation)
+        self._pupil_mask = None
+        self._sub_aps = None
+        self._ref_centroids_single = None
+        self._ref_points = None
+        self._subap_mask_cache = {}  # size -> mask
 
         # build UI
         self._build_ui()
@@ -72,14 +86,14 @@ class SensorTabWidget(QWidget):
 
         # request initial compute
         self._schedule_update(0)
-        worker.instance().request_initialization(self.sensor, self.params)
+        CalculateWorker.instance().request_initialization(self.sensor, self.params)
 
     def _build_ui(self):
         main_layout = QHBoxLayout(self)
 
         # Left: config + busy + table
         left_v = QVBoxLayout()
-        config_keys = ["sub_apertures","wfs_lambda"]
+        config_keys = ["sub_apertures","wfs_lambda","dx","dy"]
         self.config_table = Config_table(config_keys, self.params)
         left_v.addWidget(self.config_table)
 
@@ -95,6 +109,13 @@ class SensorTabWidget(QWidget):
         self.calc_values_table.setItem(1, 0, QTableWidgetItem("Poke FWHM (mrad)"))
         self.calc_values_table.setItem(2, 0, QTableWidgetItem("Unperturbed FWHM (mrad)"))
         self.calc_values_table.setItem(3, 0, QTableWidgetItem("Diffraction Limit (mrad)"))
+
+        # Pre-create value cells to avoid allocating new QTableWidgetItems on every update.
+        self._value_items = {}
+        for row in (0, 1, 2, 3):
+            it = QTableWidgetItem("—")
+            self.calc_values_table.setItem(row, 1, it)
+            self._value_items[row] = it
         self.calc_values_table.setWordWrap(True)
         self.calc_values_table.resizeRowsToContents()
         self.calc_values_table.setMinimumWidth(200)
@@ -173,41 +194,32 @@ class SensorTabWidget(QWidget):
     def _schedule_update(self, v):
         self.pending_index = int(v)
         self.debounce_timer.start()
-        self.sensor_changed.emit(self.sensor)
+        # Avoid spamming external listeners for every slider tick.
 
     def _emit_worker_request(self):
         self.job_id += 1
         self.actuator_changed.emit(int(self.pending_index), self.job_id)
-        self.busy_label.setText("Waiting")
+        self.busy_label.setText("Computing…")
 
-    @Slot(object)
+    @Slot(object, object)
     def on_calculation_finished(self, sensor, result):
         if sensor is not self.sensor:
             return
     
-        self.busy_label.setText("Calculation Finished")
-        self.pupil = result["pupil"]
-        self.act_centers = result["act_centers"]
-        self.influence_maps = result["influence_maps"]
-        self.active_sub_aps = result["active_sub_aps"]
-        self.sub_aps = result["sub_aps"]
-        self.sub_aps_idx = result["sub_aps_idx"]
-        self.sub_ap_width = result["sub_ap_width"]
-        self.sub_slice = result["sub_slice"]
-        self.sub_pupils = result["sub_pupils"]
-        self.ref_centroids = result["ref_centroids"]
-        self.ref_images = result["ref_images"]
-        self.ref_science_image = result["ref_science_image"]
-        self.ref_strehl = result["ref_strehl"]
-        self.normalized_image = result["normalized_image"]
-        self.science_image_plot = result["science_image_plot"]
+        self.busy_label.setText("Ready")
+
+        # Cache CPU-side plotting arrays
+        self._pupil_mask = result["pupil_mask"]
+        self._sub_aps = result["sub_aps"].astype(np.float32, copy=False)
+        self._ref_centroids_single = result["ref_centroids_single"].astype(np.float32, copy=False)
+        self._ref_points = self._ref_centroids_single + self._sub_aps
        
         # update the unperturbed science canvas
-        self.canvas_science_pupil.set_image(result["science_image_plot"])
+        self.canvas_science_pupil.set_image(result["ref_science_plot"])
 
         # update table values
-        self.calc_values_table.setItem(2, 1, QTableWidgetItem(f"{result['ref_fwhm']*1e3:.3e}"))
-        self.calc_values_table.setItem(3, 1, QTableWidgetItem(f"{result['diff_lim']*1e3:.3e}"))
+        self._value_items[2].setText(f"{result['ref_fwhm']*1e3:.3e}")
+        self._value_items[3].setText(f"{result['diff_lim']*1e3:.3e}")
 
         n_act = result["n_act"]
         self.act_select_spinbox.setRange(0, n_act - 1)
@@ -215,72 +227,98 @@ class SensorTabWidget(QWidget):
 
         self._schedule_update(self.act_select_spinbox.value())
 
-    @Slot(object, int)
+        # Emit a single sensor-changed notification after (re)initialization.
+        self.sensor_changed.emit(self.sensor)
+
+    @Slot(object, object, int)
     def on_worker_finished(self, sensor, result, job_id):
         if job_id != self.job_id:
             return
         if sensor is not self.sensor:
             return
 
-        enforce_config_types(self.params)
-
+        if not isinstance(result, dict) or result.get("error"):
+            self.busy_label.setText("Error")
+            return
 
         self.busy_label.setText("Plotting")
         k = int(self.pending_index)
-        centroids, subap_images = result
-        centroids = centroids - self.params.get("field_padding")
-        centroids_single = centroids.squeeze(0)
-        
-        ref_centroids_single = (self.ref_centroids - self.params.get("field_padding")).squeeze(0)
 
-        influence_phase_scale = 4 * cp.pi / float(self.params.get("science_lambda"))
-        influence_map_phase = self.influence_maps[k] * influence_phase_scale
+        centroids_single = result["centroids_single"]
+        influence_map = result["influence_map"]
+        science_plot = result["science_plot"]
+        strehl = float(result["strehl"])
+        img_fwhm = float(result["img_fwhm"])
 
-        science_img, strehl = ut.Analysis.generate_science_image(self.pupil, influence_map_phase)
-        self.science_image = science_img
-        self.strehl = strehl
-        self.normalized_image = self.science_image / self.science_image.sum()
-        self.science_image_plot = cp.log10(self.normalized_image + 1e-12)
-        self.canvas_science.set_image(self.science_image_plot)
+        self.canvas_science.set_image(science_plot)
 
-        self.canvas_overview.set_image_masked(self.influence_maps[k].get(), mask=self.pupil.get())
-        self.canvas_overview.set_points_and_quivers(
-            ref_centroids_single + self.sub_aps,
-            centroids_single + self.sub_aps 
-        )
+        if self._pupil_mask is not None:
+            self.canvas_overview.set_image_masked(influence_map, mask=self._pupil_mask)
 
-        plate_rad = (self.params.get("science_lambda") * self.params.get("grid_size")
-                     / (self.params.get("telescope_diameter") * self.science_image.shape[0]))
-        img_fwhm = plate_rad * ut.Analysis.fwhm_radial(self.science_image)
-        self.calc_values_table.setItem(0, 1, QTableWidgetItem(f"{strehl:.3f}"))
-        self.calc_values_table.setItem(1, 1, QTableWidgetItem(f"{1e3 * img_fwhm:.3e}"))
+        if self._ref_points is not None and self._sub_aps is not None:
+            self.canvas_overview.set_points_and_quivers(
+                self._ref_points,
+                centroids_single + self._sub_aps,
+            )
 
-        if isinstance(subap_images, cp.ndarray):
-            img = subap_images.get()
-        else: 
-            img = np.asarray(subap_images)
-        self.canvas_subap.set_image_masked(img, mask=ut.Pupil_tools.generate_pupil(img.shape[0]))
+        self._value_items[0].setText(f"{strehl:.3f}")
+        self._value_items[1].setText(f"{1e3 * img_fwhm:.3e}")
+
+        img = np.asarray(result["subap_image"])
+        key = tuple(img.shape)
+        mask = self._subap_mask_cache.get(key)
+        if mask is None:
+            if img.ndim == 2 and img.shape[0] == img.shape[1]:
+                m = ut.Pupil_tools.generate_pupil(grid_size=int(img.shape[0]))
+                # utilities returns cupy; plotting wants numpy bool mask
+                try:
+                    import cupy as cp
+                    if isinstance(m, cp.ndarray):
+                        m = cp.asnumpy(m)
+                except Exception:
+                    pass
+                mask = (np.asarray(m) > 0)
+            else:
+                # Fallback: no masking for non-square stitched sensor images
+                mask = None
+            self._subap_mask_cache[key] = mask
+
+        if mask is None:
+            self.canvas_subap.set_image(img)
+        else:
+            self.canvas_subap.set_image_masked(img, mask=mask)
         self.busy_label.setText("Waiting")
 
     def recalculate(self, params):
         """Queue a full recompute on the shared worker whenever this tab's config changes params."""
         self.job_id += 1
-        self.sensor.recompute(n_sub=int(params.get("sub_apertures")), wavelength=float(params.get("wfs_lambda")))
+        enforce_config_types(params)
+        self.sensor.recompute(
+            n_sub=int(params.get("sub_apertures")), 
+            wavelength=float(params.get("wfs_lambda")),
+            dx=float(params.get("dx")) * ARCSEC2RAD,
+            dy=float(params.get("dy")) * ARCSEC2RAD,
+            )
 
         self.busy_label.setText("Recomputing…")
         
         CalculateWorker.instance().request_recompute(self.sensor, params)
         self._schedule_update(self.act_select_spinbox.value())
+
+        self.sensor_changed.emit(self.sensor)
         
 
     @Slot(object)
     def main_params_changed(self, params):
         """Queue a full recompute on the shared worker whenever main window config table changes params"""
         self.job_id += 1
+        enforce_config_types(params)
         self.sensor.recompute(grid_size=int(params.get("grid_size")))
 
         self.busy_label.setText("Recomputing…")
         
         CalculateWorker.instance().request_recompute(self.sensor, params)
         self._schedule_update(self.act_select_spinbox.value())
+
+        self.sensor_changed.emit(self.sensor)
 

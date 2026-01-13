@@ -78,7 +78,7 @@ class InfiniteVonKarmanScreen2D:
     """
     Non-periodic, infinite-in-extent (by extension) von Karman screen.
     Keeps only NxN window, extends by generating new rows/cols:
-      X = A Z + B b :contentReference[oaicite:4]{index=4}
+      X = A Z + B b 
 
     Supports shifting in BOTH x and y by extending edges as needed (still only stores NxN).
     """

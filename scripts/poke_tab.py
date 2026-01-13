@@ -1,22 +1,16 @@
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot, QThread, Signal, Slot, QMetaObject, Qt
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QWidget,
-    QTableWidget, QTableWidgetItem, QSpinBox, QSlider, QLabel, QFrame,
-
+    QFrame,
 )
-
-import cupy as cp
-import numpy as np
 
 import scripts.utilities as ut
 from scripts.wrap_tab import DetachableTabWidget
 from scripts.wfsensor_tab import SensorTabWidget
-from scripts.worker import CalculateWorker
 from scripts.config_table import Config_table
-from data.CONFIG_DTYPES import CONFIG_DTYPES, enforce_config_types
 
-ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
-RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
+ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
 
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
@@ -25,6 +19,7 @@ class Poke_tab(QWidget):
     def __init__(self, config_dict):
         super().__init__()
         self.params = config_dict
+        ut.set_params(self.params)
         self.wfsensors = {}
 
         print("Creating sensors")
@@ -34,11 +29,8 @@ class Poke_tab(QWidget):
         self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=45)
         self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=-45)
         self.sensors_changed.emit(self.wfsensors)
-        [print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec") for i,j in self.wfsensors.items()]
-
-        # calculation jobs bookkeeping
-        self.job_id = 0
-        self.pending_index = 0
+        for i, j in self.wfsensors.items():
+            print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec")
 
         # layout for entire tab
         main_layout = QHBoxLayout(self)
@@ -74,7 +66,7 @@ class Poke_tab(QWidget):
         print("Starting sensor tab editor: ")
         self.tab_pages = []
         for key, val in self.wfsensors.items():
-            print(" -", key)
+            
             tab = SensorTabWidget(dict(self.params), key, val)
             tab.sensor_changed.connect(self.update_sensor)
 
@@ -82,6 +74,7 @@ class Poke_tab(QWidget):
             sensor_tabs.addTab(tab, key)
             
         sensor_selector_h.addWidget(sensor_tabs)
+        self.config_table.params_changed.connect(ut.set_params)
         self.config_table.params_changed.connect(self.update_tabs)
         
         main_middle_layout.addLayout(sensor_selector_h)

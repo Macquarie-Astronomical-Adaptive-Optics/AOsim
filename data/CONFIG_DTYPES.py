@@ -22,6 +22,8 @@ CONFIG_DTYPES = {
     "L0": float,
     "wind": list,         # expects JSON like [6.0, 1.0]
     "seed_offset": int,
+    "dx": float,
+    "dy": float,
 }
 
 def enforce_config_types(config):
