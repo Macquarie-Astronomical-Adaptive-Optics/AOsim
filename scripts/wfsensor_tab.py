@@ -308,7 +308,7 @@ class SensorTabWidget(QWidget):
         """Queue a full recompute on the shared worker whenever main window config table changes params"""
         self.job_id += 1
         enforce_config_types(params)
-        self.params = params
+        self.params.update(params)
         self.sensor.recompute(grid_size=int(params.get("grid_size")))
 
         self.busy_label.setText("Recomputing…")

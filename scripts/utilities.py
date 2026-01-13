@@ -135,7 +135,9 @@ class Pupil_tools:
         center (float, float): circle center coordinates
         """
         if center is None:
-            center = (grid_size / 2.0, grid_size / 2.0)
+            # Use pixel-center convention for even-sized grids to keep the pupil perfectly symmetric.
+            # For N even, (N-1)/2 is the true center of the discrete pixel grid.
+            center = ((grid_size - 1) / 2.0, (grid_size - 1) / 2.0)
 
         y, x = _get_xy(int(grid_size), dtype=dtype)
         dy = y - cp.asarray(center[0], dtype=dtype)
