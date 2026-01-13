@@ -72,7 +72,7 @@ class SensorPSFGrid(QWidget):
 
         for s, img in items:
             if 0 <= s < self.S:
-                self.canvases[s].set_image_robust(img, cmap=cmap)
+                self.canvases[s].queue_image(img, cmap=cmap, auto_levels=True)
 
 
 

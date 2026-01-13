@@ -76,6 +76,7 @@ class Turbulence_tab(QWidget):
 
         # sensors -> angles (radians)
         thetas = [s.field_angle for s in self.sensors.values()]  # list of (theta_x, theta_y) rad
+        ranges_m = [getattr(s, 'gs_range_m', float('inf')) for s in self.sensors.values()]  # meters
         print("Loaded sensors at angles")
         for t in thetas:
             print(f" - ({t[0]*RAD2ARCSEC:.0f}, {t[1]*RAD2ARCSEC:.0f}) arcsec")
@@ -162,7 +163,6 @@ class Turbulence_tab(QWidget):
         print("Starting GPU Scheduler")
         self.scheduler_thread = QThread(self)
 
-        ranges = [sensor.gs_range_m for sensor in self.sensors.values()]
         print("Building Turbulence Screen Generator")
         self.scheduler = SimWorker(
             sim_factory=screen["function"],
@@ -170,7 +170,7 @@ class Turbulence_tab(QWidget):
             layers=layers,
             pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
             thetas_xy_rad=thetas,
-            ranges_m = ranges,
+            ranges_m=ranges_m,
             patch_size_px= N,
             patch_M= N,
             dt_s=0.001,

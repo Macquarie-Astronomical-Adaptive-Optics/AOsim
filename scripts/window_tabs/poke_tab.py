@@ -24,11 +24,44 @@ class Poke_tab(QWidget):
         self.wfsensors = {}
 
         print("Creating sensors")
+        off_x_px = (0.5 * self.params.get("telescope_diameter")) / (self.params.get("telescope_diameter") / self.params.get("grid_size"))
         self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann()
-        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=45, dy=0)
-        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=-45, dy=0)
-        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=0, dy=45)
-        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=0, dy=-45)
+        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(
+            90_000, 
+            n_sub=20, 
+            dx=45, 
+            dy=0,
+            lgs_thickness_m=10_000.0,     # ~10 km sodium thickness
+            lgs_launch_offset_px=(-off_x_px, 0.0),
+            lgs_remove_tt=True
+        )
+        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(
+            90_000, 
+            n_sub=20, 
+            dx=-45, 
+            dy=0,
+            lgs_thickness_m=10_000.0,    
+            lgs_launch_offset_px=(off_x_px, 0.0),
+            lgs_remove_tt=True
+        )
+        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(
+            90_000, 
+            n_sub=20, 
+            dx=0, 
+            dy=45,
+            lgs_thickness_m=10_000.0,     
+            lgs_launch_offset_px=(-off_x_px, 0.0),
+            lgs_remove_tt=True
+        )
+        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(
+            90_000, 
+            n_sub=20, 
+            dx=0, 
+            dy=-45,
+            lgs_thickness_m=10_000.0,   
+            lgs_launch_offset_px=(off_x_px, 0.0),
+            lgs_remove_tt=True
+        )
         self.sensors_changed.emit(self.wfsensors)
         for i, j in self.wfsensors.items():
             print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec")

@@ -485,15 +485,45 @@ class Analysis:
 # WFS tools
 # -----------------------------
 gpu_lock = threading.Lock()
+import cupyx.scipy.ndimage as ndi
 
 class WFSensor_tools:
     ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
     RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
 
     class ShackHartmann:
-        def __init__(self, gs_range_m=None, n_sub=None, wavelength=None, dx=None, dy=None, noise=0.0, pupil=None, grid_size=None):
-            if gs_range_m is None:
-                gs_range_m = cp.inf
+        """
+        Shack–Hartmann WFS with LGS spot-elongation model.
+
+        Key ideas:
+        - Geometry (active subaps, ys/xs, sub_pupils) is cached per (device, n_sub, grid_size, pupil_ptr).
+        - LGS elongation is applied after forming subap PSF intensities I, before centroiding.
+        """
+        # small local cache for centroid coordinate vectors
+        _coord_cache = {}  # (device, h_p, w_p) -> (y_coords, x_coords)
+
+        # global geometry cache (you likely already have this in your file; keep using yours if so)
+        _SUBAP_GEOM_CACHE = {}
+
+        def __init__(
+            self,
+            gs_range_m=np.inf,                 # np.inf for NGS, finite for LGS
+            n_sub=None,
+            wavelength=None,
+            dx=None,
+            dy=None,
+            noise=0.0,
+            pupil=None,
+            grid_size=None,
+            # --- guide-star / LGS ---
+            lgs_thickness_m=0.0,               # sodium thickness (m). 0 disables elongation
+            lgs_remove_tt=True,                # remove global TT from LGS slopes
+            lgs_launch_offset_px=(0.0, 0.0),   # (off_x_px, off_y_px) relative to pupil center
+            lgs_dir_bins=1024,                   
+            lgs_rad_bins=1024,
+            lgs_elong_scale=6.0,             
+            lgs_half_max=24,                   # cap kernel half-length (pixels)
+        ):
             if n_sub is None:
                 n_sub = params.get("sub_apertures")
             if wavelength is None:
@@ -502,6 +532,7 @@ class WFSensor_tools:
                 grid_size = params.get("grid_size")
             if pupil is None:
                 pupil = Pupil_tools.generate_pupil(grid_size=grid_size)
+
             if dx is None:
                 dx = 0.0
             if dy is None:
@@ -510,77 +541,242 @@ class WFSensor_tools:
             self.n_sub = int(n_sub)
             self.wavelength = float(wavelength)
             self.noise = float(noise)
-            self.pupil = pupil
-            self.grid_size = int(grid_size)
 
+            self.grid_size = int(grid_size)
+            self.pupil = pupil
+
+            # store angles in radians internally 
             self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
             self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
             self.field_angle = (self.dx, self.dy)
-            self.sen_angle = cp.sqrt(self.field_angle[0] ** 2 + self.field_angle[1] ** 2)
-            self.gs_range_m = gs_range_m
+            self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
+
+            # LGS 
+            self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            self.lgs_thickness_m = float(lgs_thickness_m) if lgs_thickness_m is not None else 0.0
+            self.lgs_remove_tt = bool(lgs_remove_tt)
+            if lgs_launch_offset_px is None:
+                self.lgs_launch_offset_px = (0.0, 0.0)
+            else:
+                self.lgs_launch_offset_px = (float(lgs_launch_offset_px[0]), float(lgs_launch_offset_px[1]))
+            self.lgs_dir_bins = int(lgs_dir_bins)
+            self.lgs_rad_bins = int(lgs_rad_bins)
+            self.lgs_elong_scale = float(lgs_elong_scale)
+            self.lgs_half_max = int(lgs_half_max)
+
+            # LGS bin caches 
+            self._lgs_dirbin_cpu = None
+            self._lgs_rbin_cpu = None
+            self._lgs_group_order_cpu = None
+            self._lgs_group_starts_cpu = None
+            self._lgs_group_ends_cpu = None
+            self._lgs_group_gid_cpu = None
+
+            self._lgs_group_order_gpu = None
+            self._lgs_group_starts_gpu = None
+            self._lgs_group_ends_gpu = None
+            self._lgs_group_gid_gpu = None
+
+            # kernel cache: (ndir, dirbin, half) -> cp.ndarray (k,k)
+            self._lgs_kernel_cache = {}
 
             self._build_subap_geometry()
 
-        def recompute(self, n_sub=None, wavelength=None, dx=None, dy=None, noise=0.0, pupil=None, grid_size=None):
+        def recompute(
+            self,
+            n_sub=None,
+            wavelength=None,
+            dx=None,
+            dy=None,
+            noise=None,
+            pupil=None,
+            grid_size=None,
+            gs_range_m=None,
+            lgs_thickness_m=None,
+            lgs_remove_tt=None,
+            lgs_launch_offset_px=None,
+            lgs_dir_bins=None,
+            lgs_rad_bins=None,
+            lgs_elong_scale=None,
+            lgs_half_max=None,
+        ):
             if n_sub is not None:
                 self.n_sub = int(n_sub)
             if wavelength is not None:
                 self.wavelength = float(wavelength)
             if noise is not None:
                 self.noise = float(noise)
-            if pupil is not None:
-                self.pupil = pupil
             if grid_size is not None:
                 self.grid_size = int(grid_size)
+            if pupil is not None:
+                self.pupil = pupil
+
             if dx is not None:
-                self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
+                self.dx = float(dx) * self.ARCSEC2RAD
             if dy is not None:
-                self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
-
+                self.dy = float(dy) * self.ARCSEC2RAD
             self.field_angle = (self.dx, self.dy)
-            self.sen_angle = cp.sqrt(self.field_angle[0] ** 2 + self.field_angle[1] ** 2)
+            self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
+
+            if gs_range_m is not None:
+                self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            if lgs_thickness_m is not None:
+                self.lgs_thickness_m = float(lgs_thickness_m)
+            if lgs_remove_tt is not None:
+                self.lgs_remove_tt = bool(lgs_remove_tt)
+            if lgs_launch_offset_px is not None:
+                self.lgs_launch_offset_px = (float(lgs_launch_offset_px[0]), float(lgs_launch_offset_px[1]))
+            if lgs_dir_bins is not None:
+                self.lgs_dir_bins = int(lgs_dir_bins)
+            if lgs_rad_bins is not None:
+                self.lgs_rad_bins = int(lgs_rad_bins)
+            if lgs_elong_scale is not None:
+                self.lgs_elong_scale = float(lgs_elong_scale)
+            if lgs_half_max is not None:
+                self.lgs_half_max = int(lgs_half_max)
+
+            # invalidate LGS GPU group caches (they depend on bins)
+            self._lgs_group_order_gpu = None
+            self._lgs_group_starts_gpu = None
+            self._lgs_group_ends_gpu = None
+            self._lgs_group_gid_gpu = None
+
+            # kernel cache depends on ndir too
+            self._lgs_kernel_cache = {}
 
             self._build_subap_geometry()
 
+        def _device_id(self):
+            try:
+                return int(cp.cuda.runtime.getDevice())
+            except Exception:
+                return 0
 
-        # --- Compatibility with older codebase ---
-        def regen_sub_apertures(self):
-            """DEPRECATED. Rebuild sub-aperture geometry."""
-            self._build_subap_geometry()
+        def _compute_lgs_bins_and_groups_from_top_left(self, top_left_y_cpu, top_left_x_cpu, h, w):
+            if top_left_y_cpu is None or top_left_x_cpu is None:
+                self._lgs_dirbin_cpu = None
+                self._lgs_rbin_cpu = None
+                self._lgs_group_order_cpu = None
+                self._lgs_group_starts_cpu = None
+                self._lgs_group_ends_cpu = None
+                self._lgs_group_gid_cpu = None
+                return
 
-        def generate_sub_apertures(self, pupil=None, grid_size=None):
-            """DEPRECATED. Returns sensor geometry as tuple."""
-            if pupil is not None:
-                self.pupil = pupil
-            if grid_size is not None:
-                self.grid_size = int(grid_size)
-            self._build_subap_geometry()
-            return (
-                self.active_sub_aps,
-                self.sub_aps,
-                self.sub_aps_idx,
-                self.sub_ap_width,
-                self.h,
-                self.w,
-                None,
-                None,
-                self.ys,
-                self.xs,
-                getattr(self, "sub_slice", None),
-                self.sub_pupils,
-            )
+            nsub = int(top_left_y_cpu.shape[0])
+            ndir = int(max(1, self.lgs_dir_bins))
+            nrad = int(max(1, self.lgs_rad_bins))
+
+            # subap centers
+            cx = top_left_x_cpu.astype(np.float32, copy=False) + 0.5 * float(w)
+            cy = top_left_y_cpu.astype(np.float32, copy=False) + 0.5 * float(h)
+
+            pc = (float(self.grid_size) - 1.0) * 0.5
+            lx = pc + float(self.lgs_launch_offset_px[0])
+            ly = pc + float(self.lgs_launch_offset_px[1])
+
+            vx = cx - lx
+            vy = cy - ly
+
+            ang = (np.arctan2(vy, vx) + 2.0 * np.pi) % (2.0 * np.pi)  # [0,2pi)
+            dirbin = np.floor(ang * (ndir / (2.0 * np.pi))).astype(np.int16, copy=False)
+            dirbin = np.clip(dirbin, 0, ndir - 1)
+
+            r = np.sqrt(vx * vx + vy * vy)
+            rnorm = r / (0.5 * float(self.grid_size))
+            rbin = np.floor(rnorm * nrad).astype(np.int16, copy=False)
+            rbin = np.clip(rbin, 0, nrad - 1)
+
+            self._lgs_dirbin_cpu = dirbin
+            self._lgs_rbin_cpu = rbin
+
+            # group id per subap
+            gid = dirbin.astype(np.int32) + ndir * rbin.astype(np.int32)  # (nsub,)
+            order = np.argsort(gid, kind="mergesort").astype(np.int32, copy=False)
+            gid_sorted = gid[order]
+
+            if nsub == 0:
+                self._lgs_group_order_cpu = order
+                self._lgs_group_starts_cpu = np.zeros((0,), dtype=np.int32)
+                self._lgs_group_ends_cpu = np.zeros((0,), dtype=np.int32)
+                self._lgs_group_gid_cpu = np.zeros((0,), dtype=np.int32)
+                return
+
+            cuts = np.flatnonzero(np.diff(gid_sorted)) + 1
+            starts = np.r_[0, cuts].astype(np.int32, copy=False)
+            ends = np.r_[cuts, gid_sorted.size].astype(np.int32, copy=False)
+            uniq_gid = gid_sorted[starts].astype(np.int32, copy=False)
+
+            self._lgs_group_order_cpu = order
+            self._lgs_group_starts_cpu = starts
+            self._lgs_group_ends_cpu = ends
+            self._lgs_group_gid_cpu = uniq_gid
+
+            # invalidate GPU copies
+            self._lgs_group_order_gpu = None
+            self._lgs_group_starts_gpu = None
+            self._lgs_group_ends_gpu = None
+            self._lgs_group_gid_gpu = None
+
+        def _ensure_lgs_groups_gpu(self):
+            if self._lgs_group_order_cpu is None:
+                return
+            if self._lgs_group_order_gpu is not None:
+                return
+
+            self._lgs_group_order_gpu = cp.asarray(self._lgs_group_order_cpu, dtype=cp.int32)
+            self._lgs_group_starts_gpu = cp.asarray(self._lgs_group_starts_cpu, dtype=cp.int32)
+            self._lgs_group_ends_gpu = cp.asarray(self._lgs_group_ends_cpu, dtype=cp.int32)
+            self._lgs_group_gid_gpu = cp.asarray(self._lgs_group_gid_cpu, dtype=cp.int32)
+
+        def _get_line_kernel(self, dir_i: int, half: int):
+            """
+            Return normalized 2D line kernel of size (2*half+1) oriented by dir_i/ndir.
+            Cached on (ndir, dir_i, half).
+            """
+            ndir = int(max(1, self.lgs_dir_bins))
+            half = int(half)
+            key = (ndir, int(dir_i), half)
+            ker = self._lgs_kernel_cache.get(key, None)
+            if ker is not None:
+                return ker
+
+            k = 2 * half + 1
+            if k <= 1:
+                ker = cp.asarray([[1.0]], dtype=cp.float32)
+                self._lgs_kernel_cache[key] = ker
+                return ker
+
+            theta = ( (dir_i + 0.5) * (2.0 * np.pi / float(ndir)) )
+            c0 = float(half)
+
+            arr = np.zeros((k, k), dtype=np.float32)
+            for t in range(-half, half + 1):
+                x = int(round(c0 + float(t) * np.cos(theta)))
+                y = int(round(c0 + float(t) * np.sin(theta)))
+                if 0 <= x < k and 0 <= y < k:
+                    arr[y, x] += 1.0
+
+            s = float(arr.sum())
+            if s <= 0:
+                arr[half, half] = 1.0
+                s = 1.0
+            arr /= s
+
+            ker = cp.asarray(arr, dtype=cp.float32)
+            self._lgs_kernel_cache[key] = ker
+            return ker
 
         def _build_subap_geometry(self):
             """
-            One-time (or recompute-time) geometry build:
-            - finds active subaps (CPU call)
-            - precomputes GPU index grids for extracting subap windows
-            - caches sub-pupil masks per subap
+            Build/cached:
+            - active_sub_aps, sub_aps, sub_aps_idx
+            - sub_ap_width, h,w
+            - ys,xs and sub_pupils (GPU)
+            - CPU top_left_y/x (for LGS bins/groups)
             """
-            grid_size = self.grid_size
+            grid_size = int(self.grid_size)
             pupil = self.pupil
-
-            cache_key = (_device_id(), self.n_sub, grid_size, int(pupil.data.ptr))
+            cache_key = (self._device_id(), int(self.n_sub), grid_size, int(pupil.data.ptr))
 
             cached = _SUBAP_GEOM_CACHE.get(cache_key)
             if cached is not None:
@@ -595,40 +791,35 @@ class WFSensor_tools:
                 self.sub_pupils = cached["sub_pupils"]
                 self.grid_ny = cached["grid_ny"]
                 self.grid_nx = cached["grid_nx"]
+                self.sub_slice = cached.get("sub_slice", None)
+
+                # recompute LGS bins/groups from cached top_left
+                top_left_y_cpu = cached.get("top_left_y_cpu", None)
+                top_left_x_cpu = cached.get("top_left_x_cpu", None)
+                self._compute_lgs_bins_and_groups_from_top_left(top_left_y_cpu, top_left_x_cpu, self.h, self.w)
                 return
 
-            # aotools wfs helper is CPU (expects numpy)
             pupil_np = cp.asnumpy(pupil)
             sub_aps_np = aotools.wfs.findActiveSubaps(self.n_sub, pupil_np, 0.6)
 
-            # Keep a copy of the aotools-returned subap coordinates for plotting/compatibility.
-            # Use float64 for index math to avoid float32 rounding pushing values just below integers
-            # (which can create duplicated indices -> "missing rows/cols" and occasional misplacements).
             sub_aps64 = cp.asarray(sub_aps_np, dtype=cp.float64)
             sub_aps = sub_aps64.astype(cp.float32, copy=False)
             active_sub_aps = int(sub_aps64.shape[0])
 
-            sub_ap_width = float(grid_size) / float(self.n_sub)  # may be non-integer
+            sub_ap_width = float(grid_size) / float(self.n_sub)
             w64 = cp.asarray(sub_ap_width, dtype=cp.float64)
 
-            # Robust index computation:
-            # - use floor with a tiny epsilon to protect against 2.999999999 -> 2
-            # - clip to [0, n_sub-1] to avoid boundary spill
             eps = cp.asarray(1e-9, dtype=cp.float64)
             sub_aps_idx = cp.floor(sub_aps64 / w64 + eps).astype(cp.int32)
             sub_aps_idx = cp.clip(sub_aps_idx, 0, int(self.n_sub) - 1)
 
-            # Subap extraction window size (kept consistent with the original codebase).
             h = int(sub_ap_width) + 1
             w = int(sub_ap_width) + 1
 
             yy = cp.arange(h, dtype=cp.int32)[:, None]
             xx = cp.arange(w, dtype=cp.int32)[None, :]
 
-            # Compute pixel top-left corners from indices, rounding to nearest pixel boundary.
             top_left = cp.rint(sub_aps_idx.astype(cp.float64) * w64).astype(cp.int32)
-
-            # Clip to stay in-bounds (python slicing used to clip implicitly; fancy indexing does not).
             top_left_y = cp.clip(top_left[:, 0], 0, grid_size - h)
             top_left_x = cp.clip(top_left[:, 1], 0, grid_size - w)
             top_left = cp.stack((top_left_y, top_left_x), axis=1)
@@ -636,19 +827,18 @@ class WFSensor_tools:
             ys = top_left[:, 0, None, None] + yy[None, :, :]
             xs = top_left[:, 1, None, None] + xx[None, :, :]
 
-            # Legacy: keep a CPU list of slice windows per active subap (used by older visualization code).
+            # legacy CPU list-of-slices
             try:
                 _iy = cp.asnumpy(top_left[:, 0]).astype(np.int32, copy=False)
                 _ix = cp.asnumpy(top_left[:, 1]).astype(np.int32, copy=False)
-
-                self.sub_slice = [(slice(int(y0), int(y0) + h), slice(int(x0), int(x0) + w)) for y0, x0 in zip(_iy, _ix)]
-
+                sub_slice = [(slice(int(y0), int(y0) + h), slice(int(x0), int(x0) + w)) for y0, x0 in zip(_iy, _ix)]
             except Exception:
-                self.sub_slice = None
+                sub_slice = None
+                _iy = _ix = None
 
             sub_pupils = pupil[ys, xs].astype(cp.float32, copy=False)
 
-            # Use the full nominal SH grid for stitched sensor-image layout (even if edge rows/cols are inactive).
+            # full nominal grid for stitching
             grid_ny = int(self.n_sub)
             grid_nx = int(self.n_sub)
 
@@ -663,6 +853,13 @@ class WFSensor_tools:
             self.sub_pupils = sub_pupils
             self.grid_ny = grid_ny
             self.grid_nx = grid_nx
+            self.sub_slice = sub_slice
+
+            # LGS bins/groups based on CPU top_left arrays
+            if _iy is not None and _ix is not None:
+                self._compute_lgs_bins_and_groups_from_top_left(_iy, _ix, h, w)
+            else:
+                self._compute_lgs_bins_and_groups_from_top_left(None, None, h, w)
 
             _SUBAP_GEOM_CACHE[cache_key] = {
                 "active_sub_aps": active_sub_aps,
@@ -676,14 +873,22 @@ class WFSensor_tools:
                 "sub_pupils": sub_pupils,
                 "grid_ny": grid_ny,
                 "grid_nx": grid_nx,
+                "sub_slice": sub_slice,
+                "top_left_y_cpu": _iy,
+                "top_left_x_cpu": _ix,
             }
 
         def measure(self, pupil=None, phase_map=None, phase_map_alt=None, poke_amplitude=None, pad=None, return_image=True):
             """
-            Measure Shack-Hartmann slopes (and optionally a stitched sensor image).
+            Returns:
+            centroids: (n_map, n_sub_active, 2) in subap-padded pixel coords
+            slopes:    (n_map, n_sub_active, 2) relative to subap center
+            sensor_image: stitched mosaic (n_map, n_sub*n_p, n_sub*n_p) if return_image else None
             """
             if pad is None:
-                pad = params.get("field_padding")
+                pad = int(params.get("field_padding", 4))
+            pad = int(pad)
+
             if pupil is not None:
                 self.pupil = pupil
                 self._build_subap_geometry()
@@ -691,52 +896,97 @@ class WFSensor_tools:
             if phase_map is None:
                 phase_map = cp.zeros((self.grid_size, self.grid_size), dtype=cp.float32)
 
-            # accept (N,N) or (n_map,N,N)
             if phase_map.ndim == 2:
                 phase_map = phase_map[None, :, :]
             phase_map = phase_map.astype(cp.float32, copy=False)
 
             n_map = int(phase_map.shape[0])
             n_sub = int(self.sub_aps_idx.shape[0])
-            pad = int(pad)
 
-            # Extract subap phases directly
-            sub_phase = phase_map[:, self.ys, self.xs]  # (n_map, n_sub, h, w)
-            sub_phase *= self.sub_pupils[None, :, :, :]                   # zero outside pupil in subap
+            # Extract subap phases: (n_map, n_sub, h, w)
+            sub_phase = phase_map[:, self.ys, self.xs]
+            sub_phase *= self.sub_pupils[None, :, :, :]
 
+            # radians (WFS wavelength)
             scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
             sub_phase *= scale
 
-            # complex field per subap
+            # complex field
             field = cp.exp(1j * sub_phase).astype(cp.complex64, copy=False)
             field *= self.sub_pupils[None, :, :, :].astype(cp.complex64, copy=False)
 
-            # manual pad
-            h, w = self.h, self.w
+            h, w = int(self.h), int(self.w)
             h_p, w_p = h + 2 * pad, w + 2 * pad
-            field_p = cp.zeros((n_map, n_sub, h_p, w_p), dtype=cp.complex64)
-            field_p[:, :, pad:pad+h, pad:pad+w] = field
 
-            # FFT batch on last axes
-            F = cp.fft.fftshift(cp.fft.fft2(cp.fft.ifftshift(field_p, axes=(-2, -1)), axes=(-2, -1)), axes=(-2, -1))
+            field_p = cp.zeros((n_map, n_sub, h_p, w_p), dtype=cp.complex64)
+            field_p[:, :, pad:pad + h, pad:pad + w] = field
+
+            F = cp.fft.fftshift(
+                cp.fft.fft2(cp.fft.ifftshift(field_p, axes=(-2, -1)), axes=(-2, -1)),
+                axes=(-2, -1),
+            )
             I = (F.real * F.real + F.imag * F.imag).astype(cp.float32, copy=False)
 
-            # normalize per subap per map
+            # normalize per subap
             denom = cp.sum(I, axis=(-2, -1), keepdims=True)
             denom = cp.where(denom == 0, 1.0, denom)
             I = I / denom
 
-            # cached coordinate vectors for centroiding
-            ckey = (_device_id(), h_p, w_p, cp.float32)
-            coords = _COORD_CACHE.get(ckey)
+            # --- LGS realistic(ish) spot elongation (optional) ---
+            if np.isfinite(float(self.gs_range_m)) and float(self.lgs_thickness_m) > 0.0:
+                try:
+                    import cupyx.scipy.ndimage as ndi
+
+                    self._ensure_lgs_groups_gpu()
+                    if self._lgs_group_gid_gpu is not None and int(self._lgs_group_gid_gpu.size) > 0:
+                        ndir = int(max(1, self.lgs_dir_bins))
+                        nrad = int(max(1, self.lgs_rad_bins))
+
+                        frac = float(self.lgs_thickness_m) / float(self.gs_range_m)
+                        scale = float(self.lgs_elong_scale)
+
+                        order = self._lgs_group_order_gpu
+                        starts = self._lgs_group_starts_gpu
+                        ends = self._lgs_group_ends_gpu
+                        gids = self._lgs_group_gid_gpu
+
+                        # loop only non-empty groups
+                        for gi in range(int(gids.size)):
+                            gid = int(gids[gi].item())
+                            rb = gid // ndir
+                            db = gid - rb * ndir
+
+                            r_mean = (rb + 0.5) / float(nrad)
+                            half = int(round(0.5 * scale * frac * float(w_p) * float(r_mean)))
+                            half = max(0, min(half, int(self.lgs_half_max)))
+                            if half == 0:
+                                continue
+
+                            sel = order[int(starts[gi].item()):int(ends[gi].item())]
+                            if int(sel.size) == 0:
+                                continue
+
+                            ker2 = self._get_line_kernel(db, half)     # (k,k)
+                            wts = ker2[None, None, :, :]              # blur last 2 dims only
+                            I[:, sel, :, :] = ndi.convolve(I[:, sel, :, :], wts, mode="constant", cval=0.0)
+
+                        # renormalize after blur
+                        denom2 = cp.sum(I, axis=(-2, -1), keepdims=True)
+                        denom2 = cp.where(denom2 == 0, 1.0, denom2)
+                        I = I / denom2
+                except Exception:
+                    pass
+
+            # centroid coordinate vectors
+            ckey = (self._device_id(), h_p, w_p)
+            coords = self._coord_cache.get(ckey)
             if coords is None:
                 y_coords = cp.arange(h_p, dtype=cp.float32)
                 x_coords = cp.arange(w_p, dtype=cp.float32)
                 coords = (y_coords, x_coords)
-                _COORD_CACHE[ckey] = coords
+                self._coord_cache[ckey] = coords
             y_coords, x_coords = coords
 
-            # centroid (y,x)
             cx = cp.sum(I * x_coords[None, None, None, :], axis=(-2, -1))
             cy = cp.sum(I * y_coords[None, None, :, None], axis=(-2, -1))
             centroids = cp.stack((cy, cx), axis=-1)  # (n_map, n_sub, 2)
@@ -744,22 +994,26 @@ class WFSensor_tools:
             center = cp.asarray([(h_p - 1) * 0.5, (w_p - 1) * 0.5], dtype=cp.float32)
             slopes = centroids - center[None, None, :]
 
+            # LGS cannot measure absolute TT
+            if np.isfinite(float(self.gs_range_m)) and bool(self.lgs_remove_tt):
+                slopes = slopes - cp.mean(slopes, axis=1, keepdims=True)
+
             sensor_image = None
             if return_image:
-                # Cheap(ish) placement loop for display use-cases (n_sub is typically small)
-                H = self.grid_ny * h_p
-                W = self.grid_nx * w_p
+                H = int(self.grid_ny) * h_p
+                W = int(self.grid_nx) * w_p
                 sensor_image = cp.zeros((n_map, H, W), dtype=I.dtype)
-                iy = cp.asnumpy(self.sub_aps_idx[:, 0]).astype(np.int32)
-                ix = cp.asnumpy(self.sub_aps_idx[:, 1]).astype(np.int32)
 
-                # python loop is OK here: number of active subaps is limited (tens to hundreds)
+                iy = cp.asnumpy(self.sub_aps_idx[:, 0]).astype(np.int32, copy=False)
+                ix = cp.asnumpy(self.sub_aps_idx[:, 1]).astype(np.int32, copy=False)
+
                 for j in range(n_sub):
                     y0 = int(iy[j]) * h_p
                     x0 = int(ix[j]) * w_p
-                    sensor_image[:, y0:y0+h_p, x0:x0+w_p] = I[:, j, :, :]
+                    sensor_image[:, y0:y0 + h_p, x0:x0 + w_p] = I[:, j, :, :]
 
             return centroids, slopes, sensor_image
+
 
     class PyramidWFS:
         # TODO unimplemented

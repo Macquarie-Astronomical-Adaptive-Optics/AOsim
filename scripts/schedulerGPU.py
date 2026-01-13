@@ -70,8 +70,19 @@ class SimWorker(QObject):
         self.fps_cap = int(fps_cap)
 
         # AO geometry
-        self.ranges_m = ranges_m
         self.thetas_gpu = cp.asarray(thetas_xy_rad, dtype=cp.float32)  # (S,2)
+        S = int(self.thetas_gpu.shape[0])
+        if ranges_m is None:
+            self.ranges_gpu = cp.full((S,), cp.inf, dtype=cp.float32)
+        else:
+            r = cp.asarray(ranges_m, dtype=cp.float32)
+            if r.ndim != 1:
+                r = r.reshape(-1)
+            if r.size == 1:
+                r = cp.full((S,), float(r.item()), dtype=cp.float32)
+            elif r.size != S:
+                raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(r.shape)} for S={S}")
+            self.ranges_gpu = r
         self.patch_center = (self.sim_kwargs["N"]/2, self.sim_kwargs["N"]/2)
         self.patch_size_px = float(patch_size_px)
         self.patch_M = int(patch_M)
@@ -402,7 +413,7 @@ class SimWorker(QObject):
             return
 
         th = self.thetas_gpu[s:s+1]  # (1,2)
-        rng = self.ranges_m[s:s+1]
+        rng = self.ranges_gpu[s:s+1]
 
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=th,
@@ -434,11 +445,11 @@ class SimWorker(QObject):
     def _compute_all_sensor_psfs(self):
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=self.thetas_gpu,
+            ranges_m=self.ranges_gpu,
             center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
             M=self.psf_M,
             angle_deg=0.0,
-            ranges_m = self.ranges_m,
             remove_piston=True,
             return_gpu=True,
         )  # (S,M,M)
@@ -512,11 +523,11 @@ class SimWorker(QObject):
         # all layers (downsampled)
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=self.thetas_gpu,
+            ranges_m=self.ranges_gpu,
             center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
             M=self.psf_M,
             angle_deg=0.0,
-            ranges_m = self.ranges_m,
             remove_piston=True,
             return_gpu=True,
             return_per_layer=True,

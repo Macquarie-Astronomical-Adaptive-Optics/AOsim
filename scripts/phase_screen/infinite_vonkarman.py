@@ -651,7 +651,7 @@ class LayeredInfinitePhaseScreen:
         size_pixels,
         M=128,
         angle_deg=0.0,
-        ranges_m=None,
+        ranges_m=None,          # (S,) meters; np.inf for NGS
         remove_piston=True,
         return_gpu=True,
         return_per_layer=False,
@@ -661,17 +661,20 @@ class LayeredInfinitePhaseScreen:
         if thetas.ndim != 2 or thetas.shape[1] != 2:
             raise ValueError("thetas_xy_rad must be shape (S,2)")
         S = int(thetas.shape[0])
-
+        # Guide-star ranges (meters), used for LGS cone effect:
+        #   alpha(h) = 1 - h / H
+        # If ranges_m is None -> treat all as NGS (H = inf, alpha = 1).
         if ranges_m is None:
             ranges = cp.full((S,), cp.inf, dtype=self.dtype)
         else:
             ranges = cp.asarray(ranges_m, dtype=self.dtype)
+            # Accept scalar, (S,), or (S,1)/(...); normalize to (S,)
             if ranges.ndim != 1:
-                ranges = ranges.reshape(-1)     # crush (S,1) -> (S,)
+                ranges = ranges.reshape(-1)
             if ranges.size == 1:
                 ranges = cp.full((S,), float(ranges.item()), dtype=self.dtype)
             elif ranges.size != S:
-                raise ValueError(f"ranges_m must be scalar or shape (S,), got {ranges.shape} for S={S}")
+                raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(ranges.shape)} for S={S}")
 
 
         cx, cy = float(center_xy_pix[0]), float(center_xy_pix[1])
@@ -689,13 +692,8 @@ class LayeredInfinitePhaseScreen:
         Ybase = sa * Xs + ca * Ys + cy
 
         # broadcast base to (S,M,M)
-        Xb = Xbase[None, :, :]  # (1,M,M)
+        Xb = Xbase[None, :, :]
         Yb = Ybase[None, :, :]
-
-        cx0 = self.dtype(cx)
-        cy0 = self.dtype(cy)
-        dX = Xb - cx0
-        dY = Yb - cy0
 
         if return_per_layer:
             L = len(self._layers_obj)
@@ -706,17 +704,18 @@ class LayeredInfinitePhaseScreen:
                     continue
 
                 h = float(Lyr.altitude_m)
-
-                sx = (h * thetas[:, 0]) / self.dx   # pixels
+                sx = (h * thetas[:, 0]) / self.dx
                 sy = (h * thetas[:, 1]) / self.dx
 
-                # alpha = 1 - h/H for LGS, 1 for NGS
+                # LGS cone scaling (alpha=1 for NGS)
                 alpha = 1.0 - (self.dtype(h) / ranges)
                 alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
                 alpha = cp.clip(alpha, 0.0, 1.0)
-
-                Xw = cx0 + alpha[:, None, None] * dX + sx[:, None, None]
-                Yw = cy0 + alpha[:, None, None] * dY + sy[:, None, None]
+                
+                cx0 = self.dtype(cx)
+                cy0 = self.dtype(cy)
+                Xw = cx0 + alpha[:, None, None] * (Xb - cx0) + sx[:, None, None]
+                Yw = cy0 + alpha[:, None, None] * (Yb - cy0) + sy[:, None, None]
 
                 # sample this layer by WORLD coords (auto-pan inside)
                 outL[li] = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
@@ -735,17 +734,18 @@ class LayeredInfinitePhaseScreen:
             if not Lyr.active:
                 continue
             h = float(Lyr.altitude_m)
-
-            sx = (h * thetas[:, 0]) / self.dx   # pixels
+            sx = (h * thetas[:, 0]) / self.dx
             sy = (h * thetas[:, 1]) / self.dx
 
-            # alpha = 1 - h/H for LGS, 1 for NGS
+            # LGS cone scaling (alpha=1 for NGS)
             alpha = 1.0 - (self.dtype(h) / ranges)
             alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
             alpha = cp.clip(alpha, 0.0, 1.0)
-
-            Xw = cx0 + alpha[:, None, None] * dX + sx[:, None, None]
-            Yw = cy0 + alpha[:, None, None] * dY + sy[:, None, None]
+            
+            cx0 = self.dtype(cx)
+            cy0 = self.dtype(cy)
+            Xw = cx0 + alpha[:, None, None] * (Xb - cx0) + sx[:, None, None]
+            Yw = cy0 + alpha[:, None, None] * (Yb - cy0) + sy[:, None, None]
 
             out += Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
 
