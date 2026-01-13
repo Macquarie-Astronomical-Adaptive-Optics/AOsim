@@ -162,6 +162,7 @@ class Turbulence_tab(QWidget):
         print("Starting GPU Scheduler")
         self.scheduler_thread = QThread(self)
 
+        ranges = [sensor.gs_range_m for sensor in self.sensors.values()]
         print("Building Turbulence Screen Generator")
         self.scheduler = SimWorker(
             sim_factory=screen["function"],
@@ -169,6 +170,7 @@ class Turbulence_tab(QWidget):
             layers=layers,
             pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
             thetas_xy_rad=thetas,
+            ranges_m = ranges,
             patch_size_px= N,
             patch_M= N,
             dt_s=0.001,
@@ -218,8 +220,7 @@ class Turbulence_tab(QWidget):
         self.scheduler_thread.start()
 
         # worker emits stacks
-        N /= 2
-        self.overview_tab = SensorView_tab(config_dict, layers, thetas, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
+        self.overview_tab = SensorView_tab(sensors, config_dict, layers, thetas, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
         
         self.scheduler.all_sensor_psf_ready.connect(self.overview_tab.psf_grid.update_psfs)
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
@@ -269,7 +270,7 @@ class Turbulence_tab(QWidget):
 
     @Slot(object)
     def on_combined_frame(self, img_np):
-        # show combined in both canvases (pick one if you prefer)
+        # show combined in both canvases
         self.active_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
     
     @Slot(int, object)

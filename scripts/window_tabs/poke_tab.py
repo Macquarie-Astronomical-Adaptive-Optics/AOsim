@@ -25,10 +25,10 @@ class Poke_tab(QWidget):
 
         print("Creating sensors")
         self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann()
-        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=45, dy=0)
-        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=-45, dy=0)
-        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=45)
-        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(n_sub=20, dx=0, dy=-45)
+        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=45, dy=0)
+        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=-45, dy=0)
+        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=0, dy=45)
+        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(90_000, n_sub=20, dx=0, dy=-45)
         self.sensors_changed.emit(self.wfsensors)
         for i, j in self.wfsensors.items():
             print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec")

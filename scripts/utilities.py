@@ -491,7 +491,9 @@ class WFSensor_tools:
     RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
 
     class ShackHartmann:
-        def __init__(self, n_sub=None, wavelength=None, dx=None, dy=None, noise=0.0, pupil=None, grid_size=None):
+        def __init__(self, gs_range_m=None, n_sub=None, wavelength=None, dx=None, dy=None, noise=0.0, pupil=None, grid_size=None):
+            if gs_range_m is None:
+                gs_range_m = cp.inf
             if n_sub is None:
                 n_sub = params.get("sub_apertures")
             if wavelength is None:
@@ -515,6 +517,7 @@ class WFSensor_tools:
             self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
             self.field_angle = (self.dx, self.dy)
             self.sen_angle = cp.sqrt(self.field_angle[0] ** 2 + self.field_angle[1] ** 2)
+            self.gs_range_m = gs_range_m
 
             self._build_subap_geometry()
 

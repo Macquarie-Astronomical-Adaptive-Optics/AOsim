@@ -9,7 +9,7 @@ from scripts.widgets.grids import LayerFootprintGrid, SensorPSFGrid
 
 class SensorView_tab(QWidget):
 
-    def __init__(self, params, layers_cfg, thetas, N, dx, patch_center, patch_size_px, scheduler, parent=None):
+    def __init__(self, sensors, params, layers_cfg, thetas, N, dx, patch_center, patch_size_px, scheduler, parent=None):
         super().__init__(parent)
         self.params = params
         self.scheduler = scheduler
@@ -21,6 +21,7 @@ class SensorView_tab(QWidget):
 
         self.psf_grid = SensorPSFGrid(thetas, title="Sensor PSFs")
         self.layer_grid = LayerFootprintGrid(
+            sensors=sensors,
             layers_cfg=layers_cfg,
             thetas_xy_rad=thetas,
             N=N, dx=dx,

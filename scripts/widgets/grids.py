@@ -91,9 +91,11 @@ def _to_numpy(a):
     if isinstance(a, cp.ndarray):
         return a.get()
     return np.asarray(a)
+
 class LayerFootprintGrid(QWidget):
     def __init__(
         self,
+        sensors,
         layers_cfg,
         thetas_xy_rad,
         N,
@@ -106,12 +108,12 @@ class LayerFootprintGrid(QWidget):
         overlay_cmap="viridis",
         overlay_z=50,
         pupil_alpha=55,
-        # NEW: optional explicit pupil params (so we don't rely on global utilities params)
         pupil_center_obscuration=None,
     ):
         super().__init__(parent)
 
         self.layers_cfg = list(layers_cfg)  # may include active/unloaded flags
+        self.sensors = sensors
         self.thetas = np.asarray(thetas_xy_rad, dtype=np.float32)  # (S,2)
         self.N = int(N)
         self.dx = float(dx)
@@ -124,7 +126,7 @@ class LayerFootprintGrid(QWidget):
         self.overlay_z = int(overlay_z)
         self.pupil_alpha = int(pupil_alpha)
 
-        # --- NEW: pupil param state / dirty flag ---
+        # --- pupil param state / dirty flag ---
         self._pupil_center_obscuration = pupil_center_obscuration  # None -> utilities default
         self._pupil_dirty = True
         self._pupil_key = None  # (M, obsc, alpha, S)
@@ -390,7 +392,22 @@ class LayerFootprintGrid(QWidget):
         # pupil RGBA overlay
         pit = self._pupil_items[layer_idx][sensor_idx]
         pit.setImage(self._pupil_rgba_by_sensor[sensor_idx], autoLevels=False)
-        pit.setPos(x0, y0)
+
+        # cone shrink factor
+        gs_range = list(self.sensors.values())[sensor_idx].gs_range_m
+        try:
+            gs_range = cp.asnumpy(gs_range)
+            alpha = 1.0 - (h_m / gs_range)
+        except:
+             alpha = 1.0 - (h_m / gs_range)
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+
+        pit.resetTransform()
+        pit.setScale(alpha)
+
+        # keep it centered inside the patch
+        dxy = (1.0 - alpha) * M * 0.5
+        pit.setPos(x0 + dxy, y0 + dxy)
 
     # -------------------------
     # Main entry: update

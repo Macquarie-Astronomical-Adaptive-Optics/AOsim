@@ -37,6 +37,7 @@ class SimWorker(QObject):
         sim_kwargs: Dict[str, Any],
         layers: List[Dict[str, Any]],
         thetas_xy_rad,
+        ranges_m,
         patch_size_px,
         patch_M,
         dt_s: float = 0.001,
@@ -69,6 +70,7 @@ class SimWorker(QObject):
         self.fps_cap = int(fps_cap)
 
         # AO geometry
+        self.ranges_m = ranges_m
         self.thetas_gpu = cp.asarray(thetas_xy_rad, dtype=cp.float32)  # (S,2)
         self.patch_center = (self.sim_kwargs["N"]/2, self.sim_kwargs["N"]/2)
         self.patch_size_px = float(patch_size_px)
@@ -400,6 +402,7 @@ class SimWorker(QObject):
             return
 
         th = self.thetas_gpu[s:s+1]  # (1,2)
+        rng = self.ranges_m[s:s+1]
 
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=th,
@@ -407,6 +410,7 @@ class SimWorker(QObject):
             size_pixels=self.patch_size_px,
             M=self.patch_M,
             angle_deg=0.0,
+            ranges_m = rng,
             remove_piston=True,
             return_gpu=True,
         )
@@ -434,6 +438,7 @@ class SimWorker(QObject):
             size_pixels=self.patch_size_px,
             M=self.psf_M,
             angle_deg=0.0,
+            ranges_m = self.ranges_m,
             remove_piston=True,
             return_gpu=True,
         )  # (S,M,M)
@@ -511,6 +516,7 @@ class SimWorker(QObject):
             size_pixels=self.patch_size_px,
             M=self.psf_M,
             angle_deg=0.0,
+            ranges_m = self.ranges_m,
             remove_piston=True,
             return_gpu=True,
             return_per_layer=True,
