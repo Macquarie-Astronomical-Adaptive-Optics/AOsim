@@ -596,35 +596,56 @@ class WFSensor_tools:
             pupil_np = cp.asnumpy(pupil)
             sub_aps_np = aotools.wfs.findActiveSubaps(self.n_sub, pupil_np, 0.6)
 
-            sub_aps = cp.asarray(sub_aps_np, dtype=cp.float32)
-            active_sub_aps = int(sub_aps.shape[0])
+            # Keep a copy of the aotools-returned subap coordinates for plotting/compatibility.
+            # Use float64 for index math to avoid float32 rounding pushing values just below integers
+            # (which can create duplicated indices -> "missing rows/cols" and occasional misplacements).
+            sub_aps64 = cp.asarray(sub_aps_np, dtype=cp.float64)
+            sub_aps = sub_aps64.astype(cp.float32, copy=False)
+            active_sub_aps = int(sub_aps64.shape[0])
 
-            sub_ap_width = float(grid_size) / float(self.n_sub)
-            sub_aps_idx = (sub_aps / sub_ap_width).astype(cp.int32)
+            sub_ap_width = float(grid_size) / float(self.n_sub)  # may be non-integer
+            w64 = cp.asarray(sub_ap_width, dtype=cp.float64)
 
+            # Robust index computation:
+            # - use floor with a tiny epsilon to protect against 2.999999999 -> 2
+            # - clip to [0, n_sub-1] to avoid boundary spill
+            eps = cp.asarray(1e-9, dtype=cp.float64)
+            sub_aps_idx = cp.floor(sub_aps64 / w64 + eps).astype(cp.int32)
+            sub_aps_idx = cp.clip(sub_aps_idx, 0, int(self.n_sub) - 1)
+
+            # Subap extraction window size (kept consistent with the original codebase).
             h = int(sub_ap_width) + 1
             w = int(sub_ap_width) + 1
 
             yy = cp.arange(h, dtype=cp.int32)[:, None]
             xx = cp.arange(w, dtype=cp.int32)[None, :]
 
-            top_left = (sub_aps_idx.astype(cp.float32) * sub_ap_width).astype(cp.int32)
+            # Compute pixel top-left corners from indices, rounding to nearest pixel boundary.
+            top_left = cp.rint(sub_aps_idx.astype(cp.float64) * w64).astype(cp.int32)
+
+            # Clip to stay in-bounds (python slicing used to clip implicitly; fancy indexing does not).
+            top_left_y = cp.clip(top_left[:, 0], 0, grid_size - h)
+            top_left_x = cp.clip(top_left[:, 1], 0, grid_size - w)
+            top_left = cp.stack((top_left_y, top_left_x), axis=1)
 
             ys = top_left[:, 0, None, None] + yy[None, :, :]
             xs = top_left[:, 1, None, None] + xx[None, :, :]
 
-            # Legacy: keep a CPU list of slice windows per active subap.
+            # Legacy: keep a CPU list of slice windows per active subap (used by older visualization code).
             try:
                 _iy = cp.asnumpy(top_left[:, 0]).astype(np.int32, copy=False)
                 _ix = cp.asnumpy(top_left[:, 1]).astype(np.int32, copy=False)
+
                 self.sub_slice = [(slice(int(y0), int(y0) + h), slice(int(x0), int(x0) + w)) for y0, x0 in zip(_iy, _ix)]
+
             except Exception:
                 self.sub_slice = None
 
             sub_pupils = pupil[ys, xs].astype(cp.float32, copy=False)
 
-            grid_ny = int(sub_aps_idx[:, 0].max().item()) + 1
-            grid_nx = int(sub_aps_idx[:, 1].max().item()) + 1
+            # Use the full nominal SH grid for stitched sensor-image layout (even if edge rows/cols are inactive).
+            grid_ny = int(self.n_sub)
+            grid_nx = int(self.n_sub)
 
             self.active_sub_aps = active_sub_aps
             self.sub_aps = sub_aps
@@ -674,8 +695,8 @@ class WFSensor_tools:
             n_sub = int(self.sub_aps_idx.shape[0])
             pad = int(pad)
 
-            # extract subap phases directly
-            sub_phase = phase_map[:, None, :, :][:, :, self.ys, self.xs]  # (n_map, n_sub, h, w)
+            # Extract subap phases directly
+            sub_phase = phase_map[:, self.ys, self.xs]  # (n_map, n_sub, h, w)
             sub_phase *= self.sub_pupils[None, :, :, :]                   # zero outside pupil in subap
 
             scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)

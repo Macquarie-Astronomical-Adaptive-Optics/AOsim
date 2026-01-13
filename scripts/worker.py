@@ -185,7 +185,12 @@ class CalculateWorker(QObject):
 
             # Ensure sensor uses this pupil/grid and rebuilds its cached geometry
             try:
-                sensor.recompute(pupil=pupil, grid_size=grid_size)
+                sensor.recompute(
+                    n_sub=int(params.get('sub_apertures')),
+                    wavelength=float(params.get('wfs_lambda')),
+                    pupil=pupil,
+                    grid_size=grid_size,
+                )
             except Exception:
                 # Older sensors may not accept pupil/grid_size on recompute; fall back to direct assignment.
                 sensor.pupil = pupil

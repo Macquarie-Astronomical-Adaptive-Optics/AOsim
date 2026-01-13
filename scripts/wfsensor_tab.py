@@ -265,19 +265,14 @@ class SensorTabWidget(QWidget):
         self._value_items[1].setText(f"{1e3 * img_fwhm:.3e}")
 
         img = np.asarray(result["subap_image"])
-        key = tuple(img.shape)
+        obsc = self.params.get("telescope_center_obscuration")
+        key = (tuple(img.shape), obsc)
+
         mask = self._subap_mask_cache.get(key)
         if mask is None:
             if img.ndim == 2 and img.shape[0] == img.shape[1]:
                 m = ut.Pupil_tools.generate_pupil(grid_size=int(img.shape[0]))
-                # utilities returns cupy; plotting wants numpy bool mask
-                try:
-                    import cupy as cp
-                    if isinstance(m, cp.ndarray):
-                        m = cp.asnumpy(m)
-                except Exception:
-                    pass
-                mask = (np.asarray(m) > 0)
+                mask = (np.asarray(m.get()) > 0)
             else:
                 # Fallback: no masking for non-square stitched sensor images
                 mask = None
@@ -313,6 +308,7 @@ class SensorTabWidget(QWidget):
         """Queue a full recompute on the shared worker whenever main window config table changes params"""
         self.job_id += 1
         enforce_config_types(params)
+        self.params = params
         self.sensor.recompute(grid_size=int(params.get("grid_size")))
 
         self.busy_label.setText("Recomputing…")
