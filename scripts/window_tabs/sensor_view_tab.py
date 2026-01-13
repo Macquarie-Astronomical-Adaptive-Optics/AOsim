@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout, QWidget,
     QSplitter
@@ -32,6 +32,10 @@ class SensorView_tab(QWidget):
         splitter.addWidget(self.psf_grid)
         splitter.addWidget(self.layer_grid)
         splitter.setSizes([400, 800])  # tweak
+
+    @Slot(float)
+    def updateLayerGrid(self, new_obsc):
+        self.layer_grid.set_pupil_params(center_obscuration=new_obsc) 
 
     def showEvent(self, event):
         self.scheduler._overview_enabled = True

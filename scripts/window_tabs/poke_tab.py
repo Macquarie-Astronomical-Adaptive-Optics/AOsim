@@ -15,6 +15,7 @@ RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
     sensors_changed = Signal(dict)
+    pupil_changed = Signal(float)
 
     def __init__(self, config_dict):
         super().__init__()
@@ -83,6 +84,8 @@ class Poke_tab(QWidget):
         self.sensors_changed.emit(self.wfsensors)
 
     def update_tabs(self, params):
+        # also update sensor view tab while we're at it
+        self.pupil_changed.emit(params.get("telescope_center_obscuration"))
         for tab in self.tab_pages:
             tab.main_params_changed(params)
 

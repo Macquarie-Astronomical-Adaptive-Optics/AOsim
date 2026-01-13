@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         
         print("> Starting SensorView tab building")
         tabs.addTab(sensview := turb.overview_tab, "SensorView")
+        poke.pupil_changed.connect(sensview.updateLayerGrid)
         print("> SensorView tab done!")
 
 

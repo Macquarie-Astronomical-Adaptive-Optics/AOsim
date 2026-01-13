@@ -91,7 +91,6 @@ def _to_numpy(a):
     if isinstance(a, cp.ndarray):
         return a.get()
     return np.asarray(a)
-
 class LayerFootprintGrid(QWidget):
     def __init__(
         self,
@@ -106,7 +105,9 @@ class LayerFootprintGrid(QWidget):
         overlay_opacity=0.55,
         overlay_cmap="viridis",
         overlay_z=50,
-        pupil_alpha=55,   # alpha for pupil RGBA stamps
+        pupil_alpha=55,
+        # NEW: optional explicit pupil params (so we don't rely on global utilities params)
+        pupil_center_obscuration=None,
     ):
         super().__init__(parent)
 
@@ -123,11 +124,15 @@ class LayerFootprintGrid(QWidget):
         self.overlay_z = int(overlay_z)
         self.pupil_alpha = int(pupil_alpha)
 
+        # --- NEW: pupil param state / dirty flag ---
+        self._pupil_center_obscuration = pupil_center_obscuration  # None -> utilities default
+        self._pupil_dirty = True
+        self._pupil_key = None  # (M, obsc, alpha, S)
+
         self._lut_cache = {}
 
         outer = QVBoxLayout(self)
         outer.addWidget(QLabel(title))
-
         self.grid = QGridLayout()
         outer.addLayout(self.grid)
 
@@ -147,21 +152,41 @@ class LayerFootprintGrid(QWidget):
 
         # --- dynamic layout state ---
         self._active_layer_idxs = []
-        self._layer_to_canvas = {}   # layer_idx -> canvas_idx
-        self.layer_canvases = []     # list[PGCanvas], only for active layers
+        self._layer_to_canvas = {}
+        self.layer_canvases = []
 
         # overlays keyed by layer_idx
         self._overlay_items = {}     # layer_idx -> [ImageItem for each sensor]
         self._pupil_items = {}       # layer_idx -> [ImageItem for each sensor]
 
-        # pupil stamps (built lazily when we know patch M)
         self._pupil_rgba_by_sensor = None
         self._pupil_rgba_M = None
 
+        # NEW: remember last patch size we drew, so "show" can refresh stamps without update_layers()
+        self._last_patch_M = None
+
         self._rebuild_grid()
 
+    def set_pupil_params(self, *, center_obscuration=None, pupil_alpha=None):
+
+        if center_obscuration is not None:
+            self._pupil_center_obscuration = float(center_obscuration)
+        if pupil_alpha is not None:
+            self.pupil_alpha = int(pupil_alpha)
+            # also update palette alphas
+            self._pens_rgba = [(r, g, b, self.pupil_alpha) for (r, g, b, _a) in self._pens_rgba]
+
+        self._invalidate_pupil_stamps()
+        self._refresh_pupil_overlays()
+
+    def _invalidate_pupil_stamps(self):
+        self._pupil_rgba_by_sensor = None
+        self._pupil_rgba_M = None
+        self._pupil_key = None
+        self._pupil_dirty = True
+
     # -------------------------
-    # Active/inactive handling
+    # refresh when shown 
     # -------------------------
     def _layer_is_active(self, layer: dict) -> bool:
         # treat unloaded as inactive for display
@@ -242,17 +267,38 @@ class LayerFootprintGrid(QWidget):
             self._lut_cache[cmap] = _mpl_lut(cmap, 256)
         return self._lut_cache[cmap]
 
-    def _ensure_pupil_stamps(self, M: int):
-        """Build per-sensor MxMx4 RGBA pupil stamps once."""
+    def _generate_pupil_mask(self, M: int) -> np.ndarray:
+        """
+        Create the pupil mask at resolution M using current pupil params.
+        Uses Pupil_tools.generate_pupil(...) with kwargs when available.
+        """
+        try:
+            if self._pupil_center_obscuration is None:
+                pup = Pupil_tools.generate_pupil(grid_size=int(M))
+            else:
+                pup = Pupil_tools.generate_pupil(
+                    grid_size=int(M),
+                    telescope_center_obscuration=float(self._pupil_center_obscuration),
+                )
+        except TypeError:
+            # fallback for older signature: generate_pupil(M) positional
+            pup = Pupil_tools.generate_pupil(int(M))
+
+        return _to_numpy(pup).astype(bool)
+
+    def _ensure_pupil_stamps(self, M: int, force: bool = False):
         M = int(M)
-        if self._pupil_rgba_by_sensor is not None and self._pupil_rgba_M == M:
+        S = int(self.thetas.shape[0])
+        obsc = None if self._pupil_center_obscuration is None else float(self._pupil_center_obscuration)
+        key = (M, obsc, int(self.pupil_alpha), S)
+
+        if not force and not self._pupil_dirty and self._pupil_key == key and self._pupil_rgba_M == M:
             return
 
-        # generate pupil mask at patch resolution
-        pupil = _to_numpy(Pupil_tools.generate_pupil(M)).astype(bool)  # (M,M)
+        pupil = self._generate_pupil_mask(M)  # (M,M) bool
 
         stamps = []
-        for s in range(self.thetas.shape[0]):
+        for s in range(S):
             r, g, b, a = self._pens_rgba[s % len(self._pens_rgba)]
             rgba = np.zeros((M, M, 4), dtype=np.uint8)
             rgba[pupil, 0] = r
@@ -263,6 +309,27 @@ class LayerFootprintGrid(QWidget):
 
         self._pupil_rgba_by_sensor = stamps
         self._pupil_rgba_M = M
+        self._pupil_key = key
+        self._pupil_dirty = False
+
+    def _refresh_pupil_overlays(self, force: bool = False):
+        """
+        Rebuild stamps if needed and re-apply them to *all* existing pupil ImageItems
+        without requiring update_layers() to run again.
+        """
+        if self._last_patch_M is None:
+            return  # nothing drawn yet
+
+        self._ensure_pupil_stamps(self._last_patch_M, force=force)
+
+        if self._pupil_rgba_by_sensor is None:
+            return
+
+        S = self.thetas.shape[0]
+        for layer_idx, pupil_items in self._pupil_items.items():
+            # pupil_items is list[ImageItem] length S
+            for s in range(min(S, len(pupil_items))):
+                pupil_items[s].setImage(self._pupil_rgba_by_sensor[s], autoLevels=False)
 
     # -------------------------
     # Overlay update
@@ -270,13 +337,13 @@ class LayerFootprintGrid(QWidget):
     def _update_one(self, layer_idx: int, sensor_idx: int, patch_img: np.ndarray, base_levels=None):
         """Update one overlay patch + pupil stamp for (layer_idx, sensor_idx)."""
         if layer_idx not in self._layer_to_canvas:
-            return  # inactive layer not displayed
-
-        ci = self._layer_to_canvas[layer_idx]  # canvas index
-        canvas = self.layer_canvases[ci]
+            return
 
         patch = np.asarray(patch_img, dtype=np.float32)
-        M = patch.shape[0]
+        M = int(patch.shape[0])
+
+        self._last_patch_M = M
+
         self._ensure_pupil_stamps(M)
 
         # display scale: ORIGINAL N coords -> displayed image coords
