@@ -80,6 +80,9 @@ class SimWorker(QObject):
         emit_psf: bool = True,
         pupil_mask=None,                  # for single-sensor PSF (should match patch_M x patch_M)
         parent=None,
+
+        # combined update rate (display). None/0 -> every tick
+        combined_hz: Optional[int] = None,
     ):
         super().__init__(parent)
 
@@ -121,6 +124,8 @@ class SimWorker(QObject):
 
         # rate limit periods (ticks)
         self._interval_ms = max(1, int(1000 / max(1, self.fps_cap)))
+        self._combined_period = self._hz_to_period(int(combined_hz)) if (combined_hz is not None and combined_hz > 0) else 1
+
 
         self._layer_tab_period = self._hz_to_period(layer_tab_hz)
         self._sensor_period    = self._hz_to_period(sensor_hz)
@@ -141,6 +146,8 @@ class SimWorker(QObject):
 
         # sim + masks
         self.sim = None
+        # reusable GPU buffers (to avoid per-tick allocations)
+        self._combined_buf = None  # cp.ndarray (N,N) float32
         self.pupil_mask = None if pupil_mask is None else cp.asarray(pupil_mask).astype(cp.float32)
         self._pupil_mask_psf = None  # built on build_sim (circular mask for overview PSFs)
 
@@ -414,42 +421,49 @@ class SimWorker(QObject):
 
     def _combined_gpu(self):
         """
-        Return combined phase (sum of layers) as a 2D cupy array.
+        Return combined phase (sum of active layers) as a 2D cupy array.
+
         Uses world-anchored layer views so display doesn't jump even if caches pan.
         """
         N = int(self.sim_kwargs["N"])  # display size (or patch_M)
 
-        L = len(self.sim.layers)
-        if L == 0:
+        if self.sim is None or len(self.sim.layers) == 0:
             return cp.zeros((N, N), dtype=cp.float32)
 
-        # (L, N, N)
-        stack = cp.stack(
-            [ 
-                self.sim.get_layer_view(
-                    i,
-                    center_xy_pix=((N - 1) / 2.0, (N - 1) / 2.0),
-                    size_pixels=N,
-                    M=N,
-                    angle_deg=0.0,
-                    return_gpu=True,
-                )
-                if self.sim._layers_obj[i].active 
-                else cp.zeros((N, N,), dtype=cp.float32)
-                for i in range(L) 
-            ],
-            axis=0,
-        )
+        # (re)allocate reusable buffer if needed
+        buf = self._combined_buf
+        if buf is None or buf.shape != (N, N):
+            buf = cp.empty((N, N), dtype=cp.float32)
+            self._combined_buf = buf
 
-        # sum over layers -> (N, N)
-        combined = cp.sum(stack, axis=0)
+        buf.fill(0.0)
+
+        center = ((N - 1) / 2.0, (N - 1) / 2.0)
+        any_active = False
+
+        # accumulate only active layers (skip inactive without allocating zeros)
+        for i in range(len(self.sim.layers)):
+            if not self.sim._layers_obj[i].active:
+                continue
+            any_active = True
+            buf += self.sim.get_layer_view(
+                i,
+                center_xy_pix=center,
+                size_pixels=N,
+                M=N,
+                angle_deg=0.0,
+                return_gpu=True,
+            )
+
+        if not any_active:
+            # keep buffer valid shape for downstream code
+            buf.fill(0.0)
+            return buf
 
         # remove piston
-        combined -= cp.mean(combined)
+        buf -= cp.mean(buf)
+        return buf
 
-        return combined
-
-    # ---------- PSF + phase emissions ----------
     def _phase_to_psf_logI(self, phase, pupil):
         E = pupil * cp.exp(1j * phase)
         F = cp.fft.fftshift(cp.fft.fft2(E))
@@ -561,27 +575,24 @@ class SimWorker(QObject):
         self._emit_overview()
 
     def _emit_overview(self):
-        if not self._overview_enabled:
+        if not self._overview_enabled or self.sim is None:
             return
-
-        # all sensor PSFs
-        self._ensure_cache()
-        phis = [L.get("phi", None) for L in self.sim.layers]
-        phis = [p for p in phis if p is not None]
-        if len(phis) != len(self.sim.layers):
-            self.status_log.emit("Overview skipped: some layer phis not ready yet.")
-            return
-        
-        psfs = self._compute_all_sensor_psfs()
-        self.all_sensor_psf_ready.emit(cp.asnumpy(_logpsf_to_u8(psfs)))
 
         # all layers (downsampled)
+        self._ensure_cache()
+
+        # ensure layer phis are ready before sampling
+        for L in self.sim.layers:
+            if L.get("phi", None) is None:
+                self.status_log.emit("Overview skipped: some layer phis not ready yet.")
+                return
+
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=self.thetas_gpu,
             ranges_m=self.ranges_gpu,
             center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
-            M=self.psf_M,
+            M=self.layer_M,
             angle_deg=0.0,
             remove_piston=True,
             return_gpu=True,
@@ -599,9 +610,11 @@ class SimWorker(QObject):
 
         self._tick_count += 1
 
-        # always emit combined (cheap-ish; still a copy)
-        combined = self._combined_gpu()
-        self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
+        # emit combined at a capped rate to reduce GPU->CPU copies
+        if self._combined_period <= 1 or self._tick_count == 1 or (self._tick_count % self._combined_period) == 0:
+            combined = self._combined_gpu()
+            self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
+
 
         # visible layer at layer_tab rate
         if self._visible_layer is not None and (self._tick_count % self._layer_tab_period == 0):

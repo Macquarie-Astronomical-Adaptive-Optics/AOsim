@@ -515,7 +515,7 @@ class WFSensor_tools:
             lgs_launch_offset_px=(0.0, 0.0),   # (off_x_px, off_y_px) relative to pupil center
             lgs_dir_bins=1024,                   
             lgs_rad_bins=1024,
-            lgs_elong_scale=6.0,             
+            lgs_elong_scale=2.0,             
             lgs_half_max=24,                   # cap kernel half-length (pixels)
         ):
             if n_sub is None:
@@ -938,7 +938,6 @@ class WFSensor_tools:
                         ndir = int(max(1, self.lgs_dir_bins))
                         nrad = int(max(1, self.lgs_rad_bins))
 
-                        frac = float(self.lgs_thickness_m) / float(self.gs_range_m)
                         scale = float(self.lgs_elong_scale)
 
                         order = self._lgs_group_order_gpu
