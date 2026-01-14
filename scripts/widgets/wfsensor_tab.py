@@ -39,6 +39,9 @@ class SensorTabWidget(QWidget):
             )
 
         self.sensor = sensor
+        for key, val in self.sensor.__dict__.items():
+            self.params[key] = val
+
         self.params["dx"] = self.sensor.dx * RAD2ARCSEC
         self.params["dy"] = self.sensor.dy * RAD2ARCSEC
         print(" -", self.sensor_name)
@@ -93,7 +96,7 @@ class SensorTabWidget(QWidget):
 
         # Left: config + busy + table
         left_v = QVBoxLayout()
-        config_keys = ["sub_apertures","wfs_lambda","dx","dy"]
+        config_keys = ["sub_apertures","wfs_lambda","dx","dy","gs_range_m","lgs_launch_offset_px","lgs_thickness_m"]
         self.config_table = Config_table(config_keys, self.params)
         left_v.addWidget(self.config_table)
 

@@ -17,16 +17,16 @@ class GenericWorkerSignals(QObject):
 
 
 class GenericWorker(QRunnable):
-    def __init__(self, generator_func, **params):
+    def __init__(self, function, **params):
         super().__init__()
-        self.generator_func = generator_func
+        self.function = function
         self.params = params
         self.signals = GenericWorkerSignals()
 
     def run(self):
         try:
-            gen, next_frame_func = self.generator_func(**self.params)
-            self.signals.finished.emit((gen, next_frame_func))
+            function, out = self.function(**self.params)
+            self.signals.finished.emit((out, function))
         except Exception as e:
             self.signals.error.emit(e)
 

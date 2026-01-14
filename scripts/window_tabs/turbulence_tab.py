@@ -13,6 +13,7 @@ from scripts.utilities import Pupil_tools
 from scripts.widgets.config_table import Config_table
 from scripts.widgets.wrap_tab import DetachableTabWidget
 from scripts.widgets.pgcanvas import PGCanvas
+from scripts.widgets.loading_label import DotLoadingLabel
 from scripts.phase_screen.infinite_vonkarman import LayeredInfinitePhaseScreen
 from scripts.schedulerGPU import SimWorker
 from scripts.widgets.dual_list_selector import DualListSelector
@@ -27,6 +28,8 @@ RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
 class Turbulence_tab(QWidget):
     active_changed = Signal(object)
     req_add_layer = Signal(object)
+    req_step = Signal(bool)
+    req_step_n = Signal(int, int)
     req_overview_enabled = Signal(bool)
     req_emit_overview = Signal()
     req_visible_sensor = Signal(int)
@@ -111,7 +114,7 @@ class Turbulence_tab(QWidget):
 
         main_layout.addWidget(left_frame)
 
-        # middle: controls + another view (optional; keep showing combined)
+        # middle: controls + total view
         fmiddle = QFrame()
         fmiddle.setFrameShape(QFrame.Box)
         fmiddle.setLineWidth(1)
@@ -119,6 +122,10 @@ class Turbulence_tab(QWidget):
 
         self.active_canvas = PGCanvas()
         middle_layout.addWidget(self.active_canvas)
+
+        self.scheduler_status = DotLoadingLabel("Creating turbulence screens")
+        self.scheduler_status.start()
+        middle_layout.addWidget(self.scheduler_status)
 
         phase_b_layout = QHBoxLayout()
         middle_layout.addLayout(phase_b_layout)
@@ -185,15 +192,20 @@ class Turbulence_tab(QWidget):
         self.req_emit_overview.connect(self.scheduler.emit_overview_once)
         self.req_visible_sensor.connect(self.scheduler.set_visible_sensor)
         self.req_add_layer.connect(self.scheduler.add_layer)
+        self.req_step_n.connect(self.scheduler.step_n)
+        self.req_step.connect(self.scheduler.step_once)
 
 
         self.scheduler_thread.started.connect(self.scheduler.build_sim)
-        self.scheduler_thread.started.connect(self.scheduler.step_once)
+        # self.scheduler_thread.started.connect(self.scheduler.step_once)
 
         self.scheduler.finished.connect(self.scheduler_thread.quit)
 
         # signals -> UI
-        self.scheduler.status.connect(print)
+        self.scheduler.status_log.connect(print)
+        self.scheduler.status.connect(self.scheduler_status.setBaseText)
+        self.scheduler.status_running.connect(self.scheduler_status.run)
+
         self.scheduler.fpsReady.connect(lambda fps: self.setWindowTitle(f"Turbulence — {fps:.1f} FPS"))
         self.scheduler.combined_ready.connect(self.on_combined_frame)
         self.scheduler.layer_ready.connect(self.on_layer_frame)
@@ -203,7 +215,7 @@ class Turbulence_tab(QWidget):
 
 
         # controls -> worker (queued automatically across threads)
-        self.next_button.clicked.connect(self.scheduler.step_once)
+        self.next_button.clicked.connect(lambda  a: self.req_step.emit(True))
         self.run_inf_button.clicked.connect(self.scheduler.start)
         self.stop_button.clicked.connect(self.scheduler.pause)
         self.reset_button.clicked.connect(self.scheduler.reset)
@@ -257,7 +269,8 @@ class Turbulence_tab(QWidget):
     @Slot()
     def _run_x_clicked(self):
         n = int(self.spin.value())
-        self.scheduler.step_n(n, 2)
+        self.req_step_n.emit(n,2)
+        
 
     @Slot(int)
     def _tab_changed(self, idx: int):

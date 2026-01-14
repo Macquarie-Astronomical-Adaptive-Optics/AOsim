@@ -25,7 +25,6 @@ _XY_CACHE = {}          # (device, grid_size, dtype) -> (y_col, x_row)
 _PUPIL_CACHE = {}       # (device, grid_size, obsc, dtype) -> pupil
 _SCIENCE_I0PEAK = {}    # (device, grid_size, obsc, pad, science_lambda, dtype) -> float
 _RADIAL_CACHE = {}      # (backend, shape) -> (r_int, radial_cnt)
-_COORD_CACHE = {}       # (device, h_p, w_p, dtype) -> (y_coords, x_coords)
 _SUBAP_GEOM_CACHE = {}  # (device, n_sub, grid_size, obsc) -> dict geometry (for SH)
 
 def _device_id():
@@ -44,9 +43,6 @@ def _get_xy(grid_size: int, dtype=cp.float32):
         out = (y, x)
         _XY_CACHE[key] = out
     return out
-
-def _as_float32(x):
-    return x.astype(cp.float32, copy=False) if isinstance(x, cp.ndarray) else x
 
 # -----------------------------
 # Phase screen / phase maps
@@ -502,9 +498,6 @@ class WFSensor_tools:
         # small local cache for centroid coordinate vectors
         _coord_cache = {}  # (device, h_p, w_p) -> (y_coords, x_coords)
 
-        # global geometry cache (you likely already have this in your file; keep using yours if so)
-        _SUBAP_GEOM_CACHE = {}
-
         def __init__(
             self,
             gs_range_m=np.inf,                 # np.inf for NGS, finite for LGS
@@ -672,7 +665,7 @@ class WFSensor_tools:
 
             pc = (float(self.grid_size) - 1.0) * 0.5
             lx = pc + float(self.lgs_launch_offset_px[0])
-            ly = pc + float(self.lgs_launch_offset_px[1])
+            ly = pc - float(self.lgs_launch_offset_px[1]) # original is y-up, but calculations are in y-down so negate
 
             vx = cx - lx
             vy = cy - ly

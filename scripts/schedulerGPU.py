@@ -11,7 +11,10 @@ def profiling_safe_mean(a, axis):
 
 class SimWorker(QObject):
     # status / lifecycle
+    status_log = Signal(object)
     status = Signal(str)
+    status_running = Signal(bool)
+
     fpsReady = Signal(float)
     finished = Signal()
 
@@ -146,32 +149,36 @@ class SimWorker(QObject):
             return
 
         cp.cuda.Device().use()
-        self.status.emit("Building LayeredPhaseScreen on worker thread...")
+        self.status_log.emit("Building LayeredPhaseScreen on worker thread...")
+        self.status.emit("Building Sim")
 
-        self.status.emit("   Creating sim...")
+        self.status_log.emit("   Creating sim...")
         self.sim = self.sim_factory(**self.sim_kwargs)
-        [self.status.emit("     "+str((i, j))) for i, j in self.sim_kwargs.items()]
+        [self.status_log.emit("     "+str((i, j))) for i, j in self.sim_kwargs.items()]
 
         for k, layer in enumerate(self.layer_cfgs):
-            self.status.emit(f"   Adding layer {k+1}...")
-            [self.status.emit("     "+str((i, j))) for i, j in layer.items()]
+            self.status_log.emit(f"   Adding layer {k+1}...")
+            [self.status_log.emit("     "+str((i, j))) for i, j in layer.items()]
 
             self.sim.add_layer(**layer)
 
-        self.status.emit("Screen Sim built!")
+        self.status_log.emit("Screen Sim built!")
         
 
         # overview PSF uses circular pupil unless you provide your own
         self._pupil_mask_psf = self._build_circular_pupil(self.psf_M)
 
-        self.status.emit(f"Built sim with {len(self.layer_cfgs)} layers.")
+        self.status_log.emit(f"Built sim with {len(self.layer_cfgs)} layers.")
+        self.status.emit("Sim building done!")
+        self.status_running.emit(False)
+
         self.update_r0.emit(self.sim.r0_total)
         self._emit_once()
 
     @Slot(dict)
     def add_layer(self, layer_cfgs):
 
-        self.status.emit(f"Adding layer...")
+        self.status_log.emit(f"Adding layer...")
         self.sim.add_layer(**layer_cfgs)
         self.layer_cfgs.append(layer_cfgs) 
 
@@ -188,14 +195,20 @@ class SimWorker(QObject):
         self._frames = 0
         self._t0 = None
         self.timer.start(self._interval_ms)
-        self.status.emit("Running (continuous).")
+        self.status_log.emit("Running (continuous).")
+        self.status.emit("Running Sim")
+        self.status_running.emit(True)
+
 
     @Slot()
     def pause(self):
         self.timer.stop()
         self._stepping = False
         self._steps_left = 0
-        self.status.emit("Paused.")
+        self.status_log.emit("Paused.")
+        self.status.emit("Sim Paused")
+        self.status_running.emit(False)
+
 
     @Slot()
     def stop(self):
@@ -203,29 +216,47 @@ class SimWorker(QObject):
         self._stepping = False
         self._steps_left = 0
         self.finished.emit()
-        self.status.emit("Stopped.")
+        self.status_log.emit("Stopped.")
+        self.status.emit("Sim stopped")
+        self.status_running.emit(False)
+
 
     @Slot()
     def reset(self):
         if self.sim is None:
             return
         if hasattr(self.sim, "hard_reset"):
+            self.status.emit("Sim resetting")
+            self.status_running.emit(True)
+
             self.sim.hard_reset()
-            self.status.emit("Hard reset to initial frame.")
+
+            self.status_log.emit("Hard reset to initial frame.")
+            self.status.emit("Sim reset to initial frames")
+            self.status_running.emit(False)
+
+
         else:
+            self.status_log.emit("Unable to hard reset! ")
             self.status.emit("Unable to hard reset! ")
 
         self._emit_once()
 
     # ------------------ stepping ------------------
-    @Slot()
-    def step_once(self):
+    @Slot(bool)
+    def step_once(self, status=True):
         if self.sim is None:
             self.build_sim()
         self.timer.stop()
+        self.status_running.emit(True)
+
         self._ensure_cache()
         self._advance(1)
         self._emit_once()
+        self.status_running.emit(False)
+
+        if status: 
+            self.status.emit("Sim stepped once")
 
     @Slot(int, int)
     def step_n(self, n: int, emit_every: int = 0):
@@ -235,7 +266,12 @@ class SimWorker(QObject):
         self._stepping = True
         self._steps_left = max(0, int(n))
         self._emit_every = max(0, int(emit_every))
+        self.status.emit(f"Sim stepping {n} times")
+        self.status_running.emit(True)
+
+
         QTimer.singleShot(0, self._tick_step_n)
+        
 
     # ------------------ view selection ------------------
     @Slot(bool)
@@ -328,7 +364,7 @@ class SimWorker(QObject):
             self.sim.layers[i]["phi"] = None
             self.sim.layers[i]["phi_t"] = None
 
-        self.step_once()
+        self.step_once(status=False)
 
     def _regen_single_layer(self, i: int):
         # If your sim has a regen method, use it:
@@ -337,13 +373,13 @@ class SimWorker(QObject):
             return
 
         # fallback: rebuild entire sim
-        self.status.emit(f"Rebuilding sim to apply seed_offset for layer {i}...")
+        self.status_log.emit(f"Rebuilding sim to apply seed_offset for layer {i}...")
         sim_kwargs = dict(self.sim_kwargs)
         self.sim = self.sim_factory(**sim_kwargs)
         for layer in self.layer_cfgs:
             self.sim.add_layer(**layer)
         self._pupil_mask_psf = self._build_circular_pupil(self.psf_M)
-        self.status.emit("Rebuilt sim.")
+        self.status_log.emit("Rebuilt sim.")
 
     # ------------------ internals ------------------
     def _advance(self, n_steps: int):
@@ -514,7 +550,7 @@ class SimWorker(QObject):
         phis = [L.get("phi", None) for L in self.sim.layers]
         phis = [p for p in phis if p is not None]
         if len(phis) != len(self.sim.layers):
-            self.status.emit("Overview skipped: some layer phis not ready yet.")
+            self.status_log.emit("Overview skipped: some layer phis not ready yet.")
             return
         
         psfs = self._compute_all_sensor_psfs()
@@ -578,6 +614,10 @@ class SimWorker(QObject):
         if not self._stepping or self._steps_left <= 0:
             self._stepping = False
             self._emit_once()
+            self.status.emit(f"Sim finished stepping")
+            self.status_running.emit(False)
+
+
             return
 
         chunk = min(self._batch, self._steps_left)

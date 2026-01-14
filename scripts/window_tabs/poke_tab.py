@@ -32,7 +32,7 @@ class Poke_tab(QWidget):
             dx=45, 
             dy=0,
             lgs_thickness_m=10_000.0,     # ~10 km sodium thickness
-            lgs_launch_offset_px=(-off_x_px, 0.0),
+            lgs_launch_offset_px=(off_x_px, 0.0),
             lgs_remove_tt=True
         )
         self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(
@@ -41,7 +41,7 @@ class Poke_tab(QWidget):
             dx=-45, 
             dy=0,
             lgs_thickness_m=10_000.0,    
-            lgs_launch_offset_px=(off_x_px, 0.0),
+            lgs_launch_offset_px=(-off_x_px, 0.0),
             lgs_remove_tt=True
         )
         self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(
@@ -50,7 +50,7 @@ class Poke_tab(QWidget):
             dx=0, 
             dy=45,
             lgs_thickness_m=10_000.0,     
-            lgs_launch_offset_px=(-off_x_px, 0.0),
+            lgs_launch_offset_px=(0.0, off_x_px),
             lgs_remove_tt=True
         )
         self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(
@@ -59,7 +59,7 @@ class Poke_tab(QWidget):
             dx=0, 
             dy=-45,
             lgs_thickness_m=10_000.0,   
-            lgs_launch_offset_px=(off_x_px, 0.0),
+            lgs_launch_offset_px=( 0.0, -off_x_px),
             lgs_remove_tt=True
         )
         self.sensors_changed.emit(self.wfsensors)
