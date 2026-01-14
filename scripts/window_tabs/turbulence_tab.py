@@ -220,7 +220,7 @@ class Turbulence_tab(QWidget):
         self.scheduler_thread.start()
 
         # worker emits stacks
-        self.overview_tab = SensorView_tab(sensors, config_dict, layers, thetas, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
+        self.overview_tab = SensorView_tab(sensors, config_dict, layers, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
         
         self.scheduler.all_sensor_psf_ready.connect(self.overview_tab.psf_grid.update_psfs)
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)

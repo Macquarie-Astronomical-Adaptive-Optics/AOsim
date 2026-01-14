@@ -1,9 +1,25 @@
-from PySide6.QtWidgets import QWidget, QGridLayout, QLabel, QVBoxLayout, QSizePolicy
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QWidget, QGridLayout, QLabel, QVBoxLayout, QFrame
 import numpy as np
 import cupy as cp
 
 from scripts.widgets.pgcanvas import PGCanvas
 from scripts.utilities import Pupil_tools
+
+pupil_alpha=55
+_pens_rgba = [
+            (255, 0, 0, pupil_alpha),
+            (0, 255, 0, pupil_alpha),
+            (0, 128, 255, pupil_alpha),
+            (255, 165, 0, pupil_alpha),
+            (255, 0, 255, pupil_alpha),
+            (0, 255, 255, pupil_alpha),
+            (255, 255, 0, pupil_alpha),
+        ]
+
+def rgba_to_css(color):
+    r, g, b, a = color
+    return f"rgba({r}, {g}, {b}, {a/255:.3f})"
 
 class SensorPSFGrid(QWidget):
     """
@@ -11,9 +27,10 @@ class SensorPSFGrid(QWidget):
 
     thetas_xy_rad: list/array shape (S,2) with theta_x, theta_y in radians.
     """
-    def __init__(self, thetas_xy_rad, title="Sensor PSFs", parent=None):
+    def __init__(self, sensors, title="Sensor PSFs", parent=None):
         super().__init__(parent)
-        self.thetas = np.asarray(thetas_xy_rad, dtype=np.float32)  # (S,2)
+        self.sensors = sensors
+        self.thetas = np.asarray([s.field_angle for s in self.sensors.values()])# (S,2)
         self.S = self.thetas.shape[0]
 
         outer = QVBoxLayout(self)
@@ -28,12 +45,35 @@ class SensorPSFGrid(QWidget):
         # create a canvas for each sensor
         self.canvases = []
         
-        
+        self._pens_rgba = [(r, g, b, 255) for (r, g, b, _a) in _pens_rgba]
+
         for s in range(self.S):
+
+            frame = QFrame()
+            frame.setFrameShape(QFrame.NoFrame)
+            
+            vlayout = QVBoxLayout(frame)
+            vlayout.setContentsMargins(0, 0, 0, 5)
+            vlayout.setSpacing(0)
+
+            bg = frame.palette().color(frame.backgroundRole())
+            frame.setStyleSheet(
+                f"QFrame {{ background-color: {bg.name()}; }}"
+            )
+            layername = QLabel(list(self.sensors.keys())[s])
+            layername.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            css_color = rgba_to_css(self._pens_rgba[s])
+            layername.setStyleSheet(f"color: {css_color};")
+            
             c = PGCanvas()
             self.canvases.append(c)
             r, col = self.pos[s]
-            self.grid.addWidget(c, r, col)
+
+            vlayout.addWidget(c)
+            vlayout.addWidget(layername)
+
+            
+            self.grid.addWidget(frame, r, col)
 
     @staticmethod
     def _theta_to_grid(thetas):
@@ -97,7 +137,6 @@ class LayerFootprintGrid(QWidget):
         self,
         sensors,
         layers_cfg,
-        thetas_xy_rad,
         N,
         dx,
         patch_center,
@@ -107,14 +146,13 @@ class LayerFootprintGrid(QWidget):
         overlay_opacity=0.55,
         overlay_cmap="viridis",
         overlay_z=50,
-        pupil_alpha=55,
         pupil_center_obscuration=None,
     ):
         super().__init__(parent)
 
         self.layers_cfg = list(layers_cfg)  # may include active/unloaded flags
         self.sensors = sensors
-        self.thetas = np.asarray(thetas_xy_rad, dtype=np.float32)  # (S,2)
+        self.thetas = np.asarray([s.field_angle for s in self.sensors.values()])  # (S,2)
         self.N = int(N)
         self.dx = float(dx)
 
@@ -137,17 +175,6 @@ class LayerFootprintGrid(QWidget):
         outer.addWidget(QLabel(title))
         self.grid = QGridLayout()
         outer.addLayout(self.grid)
-
-        # color palette (RGBA for pupil)
-        self._pens_rgba = [
-            (255, 0, 0, self.pupil_alpha),
-            (0, 255, 0, self.pupil_alpha),
-            (0, 128, 255, self.pupil_alpha),
-            (255, 165, 0, self.pupil_alpha),
-            (255, 0, 255, self.pupil_alpha),
-            (0, 255, 255, self.pupil_alpha),
-            (255, 255, 0, self.pupil_alpha),
-        ]
 
         # on-axis sensor = closest theta to (0,0)
         self.center_idx = int(np.argmin(np.sum(self.thetas**2, axis=1)))
@@ -176,7 +203,7 @@ class LayerFootprintGrid(QWidget):
         if pupil_alpha is not None:
             self.pupil_alpha = int(pupil_alpha)
             # also update palette alphas
-            self._pens_rgba = [(r, g, b, self.pupil_alpha) for (r, g, b, _a) in self._pens_rgba]
+            _pens_rgba = [(r, g, b, self.pupil_alpha) for (r, g, b, _a) in _pens_rgba]
 
         self._invalidate_pupil_stamps()
         self._refresh_pupil_overlays()
@@ -232,7 +259,26 @@ class LayerFootprintGrid(QWidget):
             self._layer_to_canvas[layer_idx] = ci
 
             r, c = divmod(ci, ncol)
-            self.grid.addWidget(canvas, r, c)
+
+            frame = QFrame()
+            frame.setFrameShape(QFrame.NoFrame)
+            
+            vlayout = QVBoxLayout(frame)
+            vlayout.setContentsMargins(0, 0, 0, 5)
+            vlayout.setSpacing(0)
+
+            bg = frame.palette().color(frame.backgroundRole())
+            frame.setStyleSheet(
+                f"QFrame {{ background-color: {bg.name()}; }}"
+            )
+
+            layername = QLabel(self.layers_cfg[layer_idx]["name"])
+            layername.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            vlayout.addWidget(canvas)
+            vlayout.addWidget(layername)
+
+            self.grid.addWidget(frame, r, c)
 
             # create overlay items for this layer
             patch_items = []
@@ -287,7 +333,42 @@ class LayerFootprintGrid(QWidget):
             pup = Pupil_tools.generate_pupil(int(M))
 
         return _to_numpy(pup).astype(bool)
+    
+    import numpy as np
 
+    def outline(self, rgba: np.ndarray, thickness: int = 1, inplace: bool = True) -> np.ndarray:
+        if not inplace:
+            rgba = rgba.copy()
+
+        a = rgba[..., 3]
+        mask = a > 0 
+
+        if thickness <= 0 or not mask.any():
+            return rgba
+
+        def erode4(m: np.ndarray) -> np.ndarray:
+            # 4-neighbour erosion
+            out = np.zeros_like(m, dtype=bool)
+            out[1:-1, 1:-1] = (
+                m[1:-1, 1:-1] &
+                m[:-2, 1:-1] &
+                m[2:, 1:-1] &
+                m[1:-1, :-2] &
+                m[1:-1, 2:]
+            )
+            return out
+
+        core = mask
+        for _ in range(thickness):
+            core = erode4(core)
+            if not core.any():
+                break
+
+        edge_band = mask & ~core 
+        a[edge_band] = np.min([self.pupil_alpha*2, 255])
+        return rgba
+
+    
     def _ensure_pupil_stamps(self, M: int, force: bool = False):
         M = int(M)
         S = int(self.thetas.shape[0])
@@ -301,13 +382,14 @@ class LayerFootprintGrid(QWidget):
 
         stamps = []
         for s in range(S):
-            r, g, b, a = self._pens_rgba[s % len(self._pens_rgba)]
+            r, g, b, a = _pens_rgba[s % len(_pens_rgba)]
             rgba = np.zeros((M, M, 4), dtype=np.uint8)
             rgba[pupil, 0] = r
             rgba[pupil, 1] = g
             rgba[pupil, 2] = b
             rgba[pupil, 3] = a
-            stamps.append(rgba)
+
+            stamps.append(self.outline(rgba))
 
         self._pupil_rgba_by_sensor = stamps
         self._pupil_rgba_M = M
