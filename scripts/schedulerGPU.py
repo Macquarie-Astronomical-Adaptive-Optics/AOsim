@@ -8,6 +8,24 @@ from PySide6.QtCore import QObject, Signal, Slot, QTimer
 def profiling_safe_mean(a, axis):
     return a.mean(axis=axis)
 
+def _u8_linear(x, vmin, vmax):
+    # avoid div0 + sanitize
+    eps = 1e-12
+    x = cp.nan_to_num(x, nan=vmin, posinf=vmax, neginf=vmin)
+    y = (x - vmin) * (255.0 / (vmax - vmin + eps))
+    return cp.clip(y, 0.0, 255.0).astype(cp.uint8)
+
+def _phase_to_u8(phi, k=3.0):
+    # stable-ish scaling using mean±k*std (2 reductions)
+    mu = cp.mean(phi)
+    sig = cp.std(phi)
+    return _u8_linear(phi, mu - k * sig, mu + k * sig)
+
+def _logpsf_to_u8(logI, dyn=6.0):
+    # clamp to top dyn decades (1 reduction)
+    vmax = cp.max(logI)
+    vmin = vmax - dyn
+    return _u8_linear(logI, vmin, vmax)
 
 class SimWorker(QObject):
     # status / lifecycle
@@ -462,7 +480,7 @@ class SimWorker(QObject):
             return_gpu=True,
         )
         phase0 = phases[0]
-        self.sensor_phase_ready.emit(s, cp.asnumpy(phase0.astype(cp.float16)))
+        self.sensor_phase_ready.emit(s, cp.asnumpy(_phase_to_u8(phase0)))
 
         if self.emit_psf:
             if self.pupil_mask is None:
@@ -475,8 +493,8 @@ class SimWorker(QObject):
                     pupil = self._build_circular_pupil(self.patch_M)
 
             psf = self._phase_to_psf_logI(phase0, pupil)
-            self.sensor_psf_ready.emit(s, cp.asnumpy(psf.astype(cp.float16)))
-
+            self.sensor_psf_ready.emit(s, cp.asnumpy(_logpsf_to_u8(psf)))
+            
     # ---------- overview emissions ----------
     def _compute_all_sensor_psfs(self):
         phases = self.sim.sample_patches_batched(
@@ -489,7 +507,7 @@ class SimWorker(QObject):
             remove_piston=True,
             return_gpu=True,
         )  # (S,M,M)
-        self.all_sensor_phase_ready.emit(cp.asnumpy(phases.astype(cp.float16)))
+        self.all_sensor_phase_ready.emit(cp.asnumpy(_logpsf_to_u8(phases)))
 
         pupil = self._pupil_mask_psf  # (M,M)
         E = pupil[None, :, :] * cp.exp(1j * phases)
@@ -519,15 +537,16 @@ class SimWorker(QObject):
         phi = self.sim.get_layer_view(i, M=self.sim_kwargs["N"], return_gpu=True)
 
         if phi is not None:
-            self.layer_ready.emit(i, cp.asnumpy(phi.astype(cp.float16)))
+            self.layer_ready.emit(i, cp.asnumpy(_phase_to_u8(phi)))
 
     def _emit_once(self):
         self._ensure_cache()
-        self.combined_ready.emit(cp.asnumpy(self._combined_gpu().astype(cp.float16)))
+        combined = self._combined_gpu()
+        self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
         self._emit_visible_layer()
         self._emit_visible_sensor_products()
         psfs = self._compute_all_sensor_psfs()
-        self.all_sensor_psf_ready.emit(cp.asnumpy(psfs.astype(cp.float16)))
+        self.all_sensor_psf_ready.emit(cp.asnumpy(_logpsf_to_u8(psfs)))
         
         self._overview_enabled = True # Temporarily override once
         self._emit_overview()
@@ -554,7 +573,7 @@ class SimWorker(QObject):
             return
         
         psfs = self._compute_all_sensor_psfs()
-        self.all_sensor_psf_ready.emit(cp.asnumpy(psfs.astype(cp.float16)))
+        self.all_sensor_psf_ready.emit(cp.asnumpy(_logpsf_to_u8(psfs)))
 
         # all layers (downsampled)
         phases = self.sim.sample_patches_batched(
@@ -569,7 +588,7 @@ class SimWorker(QObject):
             return_per_layer=True,
             layer_first=True,
         )  # (S,M,M)
-        self.all_layers_ready.emit(cp.asnumpy(phases.astype(cp.float16)))
+        self.all_layers_ready.emit(cp.asnumpy(_phase_to_u8(phases)))
 
 
     # ------------------ main tick ------------------
@@ -581,7 +600,8 @@ class SimWorker(QObject):
         self._tick_count += 1
 
         # always emit combined (cheap-ish; still a copy)
-        self.combined_ready.emit(cp.asnumpy(self._combined_gpu().astype(cp.float16)))
+        combined = self._combined_gpu()
+        self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
 
         # visible layer at layer_tab rate
         if self._visible_layer is not None and (self._tick_count % self._layer_tab_period == 0):
@@ -595,7 +615,7 @@ class SimWorker(QObject):
         if self._overview_enabled:
             if (self._tick_count % self._overview_psf_period) == 0:
                 psfs = self._compute_all_sensor_psfs()
-                self.all_sensor_psf_ready.emit(cp.asnumpy(psfs.astype(cp.float16)))
+                self.all_sensor_psf_ready.emit(cp.asnumpy(_logpsf_to_u8(psfs)))
 
             if (self._tick_count % self._overview_layer_period) == 0:
                 self._emit_overview()

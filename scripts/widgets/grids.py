@@ -521,9 +521,9 @@ class LayerFootprintGrid(QWidget):
                     continue  # expect (S,M,M)
 
                 # base image = center sensor patch
-                base = np.asarray(layer_patches[self.center_idx], dtype=np.float32)
+                base = np.asarray(layer_patches[self.center_idx])
                 if layer_idx in self._layer_to_canvas:
-                    self.layer_canvases[self._layer_to_canvas[layer_idx]].set_image_robust(base, cmap=cmap)
+                    self.layer_canvases[self._layer_to_canvas[layer_idx]].queue_image(base, cmap=cmap, levels=(0, 255), auto_levels=True)
                     try:
                         base_levels = self.layer_canvases[self._layer_to_canvas[layer_idx]].image_item.levels
                     except Exception:
@@ -567,12 +567,12 @@ class LayerFootprintGrid(QWidget):
             layer_patches = arr[j]  # (S,M,M)
 
             # base image = center sensor patch
-            base = np.asarray(layer_patches[self.center_idx], dtype=np.float32)
+            base = np.asarray(layer_patches[self.center_idx])
             ci = self._layer_to_canvas.get(layer_idx, None)
             if ci is None:
                 continue
 
-            self.layer_canvases[ci].set_image_robust(base, cmap=cmap)
+            self.layer_canvases[ci].queue_image(base, cmap=cmap, levels=(0, 255), auto_levels=True)
             try:
                 base_levels = self.layer_canvases[ci].image_item.levels
             except Exception:

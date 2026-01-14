@@ -345,9 +345,9 @@ class TurbulenceWidget(QWidget):
     @Slot(object)
     def update_screen(self, new_screen):
         self.current_screen = new_screen
-        self.turb_canvas.queue_image(new_screen, cmap="viridis", auto_levels=True)
+        self.turb_canvas.queue_image(new_screen, cmap="viridis", levels=(0, 255), auto_levels=True)
 
     def showEvent(self, event):
         super().showEvent(event)
         if self.current_screen is not None:
-            self.turb_canvas.queue_image(self.current_screen, cmap="viridis", auto_levels=True)
+            self.turb_canvas.queue_image(self.current_screen, cmap="viridis", levels=(0, 255), auto_levels=True)

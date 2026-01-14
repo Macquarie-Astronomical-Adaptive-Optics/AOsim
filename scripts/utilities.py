@@ -505,9 +505,10 @@ class WFSensor_tools:
             wavelength=None,
             dx=None,
             dy=None,
-            noise=0.0,
             pupil=None,
             grid_size=None,
+            lenslet_f_m=None,
+            pixel_pitch_m=None,
             # --- guide-star / LGS ---
             lgs_thickness_m=0.0,               # sodium thickness (m). 0 disables elongation
             lgs_remove_tt=True,                # remove global TT from LGS slopes
@@ -525,6 +526,10 @@ class WFSensor_tools:
                 grid_size = params.get("grid_size")
             if pupil is None:
                 pupil = Pupil_tools.generate_pupil(grid_size=grid_size)
+            if lenslet_f_m is None:
+                self.lenslet_f_m   = 5e-3    # e.g. 5 mm
+            if pixel_pitch_m is None:
+                self.pixel_pitch_m = 6.5e-6  # e.g. sCMOS
 
             if dx is None:
                 dx = 0.0
@@ -533,7 +538,6 @@ class WFSensor_tools:
 
             self.n_sub = int(n_sub)
             self.wavelength = float(wavelength)
-            self.noise = float(noise)
 
             self.grid_size = int(grid_size)
             self.pupil = pupil
@@ -543,6 +547,7 @@ class WFSensor_tools:
             self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
             self.field_angle = (self.dx, self.dy)
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
+            
 
             # LGS 
             self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
@@ -581,7 +586,6 @@ class WFSensor_tools:
             wavelength=None,
             dx=None,
             dy=None,
-            noise=None,
             pupil=None,
             grid_size=None,
             gs_range_m=None,
@@ -592,22 +596,21 @@ class WFSensor_tools:
             lgs_rad_bins=None,
             lgs_elong_scale=None,
             lgs_half_max=None,
+            **kwargs
         ):
             if n_sub is not None:
                 self.n_sub = int(n_sub)
             if wavelength is not None:
                 self.wavelength = float(wavelength)
-            if noise is not None:
-                self.noise = float(noise)
             if grid_size is not None:
                 self.grid_size = int(grid_size)
             if pupil is not None:
                 self.pupil = pupil
 
             if dx is not None:
-                self.dx = float(dx) * self.ARCSEC2RAD
+                self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
             if dy is not None:
-                self.dy = float(dy) * self.ARCSEC2RAD
+                self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
             self.field_angle = (self.dx, self.dy)
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
 
@@ -950,8 +953,21 @@ class WFSensor_tools:
                             db = gid - rb * ndir
 
                             r_mean = (rb + 0.5) / float(nrad)
-                            half = int(round(0.5 * scale * frac * float(w_p) * float(r_mean)))
-                            half = max(0, min(half, int(self.lgs_half_max)))
+
+                            # mean rho for this radial bin (meters): r_mean is 0..1 wrt pupil radius
+                            rho_m = float(r_mean) * 0.5 * float(params.get("telescope_diameter"))
+                            # angular elongation (rad)
+                            dtheta = (rho_m * self.lgs_thickness_m) / (self.gs_range_m * self.gs_range_m + 1e-30)
+
+                            # plate scale (px / rad)
+                            px_per_rad = float(self.lenslet_f_m) / float(self.pixel_pitch_m)
+
+                            # streak length in pixels
+                            L_px = dtheta * px_per_rad
+
+                            half = int(round(0.5 * L_px) * scale)
+                            half = max(0, min(half, int(self.lgs_half_max)))  # keep your cap
+
                             if half == 0:
                                 continue
 

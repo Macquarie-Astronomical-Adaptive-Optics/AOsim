@@ -96,7 +96,7 @@ class SensorTabWidget(QWidget):
 
         # Left: config + busy + table
         left_v = QVBoxLayout()
-        config_keys = ["sub_apertures","wfs_lambda","dx","dy","gs_range_m","lgs_launch_offset_px","lgs_thickness_m"]
+        config_keys = ["sub_apertures","wfs_lambda","dx","dy","gs_range_m","lgs_launch_offset_px","lgs_thickness_m","lenslet_f_m","pixel_pitch_m"]
         self.config_table = Config_table(config_keys, self.params)
         left_v.addWidget(self.config_table)
 
@@ -292,10 +292,7 @@ class SensorTabWidget(QWidget):
         self.job_id += 1
         enforce_config_types(params)
         self.sensor.recompute(
-            n_sub=int(params.get("sub_apertures")), 
-            wavelength=float(params.get("wfs_lambda")),
-            dx=float(params.get("dx")) * ARCSEC2RAD,
-            dy=float(params.get("dy")) * ARCSEC2RAD,
+            **params
             )
 
         self.busy_label.setText("Recomputing…")

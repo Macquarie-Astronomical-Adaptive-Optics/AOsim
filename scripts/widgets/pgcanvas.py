@@ -30,6 +30,12 @@ def _mpl_lut(cmap: str, n: int = 256) -> np.ndarray:
     rgba = (cm(np.linspace(0, 1, n)) * 255).astype(np.ubyte)  # (n,4)
     return rgba[:, :3].copy()  # (n,3) RGB
 
+def _as_display_array(img):
+    img = _to_numpy(img)
+    # Keep uint8 as-is (perfect for LUT 0..255)
+    if img.dtype == np.uint8:
+        return img
+    return img.astype(np.float32, copy=False)
 
 @dataclass
 class OverlaySpec:
@@ -47,7 +53,7 @@ class PGCanvas(QWidget):
     """
     grab = Signal(object)  # emits QPixmap from view.grab()
 
-    def __init__(self, parent=None, emit_grab_on_update: bool = False, max_fps: int = 30):
+    def __init__(self, parent=None, emit_grab_on_update: bool = False, max_fps: int = 120):
         super().__init__(parent)
         self._emit_grab = bool(emit_grab_on_update)
 
@@ -111,7 +117,7 @@ class PGCanvas(QWidget):
         cmap: matplotlib colormap name.
         levels: (vmin, vmax). If None and auto_levels=True, use min/max.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
         self._set_cmap(cmap)
 
         if auto_levels:
@@ -154,7 +160,7 @@ class PGCanvas(QWidget):
         """
         Matplotlib-ish 'robust' scaling (percentiles). Nice for turbulence screens.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
         self._set_cmap(cmap)
 
         finite = np.isfinite(img)
@@ -216,7 +222,7 @@ class PGCanvas(QWidget):
 
         Implementation: sets masked pixels to NaN (or masked_value) and displays with LUT.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
 
         if mask is not None:
             m = _to_numpy(mask).astype(bool)
@@ -279,7 +285,7 @@ class PGCanvas(QWidget):
         """
         Add/update a scalar image overlay. Great for showing e.g. another layer, residual, etc.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
 
         if name not in self._overlays:
             item = pg.ImageItem()
@@ -499,7 +505,7 @@ class PGCanvas(QWidget):
         Queue an image for rendering. Drops intermediate frames automatically.
         Use this for high-rate updates from threads/signals.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
         self._pending = img
         self._pending_kwargs = ("normal", cmap, levels, bool(auto_levels), None, None)
 
@@ -514,7 +520,7 @@ class PGCanvas(QWidget):
         Queue an image that will be rendered with robust scaling.
         Warning: robust scaling is CPU-heavy; don't call at high rate.
         """
-        img = _to_numpy(img).astype(np.float32, copy=False)
+        img = _as_display_array(img)
         self._pending = img
         self._pending_kwargs = ("robust", cmap, None, False, float(p_lo), float(p_hi))
 

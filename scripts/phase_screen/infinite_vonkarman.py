@@ -87,7 +87,7 @@ class InfiniteVonKarmanScreen2D:
     Keeps only NxN window, extends by generating new rows/cols:
       X = A Z + B b 
 
-    Supports shifting in BOTH x and y by extending edges as needed.
+    Supports shifting in both x and y by extending edges as needed.
     """
 
     _AB_CACHE = {}  # key -> (A_ref, B_ref) built for r0_ref = 1.0
@@ -450,7 +450,7 @@ class InfiniteVonKarmanScreen2D:
     def view_patch(self, center_xy_pix, size_pixels, M: int, angle_deg: float = 0.0, margin: float = 2.0):
         """
         Return a fixed world-anchored patch (for display).
-        This will NOT jump even if the internal cache pans, because it resamples by world coords.
+        This will not jump even if the internal cache pans, because it resamples by world coords.
         """
         cx, cy = float(center_xy_pix[0]), float(center_xy_pix[1])
         side = float(size_pixels)
