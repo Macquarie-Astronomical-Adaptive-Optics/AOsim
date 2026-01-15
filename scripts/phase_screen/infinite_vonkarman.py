@@ -20,9 +20,7 @@ from cupyx.scipy.special import gamma  # GPU special functions
 
 ARCSEC_TO_RAD = math.pi / (180.0 * 3600.0)
 
-from scipy.special import kv
-def _kv(v, arg):
-    return cp.asarray(kv(cp.asnumpy(v), cp.asnumpy(arg)))
+from . import kv
 
 # ---------- von Karman phase covariance ----------
 def phase_covariance_vk_cp(r: cp.ndarray, r0: float, L0: float, dtype=cp.float32) -> cp.ndarray:
@@ -38,7 +36,7 @@ def phase_covariance_vk_cp(r: cp.ndarray, r0: float, L0: float, dtype=cp.float32
     B2 = ((24.0 / 5.0) * gamma(6.0 / 5.0)) ** (5.0 / 6.0)
 
     x = (2.0 * cp.pi * r) / L0
-    C = (x ** (5.0 / 6.0)) * _kv(5.0 / 6.0, x)
+    C = (x ** (5.0 / 6.0)) * kv.kv_realpos(5.0 / 6.0, x)
 
     return (A * B1 * B2 * C).astype(dtype)
 
@@ -122,7 +120,7 @@ class InfiniteVonKarmanScreen2D:
         # Initial window (seeded) – generate for r0_ref=1 then scale by r0^{-5/6}
         self.scrn = _ft_phase_screen_vk_cp(self.N, self.dx, r0=1.0, L0=self.L0, seed=self.seed + 1337, dtype=self.dtype)
         self.scrn *= self.dtype(amp)
-        self.scrn -= cp.mean(self.scrn)\
+        self.scrn -= cp.mean(self.scrn)
         
         self.warmup()
 
@@ -426,10 +424,6 @@ class InfiniteVonKarmanScreen2D:
         X = Xw - self.dtype(self.origin_x + self._frac_x)
         Y = Yw - self.dtype(self.origin_y + self._frac_y)
 
-        # safety clip (should rarely do anything if ensure_region_world is working)
-        X = cp.clip(X, 0.0, float(self.N - 2.001))
-        Y = cp.clip(Y, 0.0, float(self.N - 2.001))
-
         x0 = cp.floor(X).astype(cp.int32)
         y0 = cp.floor(Y).astype(cp.int32)
         x1 = x0 + 1
@@ -447,12 +441,17 @@ class InfiniteVonKarmanScreen2D:
         return (1 - wx) * (1 - wy) * v00 + wx * (1 - wy) * v10 + (1 - wx) * wy * v01 + wx * wy * v11
 
 
-    def view_patch(self, center_xy_pix, size_pixels, M: int, angle_deg: float = 0.0, margin: float = 2.0):
+    def view_patch(self, size_pixels, M: int, angle_deg: float = 0.0, margin: float = 2.0, center_xy_pix=None):
         """
         Return a fixed world-anchored patch (for display).
-        This will NOT jump even if the internal cache pans, because it resamples by world coords.
+        If center_xy_pix is None, uses the screen center based on self.N.
         """
-        cx, cy = float(center_xy_pix[0]), float(center_xy_pix[1])
+        if center_xy_pix is None:
+            cx = (self.N - 1) / 2.0
+            cy = (self.N - 1) / 2.0
+        else:
+            cx, cy = float(center_xy_pix[0]), float(center_xy_pix[1])
+
         side = float(size_pixels)
         M = int(M)
 
@@ -473,6 +472,7 @@ class InfiniteVonKarmanScreen2D:
 # ---------- Multi-layer wrapper API ----------
 @dataclass
 class _Layer:
+    N: float
     name: str
     altitude_m: float
     r0_layer: float
@@ -539,19 +539,23 @@ class LayeredInfinitePhaseScreen:
 
     def add_layer(self, name: str, altitude_m: float, r0: float,
               L0: float = 30.0, wind: Sequence[float] = (0.0, 0.0),
-              seed_offset: int = 0):
+              seed_offset: int = 0, max_theta: float = 0):
         r0_i = float(r0)
         if r0_i <= 0:
             raise ValueError("r0_layer must be > 0")
 
+        extraN = int(math.ceil(self.N + 2*(float(max_theta) * float(altitude_m)) / self.dx))
+        extraN = (extraN + 63) & ~63
+        
         scr = InfiniteVonKarmanScreen2D(
-            N=self.N, dx=self.dx, r0=r0_i, L0=float(L0),
+            N=extraN, dx=self.dx, r0=r0_i, L0=float(L0),
             seed=self.seed + int(seed_offset),
             n_columns=self.n_columns,
             dtype=self.dtype,
         )
 
         layer_obj = _Layer(
+            N= extraN,
             name=name,
             altitude_m=float(altitude_m),
             L0=float(L0),
@@ -647,8 +651,7 @@ class LayeredInfinitePhaseScreen:
     def sample_patches_batched(
         self,
         thetas_xy_rad,          # (S,2) radians
-        center_xy_pix,          # (cx, cy) in WORLD pixel coords
-        size_pixels,
+        size_pixels,            # patch side length in WORLD pixels
         M=128,
         angle_deg=0.0,
         ranges_m=None,          # (S,) meters; np.inf for NGS
@@ -661,14 +664,13 @@ class LayeredInfinitePhaseScreen:
         if thetas.ndim != 2 or thetas.shape[1] != 2:
             raise ValueError("thetas_xy_rad must be shape (S,2)")
         S = int(thetas.shape[0])
+
         # Guide-star ranges (meters), used for LGS cone effect:
         #   alpha(h) = 1 - h / H
-        # If ranges_m is None -> treat all as NGS (H = inf, alpha = 1).
         if ranges_m is None:
             ranges = cp.full((S,), cp.inf, dtype=self.dtype)
         else:
             ranges = cp.asarray(ranges_m, dtype=self.dtype)
-            # Accept scalar, (S,), or (S,1)/(...); normalize to (S,)
             if ranges.ndim != 1:
                 ranges = ranges.reshape(-1)
             if ranges.size == 1:
@@ -676,24 +678,23 @@ class LayeredInfinitePhaseScreen:
             elif ranges.size != S:
                 raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(ranges.shape)} for S={S}")
 
-
-        cx, cy = float(center_xy_pix[0]), float(center_xy_pix[1])
         side = float(size_pixels)
         M = int(M)
 
-        # pixel-center grid in WORLD coords
+        # patch grid (relative coordinates centered at 0) in WORLD pixel units
         step = side / float(M)
         lin = (cp.arange(M, dtype=self.dtype) - (M - 1) / 2.0) * step
         Xs, Ys = cp.meshgrid(lin, lin, indexing="xy")
 
+        # rotate the relative grid once
         a = math.radians(float(angle_deg))
         ca, sa = math.cos(a), math.sin(a)
-        Xbase = ca * Xs - sa * Ys + cx
-        Ybase = sa * Xs + ca * Ys + cy
+        Xrel = ca * Xs - sa * Ys
+        Yrel = sa * Xs + ca * Ys
 
-        # broadcast base to (S,M,M)
-        Xb = Xbase[None, :, :]
-        Yb = Ybase[None, :, :]
+        # broadcast relative grid to (S,M,M)
+        Xrel_b = Xrel[None, :, :]
+        Yrel_b = Yrel[None, :, :]
 
         if return_per_layer:
             L = len(self._layers_obj)
@@ -703,6 +704,17 @@ class LayeredInfinitePhaseScreen:
                 if not Lyr.active:
                     continue
 
+                # --- AUTO CENTER from this layer's screen.N ---
+                Nl = int(Lyr.screen.N)
+                cx = (Nl - 1) / 2.0
+                cy = (Nl - 1) / 2.0
+
+                # base patch in WORLD coords for this layer
+                cx0 = self.dtype(cx)
+                cy0 = self.dtype(cy)
+                Xbase = Xrel_b + cx0
+                Ybase = Yrel_b + cy0
+
                 h = float(Lyr.altitude_m)
                 sx = (h * thetas[:, 0]) / self.dx
                 sy = (h * thetas[:, 1]) / self.dx
@@ -711,14 +723,11 @@ class LayeredInfinitePhaseScreen:
                 alpha = 1.0 - (self.dtype(h) / ranges)
                 alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
                 alpha = cp.clip(alpha, 0.0, 1.0)
-                
-                cx0 = self.dtype(cx)
-                cy0 = self.dtype(cy)
-                Xw = cx0 + alpha[:, None, None] * (Xb - cx0) + sx[:, None, None]
-                Yw = cy0 + alpha[:, None, None] * (Yb - cy0) + sy[:, None, None]
 
-                # sample this layer by WORLD coords (auto-pan inside)
-                outL[li] = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
+                Xw = cx0 + alpha[:, None, None] * (Xbase - cx0) + sx[:, None, None]
+                Yw = cy0 + alpha[:, None, None] * (Ybase - cy0) + sy[:, None, None]
+
+                outL[li] = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=False, margin=2.0)
 
             if remove_piston:
                 outL -= cp.mean(outL, axis=(2, 3), keepdims=True)
@@ -730,9 +739,21 @@ class LayeredInfinitePhaseScreen:
 
         # combined (S,M,M)
         out = cp.zeros((S, M, M), dtype=self.dtype)
+
         for Lyr in self._layers_obj:
             if not Lyr.active:
                 continue
+
+            # --- AUTO CENTER from this layer's screen.N ---
+            Nl = int(Lyr.screen.N)
+            cx = (Nl - 1) / 2.0
+            cy = (Nl - 1) / 2.0
+
+            cx0 = self.dtype(cx)
+            cy0 = self.dtype(cy)
+            Xbase = Xrel_b + cx0
+            Ybase = Yrel_b + cy0
+
             h = float(Lyr.altitude_m)
             sx = (h * thetas[:, 0]) / self.dx
             sy = (h * thetas[:, 1]) / self.dx
@@ -741,11 +762,9 @@ class LayeredInfinitePhaseScreen:
             alpha = 1.0 - (self.dtype(h) / ranges)
             alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
             alpha = cp.clip(alpha, 0.0, 1.0)
-            
-            cx0 = self.dtype(cx)
-            cy0 = self.dtype(cy)
-            Xw = cx0 + alpha[:, None, None] * (Xb - cx0) + sx[:, None, None]
-            Yw = cy0 + alpha[:, None, None] * (Yb - cy0) + sy[:, None, None]
+
+            Xw = cx0 + alpha[:, None, None] * (Xbase - cx0) + sx[:, None, None]
+            Yw = cy0 + alpha[:, None, None] * (Ybase - cy0) + sy[:, None, None]
 
             out += Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
 
@@ -754,24 +773,28 @@ class LayeredInfinitePhaseScreen:
 
         return out if return_gpu else cp.asnumpy(out)
 
+
     def sample_patches_batched_arcsec(self, thetas_xy_arcsec, *args, **kwargs):
         thetas = cp.asarray(thetas_xy_arcsec, dtype=self.dtype) * ARCSEC_TO_RAD
         return self.sample_patches_batched(thetas, *args, **kwargs)
     
-    def get_layer_view(self, idx: int, center_xy_pix=None, size_pixels=None, M=None, angle_deg=0.0, return_gpu=True):
+    def get_layer_view(self, idx: int, size_pixels=None, M=None, angle_deg=0.0, return_gpu=True):
         idx = int(idx)
-        
-        if center_xy_pix is None:
-            c = ( (self.N - 1) / 2.0, (self.N - 1) / 2.0 )
-        else:
-            c = center_xy_pix
+
         if size_pixels is None:
             size_pixels = self.N
         if M is None:
             M = self.N
 
-        patch = self._layers_obj[idx].screen.view_patch(c, size_pixels, M, angle_deg=angle_deg, margin=2.0)
+        patch = self._layers_obj[idx].screen.view_patch(
+            size_pixels=size_pixels,
+            M=M,
+            angle_deg=angle_deg,
+            margin=2.0,
+            center_xy_pix=None,   # auto-center from that layer's N
+        )
         return patch if return_gpu else cp.asnumpy(patch)
+
 
     def hard_reset(self):
         for i, L in enumerate(self._layers_obj):

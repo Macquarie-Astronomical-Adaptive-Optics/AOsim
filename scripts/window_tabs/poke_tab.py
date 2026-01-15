@@ -29,7 +29,7 @@ class Poke_tab(QWidget):
         self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
             n_sub=20, 
-            dx=45, 
+            dx=10*60, 
             dy=0,
             lgs_thickness_m=10_000.0,     # ~10 km sodium thickness
             lgs_launch_offset_px=(off_x_px, 0.0),
@@ -38,7 +38,7 @@ class Poke_tab(QWidget):
         self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
             n_sub=20, 
-            dx=-45, 
+            dx=-10*60, 
             dy=0,
             lgs_thickness_m=10_000.0,    
             lgs_launch_offset_px=(-off_x_px, 0.0),
@@ -48,7 +48,7 @@ class Poke_tab(QWidget):
             90_000, 
             n_sub=20, 
             dx=0, 
-            dy=45,
+            dy=10*60,
             lgs_thickness_m=10_000.0,     
             lgs_launch_offset_px=(0.0, off_x_px),
             lgs_remove_tt=True
@@ -57,7 +57,7 @@ class Poke_tab(QWidget):
             90_000, 
             n_sub=20, 
             dx=0, 
-            dy=-45,
+            dy=-10*60,
             lgs_thickness_m=10_000.0,   
             lgs_launch_offset_px=( 0.0, -off_x_px),
             lgs_remove_tt=True

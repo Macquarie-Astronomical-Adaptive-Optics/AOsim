@@ -30,6 +30,7 @@ class Turbulence_tab(QWidget):
     req_add_layer = Signal(object)
     req_step = Signal(bool)
     req_step_n = Signal(int, int)
+    req_sensor_update = Signal(dict)
     req_overview_enabled = Signal(bool)
     req_emit_overview = Signal()
     req_visible_sensor = Signal(int)
@@ -39,6 +40,7 @@ class Turbulence_tab(QWidget):
 
         self.params = config_dict
         self.sensors = sensors
+        self.initDone = False
 
         self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
 
@@ -66,7 +68,6 @@ class Turbulence_tab(QWidget):
         layers = list(data.get("layers", []))
         base_kwargs = {k: v for k, v in data.items() if k != "layers"}
         N = int(base_kwargs["N"])
-        base_kwargs["N"] = N*3
 
         self.turbWidgets = {}
         self.layer_last = {}  # cache numpy layer frames
@@ -176,7 +177,7 @@ class Turbulence_tab(QWidget):
             sim_kwargs=base_kwargs,
             layers=layers,
             pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
-            thetas_xy_rad=thetas,
+            sensors=sensors,
             ranges_m=ranges_m,
             patch_size_px= N,
             patch_M= N,
@@ -191,6 +192,7 @@ class Turbulence_tab(QWidget):
         self.req_overview_enabled.connect(self.scheduler.set_overview_enabled)
         self.req_emit_overview.connect(self.scheduler.emit_overview_once)
         self.req_visible_sensor.connect(self.scheduler.set_visible_sensor)
+        self.req_sensor_update.connect(self.scheduler.sensor_update)
         self.req_add_layer.connect(self.scheduler.add_layer)
         self.req_step_n.connect(self.scheduler.step_n)
         self.req_step.connect(self.scheduler.step_once)
@@ -234,7 +236,7 @@ class Turbulence_tab(QWidget):
         # worker emits stacks
         self.overview_tab = SensorView_tab(sensors, config_dict, layers, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
         
-        self.scheduler.all_sensor_psf_ready.connect(self.overview_tab.psf_grid.update_psfs)
+        self.scheduler.all_sensor_phase_ready.connect(self.overview_tab.psf_grid.update_psfs)
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
         self.scheduler.sim_signal.connect(self.overview_tab.layer_grid.set_layers_cfg)
         
@@ -265,6 +267,11 @@ class Turbulence_tab(QWidget):
     def active_change(self, items, active):
         self.scheduler.set_active([turbWidg.title for turbWidg in items], active)   
 
+    @Slot(dict)
+    def sensor_update(self, sensors):
+        self.sensors = sensors
+        self.req_sensor_update.emit(sensors)
+
     # ----------- UI slots -----------
     @Slot()
     def _run_x_clicked(self):
@@ -290,6 +297,8 @@ class Turbulence_tab(QWidget):
     def on_sensor_psf(self, idx, img_np):
         # show on whatever canvas you want for that sensor
         self.science_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
+        if not self.initDone:
+            self.initDone = True
 
 
     @Slot(int, object)
@@ -298,6 +307,15 @@ class Turbulence_tab(QWidget):
         # only update visible tab widget (saves UI work)
         if int(idx) == int(self.tab_widget.currentIndex()):
             self.turbWidgets[int(idx)].update_screen(img_np)
+
+    def showEvent(self, event):
+        self.scheduler._detailed_enabled = True
+        return super().showEvent(event)
+    
+    def hideEvent(self, event):
+        if self.initDone:
+            self.scheduler._detailed_enabled = False
+        return super().hideEvent(event)
 
     def closeEvent(self, event):
         # stop scheduler and wait

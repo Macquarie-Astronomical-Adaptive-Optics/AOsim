@@ -57,7 +57,7 @@ class SimWorker(QObject):
         sim_factory,
         sim_kwargs: Dict[str, Any],
         layers: List[Dict[str, Any]],
-        thetas_xy_rad,
+        sensors,
         ranges_m,
         patch_size_px,
         patch_M,
@@ -70,7 +70,7 @@ class SimWorker(QObject):
 
         # overview update rates
         overview_psf_hz: int = 5,
-        overview_layer_hz: int = 2,
+        overview_layer_hz: int = 10,
 
         # display sizes
         psf_M: Optional[int] = None,       # default: patch_M//2
@@ -94,7 +94,8 @@ class SimWorker(QObject):
         self.fps_cap = int(fps_cap)
 
         # AO geometry
-        self.thetas_gpu = cp.asarray(thetas_xy_rad, dtype=cp.float32)  # (S,2)
+        self.sensors = sensors
+        self.thetas_gpu = cp.asarray([s.field_angle for s in self.sensors.values()])  # (S,2)
         S = int(self.thetas_gpu.shape[0])
         if ranges_m is None:
             self.ranges_gpu = cp.full((S,), cp.inf, dtype=cp.float32)
@@ -107,7 +108,6 @@ class SimWorker(QObject):
             elif r.size != S:
                 raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(r.shape)} for S={S}")
             self.ranges_gpu = r
-        self.patch_center = (self.sim_kwargs["N"]/2, self.sim_kwargs["N"]/2)
         self.patch_size_px = float(patch_size_px)
         self.patch_M = int(patch_M)
 
@@ -117,6 +117,7 @@ class SimWorker(QObject):
         # controls
         self.emit_psf = bool(emit_psf)
         self._overview_enabled = False
+        self._detailed_enabled = True
 
         # view selection
         self._visible_layer: Optional[int] = 0
@@ -180,12 +181,13 @@ class SimWorker(QObject):
         self.status_log.emit("   Creating sim...")
         self.sim = self.sim_factory(**self.sim_kwargs)
         [self.status_log.emit("     "+str((i, j))) for i, j in self.sim_kwargs.items()]
+        max_theta = max([sensor.sen_angle for sensor in self.sensors.values()])
 
         for k, layer in enumerate(self.layer_cfgs):
             self.status_log.emit(f"   Adding layer {k+1}...")
             [self.status_log.emit("     "+str((i, j))) for i, j in layer.items()]
 
-            self.sim.add_layer(**layer)
+            self.sim.add_layer(max_theta=max_theta, **layer)
 
         self.status_log.emit("Screen Sim built!")
         
@@ -209,6 +211,10 @@ class SimWorker(QObject):
 
         self.sim_signal.emit(self.sim.layers)
         self._emit_once()
+
+    @Slot(dict)
+    def sensor_update(self, sensors):
+        self.sensors = sensors
 
     @Slot()
     def start(self):
@@ -448,7 +454,6 @@ class SimWorker(QObject):
             any_active = True
             buf += self.sim.get_layer_view(
                 i,
-                center_xy_pix=center,
                 size_pixels=N,
                 M=N,
                 angle_deg=0.0,
@@ -471,7 +476,7 @@ class SimWorker(QObject):
         return cp.log10(I + 1e-12)
 
     def _emit_visible_sensor_products(self):
-        if self.sim is None:
+        if self.sim is None or not self._detailed_enabled:
             return
         
         self._ensure_cache()
@@ -485,7 +490,6 @@ class SimWorker(QObject):
 
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=th,
-            center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
             M=self.patch_M,
             angle_deg=0.0,
@@ -514,14 +518,13 @@ class SimWorker(QObject):
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=self.thetas_gpu,
             ranges_m=self.ranges_gpu,
-            center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
             M=self.psf_M,
             angle_deg=0.0,
             remove_piston=True,
             return_gpu=True,
         )  # (S,M,M)
-        self.all_sensor_phase_ready.emit(cp.asnumpy(_logpsf_to_u8(phases)))
+        self.all_sensor_phase_ready.emit(cp.asnumpy(_phase_to_u8(phases)))
 
         pupil = self._pupil_mask_psf  # (M,M)
         E = pupil[None, :, :] * cp.exp(1j * phases)
@@ -542,7 +545,7 @@ class SimWorker(QObject):
 
     # ---------- layer emissions ----------
     def _emit_visible_layer(self):
-        if self.sim is None or self._visible_layer is None:
+        if self.sim is None or self._visible_layer is None or not self._detailed_enabled:
             return
         i = int(self._visible_layer)
         if not (0 <= i < len(self.sim.layers)):
@@ -555,8 +558,9 @@ class SimWorker(QObject):
 
     def _emit_once(self):
         self._ensure_cache()
-        combined = self._combined_gpu()
-        self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
+        if self._detailed_enabled:
+            combined = self._combined_gpu()
+            self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
         self._emit_visible_layer()
         self._emit_visible_sensor_products()
         psfs = self._compute_all_sensor_psfs()
@@ -590,7 +594,6 @@ class SimWorker(QObject):
         phases = self.sim.sample_patches_batched(
             thetas_xy_rad=self.thetas_gpu,
             ranges_m=self.ranges_gpu,
-            center_xy_pix=self.patch_center,
             size_pixels=self.patch_size_px,
             M=self.layer_M,
             angle_deg=0.0,
@@ -611,9 +614,10 @@ class SimWorker(QObject):
         self._tick_count += 1
 
         # emit combined at a capped rate to reduce GPU->CPU copies
-        if self._combined_period <= 1 or self._tick_count == 1 or (self._tick_count % self._combined_period) == 0:
-            combined = self._combined_gpu()
-            self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
+        if self._detailed_enabled:
+            if self._combined_period <= 1 or self._tick_count == 1 or (self._tick_count % self._combined_period) == 0:
+                combined = self._combined_gpu()
+                self.combined_ready.emit(cp.asnumpy(_phase_to_u8(combined)))
 
 
         # visible layer at layer_tab rate

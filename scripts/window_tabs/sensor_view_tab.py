@@ -20,7 +20,7 @@ class SensorView_tab(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(splitter)
 
-        self.psf_grid = SensorPSFGrid(sensors, title="Sensor PSFs")
+        self.psf_grid = SensorPSFGrid(sensors, title="WFSensor Phase")
         self.layer_grid = LayerFootprintGrid(
             sensors=sensors,
             layers_cfg=layers_cfg,

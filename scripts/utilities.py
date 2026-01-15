@@ -874,7 +874,7 @@ class WFSensor_tools:
                 "top_left_x_cpu": _ix,
             }
 
-        def measure(self, pupil=None, phase_map=None, phase_map_alt=None, poke_amplitude=None, pad=None, return_image=True):
+        def measure(self, pupil=None, phase_map=None, pad=None, return_image=True):
             """
             Returns:
             centroids: (n_map, n_sub_active, 2) in subap-padded pixel coords
