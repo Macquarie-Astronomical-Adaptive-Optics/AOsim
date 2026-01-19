@@ -572,7 +572,6 @@ class LayerFootprintGrid(QWidget):
             if ci is None:
                 continue
 
-            self.layer_canvases[ci].queue_image(base, cmap=cmap, levels=(0, 255))
             try:
                 base_levels = self.layer_canvases[ci].image_item.levels
             except Exception:
@@ -580,3 +579,5 @@ class LayerFootprintGrid(QWidget):
 
             for s in range(S):
                 self._update_one(layer_idx, s, layer_patches[s], base_levels=base_levels)
+            self.layer_canvases[ci].queue_image(base, cmap=cmap, levels=base_levels)
+            

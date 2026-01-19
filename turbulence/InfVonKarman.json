@@ -12,7 +12,7 @@
                 "r0" : 0.55,
                 "L0": 30.0, 
                 "wind": [6.0,  1.0], 
-                "seed_offset": 1
+                "seed_offset": 2
             },
             {
                 "name" : "Layer 2",

@@ -61,7 +61,7 @@ class Turbulence_tab(QWidget):
                 })
 
         # pick first config for now
-        screen = self.turbulence_screens[0]
+        screen = self.turbulence_screens[1]
         data = screen["data"]
 
         # split base kwargs vs layer list (IMPORTANT: avoids double-adding layers)

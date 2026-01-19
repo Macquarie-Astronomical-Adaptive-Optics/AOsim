@@ -1,0 +1,22 @@
+{
+    "function": "InfVonKarman",
+    
+    "N": 512,
+    "dx": 0.015625,
+    "seed": 12,
+    "layers": 
+        [
+            {"name":"MK Layer 1",  "altitude_m":0.00001, "r0":0.282927, "L0":50.0, "wind":[0.0,0.0], "seed_offset":1},
+            {"name":"MK Layer 2",  "altitude_m":15.0,    "r0":0.422114, "L0":50.0, "wind":[0.0,0.0], "seed_offset":2},
+            {"name":"MK Layer 3",  "altitude_m":30.0,    "r0":0.934382, "L0":50.0, "wind":[0.0,0.0], "seed_offset":3},
+            {"name":"MK Layer 4",  "altitude_m":45.0,    "r0":6.022290, "L0":50.0, "wind":[0.0,0.0], "seed_offset":4},
+
+            {"name":"MK Layer 5",  "altitude_m":120.0,   "r0":1.393248, "L0":50.0, "wind":[0.0,0.0], "seed_offset":5},
+            {"name":"MK Layer 6",  "altitude_m":200.0,   "r0":2.156576, "L0":50.0, "wind":[0.0,0.0], "seed_offset":6},
+            {"name":"MK Layer 7",  "altitude_m":280.0,   "r0":2.413311, "L0":50.0, "wind":[0.0,0.0], "seed_offset":7},
+            {"name":"MK Layer 8",  "altitude_m":360.0,   "r0":3.146619, "L0":50.0, "wind":[0.0,0.0], "seed_offset":8},
+            {"name":"MK Layer 9",  "altitude_m":440.0,   "r0":7.821297, "L0":50.0, "wind":[0.0,0.0], "seed_offset":9},
+
+            {"name":"MK Layer 10 (FA)", "altitude_m":8000.0, "r0":0.240642, "L0":50.0, "wind":[0.0,0.0], "seed_offset":10}
+        ]
+}

@@ -1,7 +1,7 @@
 {
     "telescope_diameter": 8,
     "telescope_center_obscuration": 0.14,
-    "wfs_lambda": 550e-9,
+    "wfs_lambda": 500e-9,
 	"science_lambda": 200e-9,
     "actuators": 20,
     "sub_apertures": 40,   

@@ -215,7 +215,7 @@ class SensorTabWidget(QWidget):
         self._pupil_mask = result["pupil_mask"]
         self._sub_aps = result["sub_aps"].astype(np.float32, copy=False)
         self._ref_centroids_single = result["ref_centroids_single"].astype(np.float32, copy=False)
-        self._ref_points = self._ref_centroids_single + self._sub_aps
+        self._ref_points = self._ref_centroids_single
        
         # update the unperturbed science canvas
         self.canvas_science_pupil.set_image(result["ref_science_plot"])
@@ -260,8 +260,8 @@ class SensorTabWidget(QWidget):
 
         if self._ref_points is not None and self._sub_aps is not None:
             self.canvas_overview.set_points_and_quivers(
-                self._ref_points,
-                centroids_single + self._sub_aps,
+                self._ref_points + self.params["field_padding"],
+                centroids_single + self.params["field_padding"],
             )
 
         self._value_items[0].setText(f"{strehl:.3f}")

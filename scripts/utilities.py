@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 import json
 import threading
+import math
 
 # -----------------------------
 # Config / parameter management
@@ -513,8 +514,8 @@ class WFSensor_tools:
             lgs_thickness_m=0.0,               # sodium thickness (m). 0 disables elongation
             lgs_remove_tt=True,                # remove global TT from LGS slopes
             lgs_launch_offset_px=(0.0, 0.0),   # (off_x_px, off_y_px) relative to pupil center
-            lgs_dir_bins=1024,                   
-            lgs_rad_bins=1024,
+            lgs_dir_bins=64,                   
+            lgs_rad_bins=16,
             lgs_elong_scale=2.0,             
             lgs_half_max=24,                   # cap kernel half-length (pixels)
         ):
@@ -761,6 +762,112 @@ class WFSensor_tools:
             ker = cp.asarray(arr, dtype=cp.float32)
             self._lgs_kernel_cache[key] = ker
             return ker
+        
+        def _ensure_lgs_elong_plan(self):
+            # Quick reject
+            if (not math.isfinite(float(self.gs_range_m))) or float(self.lgs_thickness_m) <= 0.0:
+                self._lgs_elong_plan = None
+                self._lgs_elong_plan_key = None
+                return
+
+            self._ensure_lgs_groups_gpu()
+            if self._lgs_group_gid_gpu is None or int(self._lgs_group_gid_gpu.size) == 0:
+                self._lgs_elong_plan = None
+                self._lgs_elong_plan_key = None
+                return
+
+            ndir = int(max(1, self.lgs_dir_bins))
+            nrad = int(max(1, self.lgs_rad_bins))
+
+            # Key: rebuild plan only if these change
+            D = float(params.get("telescope_diameter"))
+            key = (
+                self._device_id(),
+                ndir, nrad,
+                float(self.gs_range_m),
+                float(self.lgs_thickness_m),
+                float(self.lgs_elong_scale),
+                int(self.lgs_half_max),
+                float(self.lenslet_f_m),
+                float(self.pixel_pitch_m),
+                D,
+            )
+            if getattr(self, "_lgs_elong_plan_key", None) == key and getattr(self, "_lgs_elong_plan", None) is not None:
+                return
+
+            self._lgs_elong_plan_key = key
+
+            if getattr(self, "_lgs_group_starts_cpu", None) is None or getattr(self, "_lgs_group_key_for_cpu", None) != (self._device_id(), ndir, nrad):
+                self._lgs_group_starts_cpu = cp.asnumpy(self._lgs_group_starts_gpu).astype("int32", copy=False)
+                self._lgs_group_ends_cpu   = cp.asnumpy(self._lgs_group_ends_gpu).astype("int32", copy=False)
+                self._lgs_group_gids_cpu   = cp.asnumpy(self._lgs_group_gid_gpu).astype("int32", copy=False)
+                self._lgs_group_key_for_cpu = (self._device_id(), ndir, nrad)
+
+            self._lgs_group_order_gpu = cp.asarray(self._lgs_group_order_cpu, dtype=cp.int32)
+
+            inv = cp.empty_like(self._lgs_group_order_gpu)
+            inv[self._lgs_group_order_gpu] = cp.arange(self._lgs_group_order_gpu.size, dtype=cp.int32)
+            self._lgs_group_inv_order_gpu = inv
+
+            order = self._lgs_group_order_gpu  # cp.int32, permutation of subaps
+
+            # Precompute half per radial bin (CPU, once)
+            H = float(self.gs_range_m)
+            thick = float(self.lgs_thickness_m)
+            px_per_rad = float(self.lenslet_f_m) / float(self.pixel_pitch_m)
+            scale_elong = float(self.lgs_elong_scale)
+            half_max = int(self.lgs_half_max)
+
+            # rb -> half
+            half_by_rb = [0] * nrad
+            H2 = H * H + 1e-30
+            for rb in range(nrad):
+                r_mean = (rb + 0.5) / float(nrad)
+                rho_m = r_mean * 0.5 * D
+                dtheta = (rho_m * thick) / H2
+                L_px = dtheta * px_per_rad
+                half = int(round(0.5 * L_px) * scale_elong) 
+                if half < 0: half = 0
+                if half > half_max: half = half_max
+                half_by_rb[rb] = half
+
+            # Kernel cache (GPU), store expanded weights (1,1,k,k)
+            if not hasattr(self, "_lgs_kernel_cache_gpu"):
+                self._lgs_kernel_cache_gpu = {}
+
+            # Build selections grouped by (db, half) to reduce convolve calls
+            sels_by_key = {}  # (db,half) -> list of cp arrays (views)
+            gids = self._lgs_group_gids_cpu
+            starts = self._lgs_group_starts_cpu
+            ends = self._lgs_group_ends_cpu
+
+            # Final plan: list of (sel_gpu, wts_gpu)
+            segs_by_key = {}  # (db,half) -> list[(s,e)] in ORDERED space
+
+            for gi in range(gids.size):
+                gid = int(gids[gi])
+                rb = gid // ndir
+                db = gid - rb * ndir
+                half = half_by_rb[rb]
+                if half == 0:
+                    continue
+                s = int(starts[gi]); e = int(ends[gi])
+                if e <= s:
+                    continue
+
+                segs_by_key.setdefault((db, half), []).append((s, e))
+
+            plan = []
+            for (db, half), segs in segs_by_key.items():
+                wts = self._lgs_kernel_cache_gpu.get((db, half))
+                if wts is None:
+                    ker2 = cp.asarray(self._get_line_kernel(db, half), dtype=cp.float32)
+                    wts = ker2[None, None, :, :]
+                    self._lgs_kernel_cache_gpu[(db, half)] = wts
+                plan.append((segs, wts))
+
+            self._lgs_elong_plan = plan
+
 
         def _build_subap_geometry(self):
             """
@@ -772,7 +879,7 @@ class WFSensor_tools:
             """
             grid_size = int(self.grid_size)
             pupil = self.pupil
-            cache_key = (self._device_id(), int(self.n_sub), grid_size, int(pupil.data.ptr))
+            cache_key = (self._device_id(), int(self.n_sub), grid_size, pupil.data.ptr)
 
             cached = _SUBAP_GEOM_CACHE.get(cache_key)
             if cached is not None:
@@ -874,6 +981,19 @@ class WFSensor_tools:
                 "top_left_x_cpu": _ix,
             }
 
+        def _ensure_freq_coords(self, h_p, w_p):
+            key = (self._device_id(), h_p, w_p)
+            item = self._coord_cache.get(key)
+            if item is not None:
+                return item  # (yrel, xrel)
+
+            # signed pixel coords centered at 0 using fftfreq (no fftshift needed)
+            yrel = (cp.fft.fftfreq(h_p).astype(cp.float32) * cp.float32(h_p))
+            xrel = (cp.fft.fftfreq(w_p).astype(cp.float32) * cp.float32(w_p))
+            self._coord_cache[key] = (yrel, xrel)
+            return yrel, xrel
+
+
         def measure(self, pupil=None, phase_map=None, pad=None, return_image=True):
             """
             Returns:
@@ -882,8 +1002,7 @@ class WFSensor_tools:
             sensor_image: stitched mosaic (n_map, n_sub*n_p, n_sub*n_p) if return_image else None
             """
             if pad is None:
-                pad = int(params.get("field_padding", 4))
-            pad = int(pad)
+                pad = int(4)
 
             if pupil is not None:
                 self.pupil = pupil
@@ -897,130 +1016,114 @@ class WFSensor_tools:
             phase_map = phase_map.astype(cp.float32, copy=False)
 
             n_map = int(phase_map.shape[0])
-            n_sub = int(self.sub_aps_idx.shape[0])
 
-            # Extract subap phases: (n_map, n_sub, h, w)
+            # (n_map, n_sub, h, w)
             sub_phase = phase_map[:, self.ys, self.xs]
             sub_phase *= self.sub_pupils[None, :, :, :]
 
             # radians (WFS wavelength)
-            scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
-            sub_phase *= scale
+            if cp.max(phase_map) == params.get("poke_amplitude"):
+                scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
+                sub_phase *= scale
 
-            # complex field
+            # complex pupil field
             field = cp.exp(1j * sub_phase).astype(cp.complex64, copy=False)
-            field *= self.sub_pupils[None, :, :, :].astype(cp.complex64, copy=False)
+            field *= self.sub_pupils[None, :, :, :]
 
             h, w = int(self.h), int(self.w)
             h_p, w_p = h + 2 * pad, w + 2 * pad
 
-            field_p = cp.zeros((n_map, n_sub, h_p, w_p), dtype=cp.complex64)
-            field_p[:, :, pad:pad + h, pad:pad + w] = field
-
-            F = cp.fft.fftshift(
-                cp.fft.fft2(cp.fft.ifftshift(field_p, axes=(-2, -1)), axes=(-2, -1)),
-                axes=(-2, -1),
-            )
+            # FFT
+            F = cp.fft.fft2(field, s=(h_p, w_p), axes=(-2, -1))  
             I = (F.real * F.real + F.imag * F.imag).astype(cp.float32, copy=False)
 
-            # normalize per subap
-            denom = cp.sum(I, axis=(-2, -1), keepdims=True)
-            denom = cp.where(denom == 0, 1.0, denom)
-            I = I / denom
 
-            # --- LGS realistic(ish) spot elongation (optional) ---
-            if np.isfinite(float(self.gs_range_m)) and float(self.lgs_thickness_m) > 0.0:
-                try:
-                    import cupyx.scipy.ndimage as ndi
+            # --- LGS elongation here ---
+            if math.isfinite(self.gs_range_m) and self.lgs_thickness_m > 0.0:
+                self._ensure_lgs_elong_plan()
+                plan = getattr(self, "_lgs_elong_plan", None)
+                if plan:
+                    order = self._lgs_group_order_gpu
+                    inv   = self._lgs_group_inv_order_gpu
 
-                    self._ensure_lgs_groups_gpu()
-                    if self._lgs_group_gid_gpu is not None and int(self._lgs_group_gid_gpu.size) > 0:
-                        ndir = int(max(1, self.lgs_dir_bins))
-                        nrad = int(max(1, self.lgs_rad_bins))
+                    I = I[:, order, :, :]  # ONE gather
 
-                        scale = float(self.lgs_elong_scale)
+                    for segs, wts in plan:
+                        for s, e in segs:
+                            I[:, s:e, :, :] = ndi.convolve(I[:, s:e, :, :], wts, mode="constant", cval=0.0)
 
-                        order = self._lgs_group_order_gpu
-                        starts = self._lgs_group_starts_gpu
-                        ends = self._lgs_group_ends_gpu
-                        gids = self._lgs_group_gid_gpu
+                    # compute slopes/centroids from this reordered I ...
+                    # then at the end reorder outputs back:
+                    centroids = centroids[:, inv, :]
+                    slopes    = slopes[:, inv, :]
 
-                        # loop only non-empty groups
-                        for gi in range(int(gids.size)):
-                            gid = int(gids[gi].item())
-                            rb = gid // ndir
-                            db = gid - rb * ndir
 
-                            r_mean = (rb + 0.5) / float(nrad)
+            # moments without normalizing I
+            yrel, xrel = self._ensure_freq_coords(h_p, w_p)
 
-                            # mean rho for this radial bin (meters): r_mean is 0..1 wrt pupil radius
-                            rho_m = float(r_mean) * 0.5 * float(params.get("telescope_diameter"))
-                            # angular elongation (rad)
-                            dtheta = (rho_m * self.lgs_thickness_m) / (self.gs_range_m * self.gs_range_m + 1e-30)
+            # reduce then multiply
+            Ix = I.sum(axis=-2)                           # (n_map, n_sub, w_p)
+            denom = Ix.sum(axis=-1)                       # (n_map, n_sub)
+            denom = cp.maximum(denom, cp.float32(1e-20))  # avoid 0
 
-                            # plate scale (px / rad)
-                            px_per_rad = float(self.lenslet_f_m) / float(self.pixel_pitch_m)
+            num_x = (Ix * xrel[None, None, :]).sum(axis=-1)
 
-                            # streak length in pixels
-                            L_px = dtheta * px_per_rad
+            Iy = I.sum(axis=-1)                           # (n_map, n_sub, h_p)
+            num_y = (Iy * yrel[None, None, :]).sum(axis=-1)
 
-                            half = int(round(0.5 * L_px) * scale)
-                            half = max(0, min(half, int(self.lgs_half_max)))  # keep your cap
+            cx_rel = num_x / denom
+            cy_rel = num_y / denom
 
-                            if half == 0:
-                                continue
+            centroids = cp.stack(
+                (cy_rel + cp.float32((h_p - 1) * 0.5),
+                cx_rel + cp.float32((w_p - 1) * 0.5)),
+                axis=-1
+            )
 
-                            sel = order[int(starts[gi].item()):int(ends[gi].item())]
-                            if int(sel.size) == 0:
-                                continue
+            slopes = cp.stack((cy_rel, cx_rel), axis=-1)
 
-                            ker2 = self._get_line_kernel(db, half)     # (k,k)
-                            wts = ker2[None, None, :, :]              # blur last 2 dims only
-                            I[:, sel, :, :] = ndi.convolve(I[:, sel, :, :], wts, mode="constant", cval=0.0)
-
-                        # renormalize after blur
-                        denom2 = cp.sum(I, axis=(-2, -1), keepdims=True)
-                        denom2 = cp.where(denom2 == 0, 1.0, denom2)
-                        I = I / denom2
-                except Exception:
-                    pass
-
-            # centroid coordinate vectors
-            ckey = (self._device_id(), h_p, w_p)
-            coords = self._coord_cache.get(ckey)
-            if coords is None:
-                y_coords = cp.arange(h_p, dtype=cp.float32)
-                x_coords = cp.arange(w_p, dtype=cp.float32)
-                coords = (y_coords, x_coords)
-                self._coord_cache[ckey] = coords
-            y_coords, x_coords = coords
-
-            cx = cp.sum(I * x_coords[None, None, None, :], axis=(-2, -1))
-            cy = cp.sum(I * y_coords[None, None, :, None], axis=(-2, -1))
-            centroids = cp.stack((cy, cx), axis=-1)  # (n_map, n_sub, 2)
-
-            center = cp.asarray([(h_p - 1) * 0.5, (w_p - 1) * 0.5], dtype=cp.float32)
-            slopes = centroids - center[None, None, :]
-
-            # LGS cannot measure absolute TT
-            if np.isfinite(float(self.gs_range_m)) and bool(self.lgs_remove_tt):
+            if math.isfinite(float(self.gs_range_m)) and bool(self.lgs_remove_tt):
                 slopes = slopes - cp.mean(slopes, axis=1, keepdims=True)
 
             sensor_image = None
             if return_image:
-                H = int(self.grid_ny) * h_p
-                W = int(self.grid_nx) * w_p
-                sensor_image = cp.zeros((n_map, H, W), dtype=I.dtype)
+                # normalize only for display
+                I_norm = I / denom[:, :, None, None]
+                I_norm = cp.fft.fftshift(I_norm, axes=(-2, -1))
+                I_norm = I_norm[:, :, pad:-pad -1, pad:-pad -1]
 
-                iy = cp.asnumpy(self.sub_aps_idx[:, 0]).astype(np.int32, copy=False)
-                ix = cp.asnumpy(self.sub_aps_idx[:, 1]).astype(np.int32, copy=False)
+                h += -1
+                w += -1
 
-                for j in range(n_sub):
-                    y0 = int(iy[j]) * h_p
-                    x0 = int(ix[j]) * w_p
-                    sensor_image[:, y0:y0 + h_p, x0:x0 + w_p] = I[:, j, :, :]
+                # TODO: replace tiles approach with LUT+kernel 
+                gy = int(self.grid_ny); gx = int(self.grid_nx)
+                tiles = cp.zeros((n_map, gy, gx, h, w), dtype=I_norm.dtype)
+                iy = self.sub_aps_idx[:, 0].astype(cp.int32, copy=False)
+                ix = self.sub_aps_idx[:, 1].astype(cp.int32, copy=False)
+                tiles[:, iy, ix, :, :] = I_norm
+                sensor_image = tiles.transpose(0, 1, 3, 2, 4).reshape(n_map, gy * h, gx * w)
+
+                                # tile size used in stitching
+                H = int(h)
+                W = int(w)
+
+                iy = self.sub_aps_idx[:, 0].astype(cp.int32, copy=False)  # (n_sub,)
+                ix = self.sub_aps_idx[:, 1].astype(cp.int32, copy=False)  # (n_sub,)
+
+                # centroids: (n_map, n_sub, 2)  (y,x)
+                cy = centroids[..., 0]
+                cx = centroids[..., 1]
+
+                # mosaic coords: (n_map, n_sub)
+                mosaic_y = cy + iy[None, :] * H - pad
+                mosaic_x = cx + ix[None, :] * W - pad
+
+                centroids = cp.stack((mosaic_y, mosaic_x), axis=-1)  # (n_map, n_sub, 2)
+
 
             return centroids, slopes, sensor_image
+
+
 
 
     class PyramidWFS:

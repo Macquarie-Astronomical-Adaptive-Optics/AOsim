@@ -24,12 +24,12 @@ class Poke_tab(QWidget):
         self.wfsensors = {}
 
         print("Creating sensors")
-        off_x_px = (0.5 * self.params.get("telescope_diameter")) / (self.params.get("telescope_diameter") / self.params.get("grid_size"))
-        self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann()
+        off_x_px = 0.0 # (0.5 * self.params.get("telescope_diameter")) / (self.params.get("telescope_diameter") / self.params.get("grid_size"))
+        self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann(n_sub=16, )
         self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
-            n_sub=20, 
-            dx=10*60, 
+            n_sub=16, 
+            dx=7*60, 
             dy=0,
             lgs_thickness_m=10_000.0,     # ~10 km sodium thickness
             lgs_launch_offset_px=(off_x_px, 0.0),
@@ -37,8 +37,8 @@ class Poke_tab(QWidget):
         )
         self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
-            n_sub=20, 
-            dx=-10*60, 
+            n_sub=16, 
+            dx=-7*60, 
             dy=0,
             lgs_thickness_m=10_000.0,    
             lgs_launch_offset_px=(-off_x_px, 0.0),
@@ -46,18 +46,18 @@ class Poke_tab(QWidget):
         )
         self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
-            n_sub=20, 
+            n_sub=16, 
             dx=0, 
-            dy=10*60,
+            dy=7*60,
             lgs_thickness_m=10_000.0,     
             lgs_launch_offset_px=(0.0, off_x_px),
             lgs_remove_tt=True
         )
         self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(
             90_000, 
-            n_sub=20, 
+            n_sub=16, 
             dx=0, 
-            dy=-10*60,
+            dy=-7*60,
             lgs_thickness_m=10_000.0,   
             lgs_launch_offset_px=( 0.0, -off_x_px),
             lgs_remove_tt=True

@@ -225,9 +225,9 @@ class CalculateWorker(QObject):
                 pupil=pupil,
                 phase_map=zero_phase,
                 pad=pad_fp,
-                return_image=False,
+                return_image=True,
             )
-            ref_centroids_single = (_to_numpy(centroids_ref[0]) - float(pad_fp)).astype(np.float32, copy=False)
+            ref_centroids_single = (_to_numpy(centroids_ref[0]) - pad_fp).astype(np.float32, copy=False)
 
             # Unperturbed science image (display) + FWHM
             science_pad = 512

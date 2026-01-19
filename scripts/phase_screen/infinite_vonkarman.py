@@ -648,6 +648,43 @@ class LayeredInfinitePhaseScreen:
 
 
     # ----- batched sampling -----
+
+    def _get_patch_rel_grid_cached(self, side: float, M: int, angle_deg: float):
+        # lazily create cache
+        cache = getattr(self, "_patch_rel_grid_cache", None)
+        if cache is None:
+            cache = {}
+            self._patch_rel_grid_cache = cache
+
+        key = (int(M), float(side), float(angle_deg), str(self.dtype))
+        hit = cache.get(key, None)
+        if hit is not None:
+            return hit  # (Xrel_b, Yrel_b) each (1,M,M)
+
+        M = int(M)
+        side = float(side)
+
+        step = side / float(M)
+        lin = (cp.arange(M, dtype=self.dtype) - (M - 1) / 2.0) * self.dtype(step)
+        Xs, Ys = cp.meshgrid(lin, lin, indexing="xy")
+
+        if float(angle_deg) == 0.0:
+            Xrel = Xs
+            Yrel = Ys
+        else:
+            a = math.radians(float(angle_deg))
+            ca = self.dtype(math.cos(a))
+            sa = self.dtype(math.sin(a))
+            Xrel = ca * Xs - sa * Ys
+            Yrel = sa * Xs + ca * Ys
+
+        Xrel_b = Xrel[None, :, :]  # (1,M,M)
+        Yrel_b = Yrel[None, :, :]  # (1,M,M)
+
+        cache[key] = (Xrel_b, Yrel_b)
+        return Xrel_b, Yrel_b
+
+    # ----- batched sampling (optimized) -----
     def sample_patches_batched(
         self,
         thetas_xy_rad,          # (S,2) radians
@@ -665,36 +702,41 @@ class LayeredInfinitePhaseScreen:
             raise ValueError("thetas_xy_rad must be shape (S,2)")
         S = int(thetas.shape[0])
 
-        # Guide-star ranges (meters), used for LGS cone effect:
-        #   alpha(h) = 1 - h / H
+        # ranges -> (S,)
         if ranges_m is None:
             ranges = cp.full((S,), cp.inf, dtype=self.dtype)
         else:
-            ranges = cp.asarray(ranges_m, dtype=self.dtype)
-            if ranges.ndim != 1:
-                ranges = ranges.reshape(-1)
+            ranges = cp.asarray(ranges_m, dtype=self.dtype).reshape(-1)
             if ranges.size == 1:
-                ranges = cp.full((S,), float(ranges.item()), dtype=self.dtype)
+                # broadcast scalar to (S,)
+                ranges = cp.full((S,), float(ranges[0].item()), dtype=self.dtype)
             elif ranges.size != S:
                 raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(ranges.shape)} for S={S}")
 
         side = float(size_pixels)
         M = int(M)
 
-        # patch grid (relative coordinates centered at 0) in WORLD pixel units
-        step = side / float(M)
-        lin = (cp.arange(M, dtype=self.dtype) - (M - 1) / 2.0) * step
-        Xs, Ys = cp.meshgrid(lin, lin, indexing="xy")
+        # cached relative grid (1,M,M) in WORLD pixels
+        Xrel_b, Yrel_b = self._get_patch_rel_grid_cached(side, M, angle_deg)
 
-        # rotate the relative grid once
-        a = math.radians(float(angle_deg))
-        ca, sa = math.cos(a), math.sin(a)
-        Xrel = ca * Xs - sa * Ys
-        Yrel = sa * Xs + ca * Ys
+        # precompute theta/dx once
+        theta_over_dx = thetas / self.dtype(self.dx)  # (S,2)
+        thx = theta_over_dx[:, 0]
+        thy = theta_over_dx[:, 1]
 
-        # broadcast relative grid to (S,M,M)
-        Xrel_b = Xrel[None, :, :]
-        Yrel_b = Yrel[None, :, :]
+        # inv_ranges: 1/ranges for finite; 0 for inf (NGS)
+        finite = cp.isfinite(ranges)
+
+        inv_ranges = cp.zeros_like(ranges)
+        inv_ranges[finite] = self.dtype(1.0) / ranges[finite]
+        # (NGS: ranges=inf => finite=False => inv_ranges stays 0)
+
+        # reusable buffers
+        shiftx = cp.empty((S,), dtype=self.dtype)
+        shifty = cp.empty((S,), dtype=self.dtype)
+        alpha  = cp.empty((S,), dtype=self.dtype)
+        Xw = cp.empty((S, M, M), dtype=self.dtype)
+        Yw = cp.empty((S, M, M), dtype=self.dtype)
 
         if return_per_layer:
             L = len(self._layers_obj)
@@ -704,28 +746,31 @@ class LayeredInfinitePhaseScreen:
                 if not Lyr.active:
                     continue
 
-                # --- AUTO CENTER from this layer's screen.N ---
+                h = self.dtype(float(Lyr.altitude_m))
+
+                # shifts = h * (theta/dx)
+                cp.multiply(thx, h, out=shiftx)
+                cp.multiply(thy, h, out=shifty)
+
+                # alpha = clip(1 - h/range, 0..1); for NGS inv_ranges=0 => alpha=1
+                cp.multiply(inv_ranges, h, out=alpha)           # alpha = h*inv_ranges
+                cp.subtract(self.dtype(1.0), alpha, out=alpha)  # alpha = 1 - h*inv_ranges
+                cp.clip(alpha, self.dtype(0.0), self.dtype(1.0), out=alpha)
+
+                # center for this layer
                 Nl = int(Lyr.screen.N)
-                cx = (Nl - 1) / 2.0
-                cy = (Nl - 1) / 2.0
+                cx0 = self.dtype((Nl - 1) * 0.5)
+                cy0 = cx0  # square
 
-                # base patch in WORLD coords for this layer
-                cx0 = self.dtype(cx)
-                cy0 = self.dtype(cy)
-                Xbase = Xrel_b + cx0
-                Ybase = Yrel_b + cy0
+                # Xw = cx0 + alpha*Xrel + shiftx
+                cp.multiply(alpha[:, None, None], Xrel_b, out=Xw)
+                Xw += cx0
+                Xw += shiftx[:, None, None]
 
-                h = float(Lyr.altitude_m)
-                sx = (h * thetas[:, 0]) / self.dx
-                sy = (h * thetas[:, 1]) / self.dx
-
-                # LGS cone scaling (alpha=1 for NGS)
-                alpha = 1.0 - (self.dtype(h) / ranges)
-                alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
-                alpha = cp.clip(alpha, 0.0, 1.0)
-
-                Xw = cx0 + alpha[:, None, None] * (Xbase - cx0) + sx[:, None, None]
-                Yw = cy0 + alpha[:, None, None] * (Ybase - cy0) + sy[:, None, None]
+                # Yw = cy0 + alpha*Yrel + shifty
+                cp.multiply(alpha[:, None, None], Yrel_b, out=Yw)
+                Yw += cy0
+                Yw += shifty[:, None, None]
 
                 outL[li] = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=False, margin=2.0)
 
@@ -744,27 +789,26 @@ class LayeredInfinitePhaseScreen:
             if not Lyr.active:
                 continue
 
-            # --- AUTO CENTER from this layer's screen.N ---
+            h = self.dtype(float(Lyr.altitude_m))
+
+            cp.multiply(thx, h, out=shiftx)
+            cp.multiply(thy, h, out=shifty)
+
+            cp.multiply(inv_ranges, h, out=alpha)
+            cp.subtract(self.dtype(1.0), alpha, out=alpha)
+            cp.clip(alpha, self.dtype(0.0), self.dtype(1.0), out=alpha)
+
             Nl = int(Lyr.screen.N)
-            cx = (Nl - 1) / 2.0
-            cy = (Nl - 1) / 2.0
+            cx0 = self.dtype((Nl - 1) * 0.5)
+            cy0 = cx0
 
-            cx0 = self.dtype(cx)
-            cy0 = self.dtype(cy)
-            Xbase = Xrel_b + cx0
-            Ybase = Yrel_b + cy0
+            cp.multiply(alpha[:, None, None], Xrel_b, out=Xw)
+            Xw += cx0
+            Xw += shiftx[:, None, None]
 
-            h = float(Lyr.altitude_m)
-            sx = (h * thetas[:, 0]) / self.dx
-            sy = (h * thetas[:, 1]) / self.dx
-
-            # LGS cone scaling (alpha=1 for NGS)
-            alpha = 1.0 - (self.dtype(h) / ranges)
-            alpha = cp.where(cp.isfinite(ranges), alpha, self.dtype(1.0))
-            alpha = cp.clip(alpha, 0.0, 1.0)
-
-            Xw = cx0 + alpha[:, None, None] * (Xbase - cx0) + sx[:, None, None]
-            Yw = cy0 + alpha[:, None, None] * (Ybase - cy0) + sy[:, None, None]
+            cp.multiply(alpha[:, None, None], Yrel_b, out=Yw)
+            Yw += cy0
+            Yw += shifty[:, None, None]
 
             out += Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
 
@@ -775,26 +819,34 @@ class LayeredInfinitePhaseScreen:
 
 
     def sample_patches_batched_arcsec(self, thetas_xy_arcsec, *args, **kwargs):
-        thetas = cp.asarray(thetas_xy_arcsec, dtype=self.dtype) * ARCSEC_TO_RAD
+        thetas = cp.asarray(thetas_xy_arcsec, dtype=self.dtype) * self.dtype(ARCSEC_TO_RAD)
         return self.sample_patches_batched(thetas, *args, **kwargs)
-    
+
+
     def get_layer_view(self, idx: int, size_pixels=None, M=None, angle_deg=0.0, return_gpu=True):
         idx = int(idx)
+        Lyr = self._layers_obj[idx]
 
         if size_pixels is None:
-            size_pixels = self.N
+            size_pixels = Lyr.screen.N
         if M is None:
-            M = self.N
+            M = int(size_pixels)
 
-        patch = self._layers_obj[idx].screen.view_patch(
-            size_pixels=size_pixels,
-            M=M,
-            angle_deg=angle_deg,
-            margin=2.0,
-            center_xy_pix=None,   # auto-center from that layer's N
-        )
+        side = float(size_pixels)
+        M = int(M)
+
+        Xrel_b, Yrel_b = self._get_patch_rel_grid_cached(side, M, angle_deg)
+
+        Nl = int(Lyr.screen.N)
+        cx0 = self.dtype((Nl - 1) * 0.5)
+        cy0 = cx0
+
+        # (M,M) is enough here
+        Xw = Xrel_b[0] + cx0
+        Yw = Yrel_b[0] + cy0
+
+        patch = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=False, margin=2.0)
         return patch if return_gpu else cp.asnumpy(patch)
-
 
     def hard_reset(self):
         for i, L in enumerate(self._layers_obj):
