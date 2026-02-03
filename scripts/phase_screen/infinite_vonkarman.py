@@ -371,25 +371,22 @@ class InfiniteVonKarmanScreen2D:
 
 
     # ----- sampling -----
-    def ensure_region_world(self, Xw: cp.ndarray, Yw: cp.ndarray, margin: float = 2.0):
+    def ensure_region_world_integer(self, Xw: cp.ndarray, Yw: cp.ndarray, margin: float = 2.0):
         """
-        Ensure all requested world coords are inside the local bilinear-safe range [0, N-2]
-        after applying (origin + fractional wind shift).
+        Ensure requested world coords are inside local integer-safe range [0, N-1]
+        using origin_x/origin_y (ignoreing fractional wind offsets).
         """
         Xw = cp.asarray(Xw, dtype=self.dtype)
         Yw = cp.asarray(Yw, dtype=self.dtype)
 
-        # Convert world coords to local sample coords (same transform sample uses)
-        # sample_bilinear subtracts frac; we include it here so bounds are correct.
-        Xloc_min = float(cp.min(Xw) - (self.origin_x + self._frac_x))
-        Xloc_max = float(cp.max(Xw) - (self.origin_x + self._frac_x))
-        Yloc_min = float(cp.min(Yw) - (self.origin_y + self._frac_y))
-        Yloc_max = float(cp.max(Yw) - (self.origin_y + self._frac_y))
+        Xloc_min = float(cp.min(Xw) - self.origin_x)
+        Xloc_max = float(cp.max(Xw) - self.origin_x)
+        Yloc_min = float(cp.min(Yw) - self.origin_y)
+        Yloc_max = float(cp.max(Yw) - self.origin_y)
 
         lo = 0.0 + float(margin)
-        hi = (self.N - 2.0) - float(margin)
+        hi = (self.N - 1.0) - float(margin)
 
-        # Pan until region fits
         while Xloc_min < lo:
             self._pan_include_left()
             Xloc_min += 1.0
@@ -410,36 +407,30 @@ class InfiniteVonKarmanScreen2D:
             Yloc_min -= 1.0
             Yloc_max -= 1.0
 
-    def sample_bilinear_world(self, Xw: cp.ndarray, Yw: cp.ndarray, autopan: bool = True, margin: float = 2.0):
+
+    def sample_integer_world(self, Xw: cp.ndarray, Yw: cp.ndarray, autopan: bool = True, margin: float = 2.0):
         """
-        Sample using world pixel coords. Optionally pan the cached window so coords are in-bounds.
+        Integer-offset / nearest-neighbor sampling in world pixel coords.
+        Ignores fractional wind offsets (_frac_x/_frac_y).
         """
         Xw = cp.asarray(Xw, dtype=self.dtype)
         Yw = cp.asarray(Yw, dtype=self.dtype)
 
         if autopan:
-            self.ensure_region_world(Xw, Yw, margin=margin)
+            self.ensure_region_world_integer(Xw, Yw, margin=margin)
 
-        # World -> local coords used for bilinear indexing
-        X = Xw - self.dtype(self.origin_x + self._frac_x)
-        Y = Yw - self.dtype(self.origin_y + self._frac_y)
+        # World -> local (IGNORE fractional offsets)
+        X = Xw - self.dtype(self.origin_x)
+        Y = Yw - self.dtype(self.origin_y)
 
-        x0 = cp.floor(X).astype(cp.int32)
-        y0 = cp.floor(Y).astype(cp.int32)
-        x1 = x0 + 1
-        y1 = y0 + 1
+        # nearest-neighbor indices (avoid bankers rounding)
+        xi = cp.floor(X + self.dtype(0.5)).astype(cp.int32)
+        yi = cp.floor(Y + self.dtype(0.5)).astype(cp.int32)
 
-        wx = (X - x0).astype(self.dtype)
-        wy = (Y - y0).astype(self.dtype)
+        xi = cp.clip(xi, 0, self.N - 1)
+        yi = cp.clip(yi, 0, self.N - 1)
 
-        phi = self.scrn
-        v00 = phi[y0, x0]
-        v10 = phi[y0, x1]
-        v01 = phi[y1, x0]
-        v11 = phi[y1, x1]
-
-        return (1 - wx) * (1 - wy) * v00 + wx * (1 - wy) * v10 + (1 - wx) * wy * v01 + wx * wy * v11
-
+        return self.scrn[yi, xi]
 
     def view_patch(self, size_pixels, M: int, angle_deg: float = 0.0, margin: float = 2.0, center_xy_pix=None):
         """
@@ -465,7 +456,7 @@ class InfiniteVonKarmanScreen2D:
         Xw = ca * Xs - sa * Ys + cx
         Yw = sa * Xs + ca * Ys + cy
 
-        return self.sample_bilinear_world(Xw, Yw, autopan=True, margin=margin)
+        return self.sample_integer_world(Xw, Yw, autopan=True, margin=margin)
 
 
 
@@ -772,7 +763,7 @@ class LayeredInfinitePhaseScreen:
                 Yw += cy0
                 Yw += shifty[:, None, None]
 
-                outL[li] = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=False, margin=2.0)
+                outL[li] = Lyr.screen.sample_integer_world(Xw, Yw, autopan=False, margin=2.0)
 
             if remove_piston:
                 outL -= cp.mean(outL, axis=(2, 3), keepdims=True)
@@ -810,7 +801,7 @@ class LayeredInfinitePhaseScreen:
             Yw += cy0
             Yw += shifty[:, None, None]
 
-            out += Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=True, margin=2.0)
+            out += Lyr.screen.sample_integer_world(Xw, Yw, autopan=True, margin=2.0)
 
         if remove_piston:
             out -= cp.mean(out, axis=(1, 2), keepdims=True)
@@ -845,7 +836,7 @@ class LayeredInfinitePhaseScreen:
         Xw = Xrel_b[0] + cx0
         Yw = Yrel_b[0] + cy0
 
-        patch = Lyr.screen.sample_bilinear_world(Xw, Yw, autopan=False, margin=2.0)
+        patch = Lyr.screen.sample_integer_world(Xw, Yw, autopan=False, margin=2.0)
         return patch if return_gpu else cp.asnumpy(patch)
 
     def hard_reset(self):

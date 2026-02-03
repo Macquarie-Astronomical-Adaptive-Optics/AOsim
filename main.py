@@ -4,12 +4,14 @@ from pathlib import Path
 import argparse
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget
+    QApplication, QMainWindow
 )
 
 from scripts.window_tabs.poke_tab import Poke_tab
 from scripts.window_tabs.turbulence_tab import Turbulence_tab
-from scripts.window_tabs.sensor_view_tab import SensorView_tab
+from scripts.window_tabs.loop_tab import Loop_tab
+from scripts.window_tabs.log_console import *
+from scripts.widgets.wrap_tab import DetachableTabWidget
 
 import cupy as cp
 import sys
@@ -55,8 +57,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AOsim")
         cp.cuda.Device(0).use()
             
+        # self.logger = add_console(self)
+        
         print("> Starting!")
-        tabs = QTabWidget()
+        tabs = DetachableTabWidget()
         tabs.setMovable(True)
 
         print("> Starting Poke diagnostic tab building")
@@ -73,6 +77,13 @@ class MainWindow(QMainWindow):
         poke.pupil_changed.connect(sensview.updateLayerGrid)
         print("> SensorView tab done!")
 
+        print("> Starting Recontructor tab building")
+        tabs.addTab(recoview := turb.reconstructor_tab, "Reconstructor")
+        print("> Recontructor tab done!")
+
+        print("> Starting Loop tab building")
+        tabs.addTab(loopview := Loop_tab(self.params, turb.scheduler), "Loop")
+        print("> Loop tab done!")
 
         self.setCentralWidget(tabs)
         print("> MAIN init done!")

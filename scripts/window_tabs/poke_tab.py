@@ -1,131 +1,168 @@
+from __future__ import annotations
+
+import math
+from typing import Dict
+
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (
-    QHBoxLayout, QVBoxLayout, QWidget,
-    QFrame,
-)
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 import scripts.utilities as ut
-from scripts.widgets.wrap_tab import DetachableTabWidget
-from scripts.widgets.wfsensor_tab import SensorTabWidget
 from scripts.widgets.config_table import Config_table
+from scripts.widgets.wrap_tab import DetachableTabWidget
+from scripts.window_tabs.wfsensor_tab import SensorTabWidget
 
-ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
-RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
+ARCSEC2RAD = math.pi / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / math.pi
+
 
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
     sensors_changed = Signal(dict)
     pupil_changed = Signal(float)
 
-    def __init__(self, config_dict):
+    def __init__(self, config_dict: dict):
         super().__init__()
         self.params = config_dict
         ut.set_params(self.params)
-        self.wfsensors = {}
 
-        print("Creating sensors")
-        off_x_px = 0.0 # (0.5 * self.params.get("telescope_diameter")) / (self.params.get("telescope_diameter") / self.params.get("grid_size"))
-        self.wfsensors["main_sensor"] = ut.WFSensor_tools.ShackHartmann(n_sub=16, )
-        self.wfsensors["test_sensor_right"] = ut.WFSensor_tools.ShackHartmann(
-            90_000, 
-            n_sub=16, 
-            dx=7*60, 
-            dy=0,
-            lgs_thickness_m=10_000.0,     # ~10 km sodium thickness
-            lgs_launch_offset_px=(off_x_px, 0.0),
-            lgs_remove_tt=True
-        )
-        self.wfsensors["test_sensor_left"] = ut.WFSensor_tools.ShackHartmann(
-            90_000, 
-            n_sub=16, 
-            dx=-7*60, 
-            dy=0,
-            lgs_thickness_m=10_000.0,    
-            lgs_launch_offset_px=(-off_x_px, 0.0),
-            lgs_remove_tt=True
-        )
-        self.wfsensors["test_sensor_up"] = ut.WFSensor_tools.ShackHartmann(
-            90_000, 
-            n_sub=16, 
-            dx=0, 
-            dy=7*60,
-            lgs_thickness_m=10_000.0,     
-            lgs_launch_offset_px=(0.0, off_x_px),
-            lgs_remove_tt=True
-        )
-        self.wfsensors["test_sensor_down"] = ut.WFSensor_tools.ShackHartmann(
-            90_000, 
-            n_sub=16, 
-            dx=0, 
-            dy=-7*60,
-            lgs_thickness_m=10_000.0,   
-            lgs_launch_offset_px=( 0.0, -off_x_px),
-            lgs_remove_tt=True
-        )
-        self.sensors_changed.emit(self.wfsensors)
-        for i, j in self.wfsensors.items():
-            print(" -", i, f": ({j.dx*RAD2ARCSEC:.0f}, {j.dy*RAD2ARCSEC:.0f}) arcsec")
+        self.wfsensors: Dict[str, object] = {}
+        self._build_sensors()
 
         # layout for entire tab
         main_layout = QHBoxLayout(self)
 
-        
-
+        # ---- Left: parameter configuration ----
         left_layout = QVBoxLayout()
-        ## top left -- parameter configuration
+
         ftable = QFrame()
         ftable.setMaximumWidth(250)
         ftable.setMinimumWidth(218)
 
         ftable_layout = QVBoxLayout(ftable)
-        table_config_key = ["telescope_diameter","telescope_center_obscuration","actuators","grid_size","poke_amplitude"]
-        self.config_table = Config_table(table_config_key, self.params)
-        
+        self.config_table = Config_table(
+            ["telescope_diameter", "telescope_center_obscuration", "actuators", "grid_size", "poke_amplitude"],
+            self.params,
+        )
         ftable_layout.addWidget(self.config_table)
-
         left_layout.addWidget(ftable)
+        main_layout.addLayout(left_layout)
 
-        main_layout.addLayout(left_layout)       
-
-
-        # middle section
+        # ---- Middle: sensor editor tabs ----
         main_middle_layout = QVBoxLayout()
-
-
-        # sensor viewer
         sensor_selector_h = QHBoxLayout()
+
         sensor_tabs = DetachableTabWidget()
         sensor_tabs.setMovable(True)
-        
-        print("Starting sensor tab editor: ")
+
+        print("Starting sensor tab editor:")
+
         self.tab_pages = []
-        for key, val in self.wfsensors.items():
-            
-            tab = SensorTabWidget(dict(self.params), key, val)
+        for key, sensor in self.wfsensors.items():
+            tab = SensorTabWidget(dict(self.params), key, sensor)
             tab.sensor_changed.connect(self.update_sensor)
 
             self.tab_pages.append(tab)
             sensor_tabs.addTab(tab, key)
-            
+
         sensor_selector_h.addWidget(sensor_tabs)
+
         self.config_table.params_changed.connect(ut.set_params)
         self.config_table.params_changed.connect(self.update_tabs)
-        
+
         main_middle_layout.addLayout(sensor_selector_h)
         main_layout.addLayout(main_middle_layout)
 
+        # Some code expects an emission after UI construction as well.
         self.sensors_changed.emit(self.wfsensors)
 
-    def update_tabs(self, params):
+    def _build_sensors(self) -> None:
+        print("Creating sensors")
+        # Note: keep off_x_px=0.0 to preserve existing behaviour (placeholder for future scaling).
+        off_x_px = 0.0  # (0.5 * telescope_diameter) / (telescope_diameter / grid_size)
+
+        def add(key: str, sensor) -> None:
+            self.wfsensors[key] = sensor
+
+        # Science channel
+        add("science", ut.WFSensor_tools.ShackHartmann(n_sub=1, wavelength=2.150e-06))
+
+        # LGS constellation (units consistent with original code)
+        add(
+            "LGS_right",
+            ut.WFSensor_tools.ShackHartmann(
+                90_000,
+                n_sub=32,
+                dx=10 * 60,
+                dy=0,
+                lgs_thickness_m=10_000.0,  # ~10 km sodium thickness
+                lgs_launch_offset_px=(off_x_px, 0.0),
+                lgs_remove_tt=True,
+                wavelength=589e-9,
+            ),
+        )
+        add(
+            "LGS_left",
+            ut.WFSensor_tools.ShackHartmann(
+                90_000,
+                n_sub=32,
+                dx=-10 * 60,
+                dy=0,
+                lgs_thickness_m=10_000.0,
+                lgs_launch_offset_px=(-off_x_px, 0.0),
+                lgs_remove_tt=True,
+                wavelength=589e-9,
+            ),
+        )
+        add(
+            "LGS_up",
+            ut.WFSensor_tools.ShackHartmann(
+                90_000,
+                n_sub=32,
+                dx=0,
+                dy=10 * 60,
+                lgs_thickness_m=10_000.0,
+                lgs_launch_offset_px=(0.0, off_x_px),
+                lgs_remove_tt=True,
+                wavelength=589e-9,
+            ),
+        )
+        add(
+            "LGS_down",
+            ut.WFSensor_tools.ShackHartmann(
+                90_000,
+                n_sub=32,
+                dx=0,
+                dy=-10 * 60,
+                lgs_thickness_m=10_000.0,
+                lgs_launch_offset_px=(0.0, -off_x_px),
+                lgs_remove_tt=True,
+                wavelength=589e-9,
+            ),
+        )
+
+        # NGS quad
+        for name, dx, dy in [
+            ("NGS_NE", 4.95 * 60, 4.95 * 60),
+            ("NGS_NW", -4.95 * 60, 4.95 * 60),
+            ("NGS_SE", 4.95 * 60, -4.95 * 60),
+            ("NGS_SW", -4.95 * 60, -4.95 * 60),
+        ]:
+            add(name, ut.WFSensor_tools.ShackHartmann(n_sub=2, dx=dx, dy=dy, wavelength=1650e-9))
+
+        self.sensors_changed.emit(self.wfsensors)
+
+        for key, sensor in self.wfsensors.items():
+            dx_arcsec = getattr(sensor, "dx", 0.0) * RAD2ARCSEC
+            dy_arcsec = getattr(sensor, "dy", 0.0) * RAD2ARCSEC
+            print(f" - {key}: ({dx_arcsec:.0f}, {dy_arcsec:.0f}) arcsec")
+
+    def update_tabs(self, params: dict) -> None:
         # also update sensor view tab while we're at it
         self.pupil_changed.emit(params.get("telescope_center_obscuration"))
         for tab in self.tab_pages:
             tab.main_params_changed(params)
 
-    def update_sensor(self, sensor):
+    def update_sensor(self, sensor) -> None:
+        # SensorTabWidget emits this after its worker finishes a full (re)compute.
+        # Sensors are mutated in-place; just re-emit the dictionary.
         self.sensors_changed.emit(self.wfsensors)
-            
-
-        
-
-

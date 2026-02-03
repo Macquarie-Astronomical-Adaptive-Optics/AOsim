@@ -1,28 +1,35 @@
-from PySide6.QtCore import Signal, Slot, QThread
-from PySide6.QtWidgets import (
-    QHBoxLayout, QVBoxLayout, QWidget,
-    QLabel, QFrame,
-    QPushButton, QSizePolicy,
-    QSpinBox,
-)
+from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from scripts.utilities import Pupil_tools
-from scripts.widgets.config_table import Config_table
-from scripts.widgets.wrap_tab import DetachableTabWidget
-from scripts.widgets.pgcanvas import PGCanvas
-from scripts.widgets.loading_label import DotLoadingLabel
+import numpy as np
+from PySide6.QtCore import QThread, Signal, Slot
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
 from scripts.phase_screen.infinite_vonkarman import LayeredInfinitePhaseScreen
 from scripts.schedulerGPU import SimWorker
+from scripts.utilities import Pupil_tools
+from scripts.widgets.config_table import Config_table
 from scripts.widgets.dual_list_selector import DualListSelector
+from scripts.widgets.loading_label import DotLoadingLabel
+from scripts.widgets.pgcanvas import PGCanvas
+from scripts.widgets.popout_window import PopoutWindow
+from scripts.widgets.wrap_tab import DetachableTabWidget
+from scripts.window_tabs.reconstructor_tab import Reconstructor_tab
 from scripts.window_tabs.sensor_view_tab import SensorView_tab
 
-import cupy as cp
-
-ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
-RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
+ARCSEC2RAD = np.pi / (180.0 * 3600.0)
+RAD2ARCSEC = (180.0 * 3600.0) / np.pi
 
 
 class Turbulence_tab(QWidget):
@@ -35,7 +42,7 @@ class Turbulence_tab(QWidget):
     req_emit_overview = Signal()
     req_visible_sensor = Signal(int)
 
-    def __init__(self, config_dict, sensors):
+    def __init__(self, config_dict: dict, sensors: dict):
         super().__init__()
 
         self.params = config_dict
@@ -43,25 +50,10 @@ class Turbulence_tab(QWidget):
         self.initDone = False
 
         self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
-
-        screen_directory = Path(__file__).parent.parent.parent / "turbulence"
-
-        # load turbulence configs
-        self.turbulence_screens = []
-        for file_path in screen_directory.iterdir():
-            if file_path.is_file():
-                with file_path.open("r") as f:
-                    content = json.load(f)
-                content_name = file_path.stem
-                content_data = {k: v for k, v in content.items() if k != "function"}
-                self.turbulence_screens.append({
-                    "name": content_name,
-                    "data": content_data,
-                    "function": self.available_funcs[content["function"]],
-                })
+        self.turbulence_screens = self._load_turbulence_configs()
 
         # pick first config for now
-        screen = self.turbulence_screens[1]
+        screen = self.turbulence_screens[0]
         data = screen["data"]
 
         # split base kwargs vs layer list (IMPORTANT: avoids double-adding layers)
@@ -69,21 +61,20 @@ class Turbulence_tab(QWidget):
         base_kwargs = {k: v for k, v in data.items() if k != "layers"}
         N = int(base_kwargs["N"])
 
-        self.turbWidgets = {}
-        self.layer_last = {}  # cache numpy layer frames
+        self.turbWidgets: Dict[int, TurbulenceWidget] = {}
+        self.layer_last: Dict[int, np.ndarray] = {}  # cache numpy layer frames
 
         # build widgets from layer configs (GUI side only)
         for i, layer in enumerate(layers):
             name = f"Layer {i+1}"
-            turbWidget = TurbulenceWidget(name, screen["function"], layer)
-            self.turbWidgets[i] = turbWidget
+            self.turbWidgets[i] = TurbulenceWidget(name, screen["function"], layer)
 
-        # sensors -> angles (radians)
+        # sensors -> angles (radians) (used for debug output)
         thetas = [s.field_angle for s in self.sensors.values()]  # list of (theta_x, theta_y) rad
-        ranges_m = [getattr(s, 'gs_range_m', float('inf')) for s in self.sensors.values()]  # meters
+        ranges_m = [getattr(s, "gs_range_m", float("inf")) for s in self.sensors.values()]  # meters
         print("Loaded sensors at angles")
         for t in thetas:
-            print(f" - ({t[0]*RAD2ARCSEC:.0f}, {t[1]*RAD2ARCSEC:.0f}) arcsec")
+            print(f" - ({t[0] * RAD2ARCSEC:.0f}, {t[1] * RAD2ARCSEC:.0f}) arcsec")
 
         # ---------- UI ----------
         main_layout = QHBoxLayout(self)
@@ -94,24 +85,25 @@ class Turbulence_tab(QWidget):
         left_frame.setLineWidth(1)
         left_layout = QVBoxLayout(left_frame)
 
-        self.science_canvas = PGCanvas()
+        self.science_canvas = PGCanvas(show_colorbar=False)
         left_layout.addWidget(self.science_canvas)
 
-        self.psf_r0_label = QLabel(f"Synthetic R0 total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}")
+        self.psf_r0_label = QLabel(
+            f"Synthetic R0 total = {base_kwargs.get('r0_total', base_kwargs.get('r0', '...'))}"
+        )
         left_layout.addWidget(self.psf_r0_label)
 
         self.layer_selector = DualListSelector(active=self.turbWidgets.values(), text_key="title")
         self.layer_selector.itemsChanged.connect(self.active_change)
-
         left_layout.addWidget(self.layer_selector)
 
         add_layer_btn = QPushButton("Add Layer")
         add_layer_btn.clicked.connect(self.add_layer)
-
         left_layout.addWidget(add_layer_btn)
 
-        print("Active layers: ")
-        [print(" -", i.title) for i in self.layer_selector.active_items()]
+        print("Active layers:")
+        for w in self.layer_selector.active_items():
+            print(" -", w.title)
 
         main_layout.addWidget(left_frame)
 
@@ -122,14 +114,24 @@ class Turbulence_tab(QWidget):
         middle_layout = QVBoxLayout(fmiddle)
 
         self.active_canvas = PGCanvas()
+        self.active_canvas.set_colorbar(label="phase", units="rad")
         middle_layout.addWidget(self.active_canvas)
+
+        control_popout = QFrame()
+        control_popout.setFrameShape(QFrame.NoFrame)
+        self.control_popout_layout = QVBoxLayout(control_popout)
+        self.control_popout_window: Optional[PopoutWindow] = None
+
+        self.control_frame = QFrame()
+        self.control_frame.setFrameShape(QFrame.NoFrame)
+        control_layout = QVBoxLayout(self.control_frame)
 
         self.scheduler_status = DotLoadingLabel("Creating turbulence screens")
         self.scheduler_status.start()
-        middle_layout.addWidget(self.scheduler_status)
+        control_layout.addWidget(self.scheduler_status)
 
         phase_b_layout = QHBoxLayout()
-        middle_layout.addLayout(phase_b_layout)
+        control_layout.addLayout(phase_b_layout)
 
         self.next_button = QPushButton("Next Step")
         self.run_x_button = QPushButton("Run X Frames")
@@ -140,6 +142,9 @@ class Turbulence_tab(QWidget):
         self.stop_button = QPushButton("Pause")
         self.reset_button = QPushButton("Reset")
 
+        self.control_popout_layout.addWidget(self.control_frame)
+        middle_layout.addWidget(control_popout)
+
         phase_b_layout.addWidget(self.next_button)
         phase_b_layout.addWidget(self.run_x_button)
         phase_b_layout.addWidget(self.spin)
@@ -149,7 +154,7 @@ class Turbulence_tab(QWidget):
 
         main_layout.addWidget(fmiddle)
 
-        # right: per-layer tabs (your plan)
+        # right: per-layer tabs
         right_layout = QVBoxLayout()
         fright_top = QFrame()
         fright_top.setFrameShape(QFrame.Box)
@@ -166,7 +171,7 @@ class Turbulence_tab(QWidget):
         right_top_layout.addWidget(self.tab_widget)
         right_layout.addWidget(fright_top)
         main_layout.addLayout(right_layout)
-        
+
         # ---------- Worker thread ----------
         print("Starting GPU Scheduler")
         self.scheduler_thread = QThread(self)
@@ -179,14 +184,13 @@ class Turbulence_tab(QWidget):
             pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
             sensors=sensors,
             ranges_m=ranges_m,
-            patch_size_px= N,
-            patch_M= N,
+            patch_size_px=N,
+            patch_M=N,
             dt_s=0.001,
             emit_psf=True,
         )
         self.scheduler.moveToThread(self.scheduler_thread)
         print("Scheduler moved to thread!")
-
 
         # build once thread starts, then emit a first frame
         self.req_overview_enabled.connect(self.scheduler.set_overview_enabled)
@@ -197,10 +201,7 @@ class Turbulence_tab(QWidget):
         self.req_step_n.connect(self.scheduler.step_n)
         self.req_step.connect(self.scheduler.step_once)
 
-
         self.scheduler_thread.started.connect(self.scheduler.build_sim)
-        # self.scheduler_thread.started.connect(self.scheduler.step_once)
-
         self.scheduler.finished.connect(self.scheduler_thread.quit)
 
         # signals -> UI
@@ -215,13 +216,11 @@ class Turbulence_tab(QWidget):
 
         self.req_visible_sensor.emit(0)
 
-
         # controls -> worker (queued automatically across threads)
-        self.next_button.clicked.connect(lambda  a: self.req_step.emit(True))
+        self.next_button.clicked.connect(lambda _: self.req_step.emit(True))
         self.run_inf_button.clicked.connect(self.scheduler.start)
         self.stop_button.clicked.connect(self.scheduler.pause)
         self.reset_button.clicked.connect(self.scheduler.reset)
-
         self.run_x_button.clicked.connect(self._run_x_clicked)
 
         # tab changes => only update visible layer
@@ -234,26 +233,66 @@ class Turbulence_tab(QWidget):
         self.scheduler_thread.start()
 
         # worker emits stacks
-        self.overview_tab = SensorView_tab(sensors, config_dict, layers, N, self.params.get("telescope_diameter")/N, (N/2,N/2), N, self.scheduler)
-        
+        self.overview_tab = SensorView_tab(
+            sensors,
+            config_dict,
+            layers,
+            N,
+            self.params.get("telescope_diameter") / N,
+            (N / 2, N / 2),
+            N,
+            self.scheduler,
+        )
         self.scheduler.all_sensor_phase_ready.connect(self.overview_tab.psf_grid.update_psfs)
         self.scheduler.all_layers_ready.connect(self.overview_tab.layer_grid.update_layers)
         self.scheduler.sim_signal.connect(self.overview_tab.layer_grid.set_layers_cfg)
-        
+
         self.scheduler.update_r0.connect(lambda r: self.psf_r0_label.setText(f"Synthetic R0 total: {r:.3f}"))
 
         # enable and render once (queued)
         self.req_overview_enabled.emit(True)
         self.req_emit_overview.emit()
 
-    def add_layer(self):
-        layer_params = self.turbulence_screens[0]["data"]["layers"][0].copy()
+        self.reconstructor_tab = Reconstructor_tab(config_dict, self.scheduler)
+        self.scheduler.reconstructed_ready.connect(self.reconstructor_tab.update_view)
+        self.scheduler.recon_matr_ready.connect(self.reconstructor_tab.update_mat_view)
 
+    def _load_turbulence_configs(self) -> List[Dict[str, Any]]:
+        screen_directory = Path(__file__).parent.parent.parent / "turbulence"
+
+        configs: List[Dict[str, Any]] = []
+        for file_path in sorted(screen_directory.iterdir()):
+            if not (file_path.is_file() and file_path.suffix.lower() == ".json"):
+                continue
+            with file_path.open("r", encoding="utf-8") as f:
+                content = json.load(f)
+
+            fn_name = content.get("function")
+            if fn_name not in self.available_funcs:
+                raise KeyError(f"Unknown turbulence screen function: {fn_name!r} in {file_path.name}")
+
+            content_name = file_path.stem
+            content_data = {k: v for k, v in content.items() if k != "function"}
+            configs.append(
+                {
+                    "name": content_name,
+                    "data": content_data,
+                    "function": self.available_funcs[fn_name],
+                }
+            )
+
+        if not configs:
+            raise FileNotFoundError(f"No turbulence configs found in {screen_directory}")
+
+        return configs
+
+    def add_layer(self) -> None:
+        layer_params = self.turbulence_screens[0]["data"]["layers"][0].copy()
 
         i = len(self.turbWidgets)
         name = f"Layer {i+1}"
-        layer_params['name'] = name
-        layer_params['seed_offset'] = i+1
+        layer_params["name"] = name
+        layer_params["seed_offset"] = i + 1
 
         self.req_add_layer.emit(layer_params)
 
@@ -263,24 +302,22 @@ class Turbulence_tab(QWidget):
         self.tab_widget.addTab(turbWidget, name)
         turbWidget.screen_params_changed.connect(lambda p, idx=i: self.scheduler.apply_layer_params(idx, p))
 
-
-    def active_change(self, items, active):
-        self.scheduler.set_active([turbWidg.title for turbWidg in items], active)   
+    def active_change(self, items, active) -> None:
+        self.scheduler.set_active([turbWidg.title for turbWidg in items], active)
 
     @Slot(dict)
-    def sensor_update(self, sensors):
+    def sensor_update(self, sensors: dict) -> None:
         self.sensors = sensors
         self.req_sensor_update.emit(sensors)
 
     # ----------- UI slots -----------
     @Slot()
-    def _run_x_clicked(self):
+    def _run_x_clicked(self) -> None:
         n = int(self.spin.value())
-        self.req_step_n.emit(n,2)
-        
+        self.req_step_n.emit(n, 2)
 
     @Slot(int)
-    def _tab_changed(self, idx: int):
+    def _tab_changed(self, idx: int) -> None:
         # request updates for just the visible layer tab
         self.scheduler.set_visible_layer(idx)
 
@@ -289,32 +326,47 @@ class Turbulence_tab(QWidget):
             self.turbWidgets[idx].update_screen(self.layer_last[idx])
 
     @Slot(object)
-    def on_combined_frame(self, img_np):
+    def on_combined_frame(self, img_np: np.ndarray) -> None:
         # show combined in both canvases
-        self.active_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
-    
+        img_np = np.asarray(img_np)
+        absol = float(np.max(np.abs(img_np))) if img_np.size else 0.0
+        self.active_canvas.queue_image(img_np, cmap="seismic", levels=(-absol, absol), auto_levels=False)
+
     @Slot(int, object)
-    def on_sensor_psf(self, idx, img_np):
+    def on_sensor_psf(self, idx: int, img_np: np.ndarray) -> None:
         # show on whatever canvas you want for that sensor
-        self.science_canvas.queue_image(img_np, cmap="viridis", auto_levels=True)
+        self.science_canvas.queue_image(np.asarray(img_np) / 255.0, cmap="viridis", auto_levels=True)
         if not self.initDone:
             self.initDone = True
 
-
     @Slot(int, object)
-    def on_layer_frame(self, idx: int, img_np):
-        self.layer_last[int(idx)] = img_np
+    def on_layer_frame(self, idx: int, img_np: np.ndarray) -> None:
+        idx = int(idx)
+        self.layer_last[idx] = np.asarray(img_np)
         # only update visible tab widget (saves UI work)
-        if int(idx) == int(self.tab_widget.currentIndex()):
-            self.turbWidgets[int(idx)].update_screen(img_np)
+        if idx == int(self.tab_widget.currentIndex()):
+            self.turbWidgets[idx].update_screen(img_np)
 
     def showEvent(self, event):
         self.scheduler._detailed_enabled = True
         return super().showEvent(event)
-    
+
     def hideEvent(self, event):
         if self.initDone:
             self.scheduler._detailed_enabled = False
+
+        timer = getattr(self.scheduler, "timer", None)
+        if timer is not None and timer.isActive():
+            print("exiting page while sim is running")
+
+            def on_close_callback(returned_widget, returned_title):
+                self.control_popout_layout.addWidget(returned_widget)
+                self.control_popout_window = None
+                return
+
+            self.control_popout_window = PopoutWindow(self.control_frame, "Sim Controls", on_close_callback)
+            self.control_popout_window.show()
+
         return super().hideEvent(event)
 
     def closeEvent(self, event):
@@ -330,7 +382,7 @@ class Turbulence_tab(QWidget):
 class TurbulenceWidget(QWidget):
     screen_params_changed = Signal(dict)
 
-    def __init__(self, title, function, params, parent=None):
+    def __init__(self, title: str, function, params: dict, parent=None):
         super().__init__(parent)
         self.title = title
         self.function = function
@@ -338,34 +390,31 @@ class TurbulenceWidget(QWidget):
         self.current_screen = None
 
         tab_frame = QFrame(self)
-        self.tab_layout = QVBoxLayout(tab_frame)
+        tab_layout = QVBoxLayout(tab_frame)
 
         self.turb_canvas = PGCanvas()
-        self.tab_layout.addWidget(self.turb_canvas)
+        self.turb_canvas.set_colorbar(label="phase", units="rad")
+        tab_layout.addWidget(self.turb_canvas)
 
-        table_config_key = list(self.params.keys())
-        self.config_table = Config_table(table_config_key, self.params)
-        self.tab_layout.addWidget(self.config_table)
-
+        self.config_table = Config_table(list(self.params.keys()), self.params)
+        tab_layout.addWidget(self.config_table)
         self.config_table.params_changed.connect(self._on_params_changed)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(tab_frame)
 
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-
     @Slot(dict)
-    def _on_params_changed(self, pc: dict):
+    def _on_params_changed(self, pc: dict) -> None:
         self.params = pc
         self.screen_params_changed.emit(pc)
 
     @Slot(object)
-    def update_screen(self, new_screen):
+    def update_screen(self, new_screen) -> None:
         self.current_screen = new_screen
-        self.turb_canvas.queue_image(new_screen, cmap="viridis", levels=(0, 255), auto_levels=True)
+        self.turb_canvas.queue_image(new_screen, cmap="seismic", levels=(0, 255), auto_levels=True)
 
     def showEvent(self, event):
         super().showEvent(event)
         if self.current_screen is not None:
-            self.turb_canvas.queue_image(self.current_screen, cmap="viridis", levels=(0, 255), auto_levels=True)
+            self.turb_canvas.queue_image(self.current_screen, cmap="seismic", levels=(0, 255), auto_levels=True)

@@ -24,6 +24,8 @@ CONFIG_DTYPES = {
     "seed_offset": int,
     "dx": float,
     "dy": float,
+    "loop_gain": float,
+    "loop_leak": float,
 }
 
 def enforce_config_types(config):

@@ -62,10 +62,12 @@ class SensorPSFGrid(QWidget):
             )
             layername = QLabel(list(self.sensors.keys())[s])
             layername.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            css_color = rgba_to_css(self._pens_rgba[s])
+            css_color = rgba_to_css(self._pens_rgba[s % len(self._pens_rgba)])
             layername.setStyleSheet(f"color: {css_color};")
             
             c = PGCanvas()
+            c.set_colorbar(label="phase", units="rad")
+
             self.canvases.append(c)
             r, col = self.pos[s]
 
@@ -95,7 +97,7 @@ class SensorPSFGrid(QWidget):
         ix0, iy0 = ix - ix.min(), iy.max() - iy
         return list(zip(iy0.tolist(), ix0.tolist()))
 
-    def update_psfs(self, psf_stack_or_dict, cmap="viridis"):
+    def update_psfs(self, psf_stack_or_dict, cmap="seismic"):
         """
         Accepts:
           - dict {sensor_idx: image}
@@ -112,7 +114,8 @@ class SensorPSFGrid(QWidget):
 
         for s, img in items:
             if 0 <= s < self.S:
-                self.canvases[s].queue_image(img, cmap=cmap, auto_levels=True)
+                absol = max(abs(np.min(img)), abs(np.max(img)))
+                self.canvases[s].queue_image(img, cmap=cmap, levels=(-absol,absol), auto_levels=False)
 
 
 
@@ -255,6 +258,8 @@ class LayerFootprintGrid(QWidget):
 
         for ci, layer_idx in enumerate(self._active_layer_idxs):
             canvas = PGCanvas()
+            canvas.set_colorbar(label="phase", units="rad")
+
             self.layer_canvases.append(canvas)
             self._layer_to_canvas[layer_idx] = ci
 
@@ -447,7 +452,7 @@ class LayerFootprintGrid(QWidget):
         sy = ((h_m * thy) / self.dx) * scale_y
 
         # put patch centered at (cx+sx, cy+sy)
-        cxs = cx + sx
+        cxs = cx - sx
         cys = cy + sy
         x0 = float(cxs - M / 2.0)
         y0 = float(cys - M / 2.0)

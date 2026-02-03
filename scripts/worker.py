@@ -1,38 +1,21 @@
 # scripts/worker.py
+from __future__ import annotations
+
 from collections import deque
 import threading
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import cupy as cp
+
+from PySide6.QtCore import QObject, Signal, Slot, QTimer, QThread
+
 import scripts.utilities as ut
-
-from PySide6.QtCore import QObject, QRunnable, Signal, Slot, QTimer, QThread
-
-
-# ---- Generic Fire and Forget worker
-class GenericWorkerSignals(QObject):
-    finished = Signal(object)  # emit the created generator
-    error = Signal(Exception)
-
-
-class GenericWorker(QRunnable):
-    def __init__(self, function, **params):
-        super().__init__()
-        self.function = function
-        self.params = params
-        self.signals = GenericWorkerSignals()
-
-    def run(self):
-        try:
-            function, out = self.function(**self.params)
-            self.signals.finished.emit((out, function))
-        except Exception as e:
-            self.signals.error.emit(e)
+from scripts.utilities import Gaussian2DFitter, Analysis
 
 
 def _to_numpy(x: Any) -> np.ndarray:
-    """Convert cupy arrays to numpy; pass numpy arrays through."""
+    """Convert CuPy arrays to NumPy; pass NumPy arrays through."""
     if isinstance(x, cp.ndarray):
         return cp.asnumpy(x)
     return np.asarray(x)
@@ -72,7 +55,7 @@ class CalculateWorker(QObject):
         # Shared GPU arrays per sensor
         self._sensor_data: Dict[object, Dict[str, Any]] = {}
 
-        # dedicated thread
+        # Dedicated thread
         self.thread = QThread()
         self.moveToThread(self.thread)
         self.thread.started.connect(self._start_timer)
@@ -85,26 +68,26 @@ class CalculateWorker(QObject):
                 cls._instance = CalculateWorker()
             return cls._instance
 
-    def _start_timer(self):
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._process_one)
-        self.timer.start(10)
+    def _start_timer(self) -> None:
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._process_one)
+        self._timer.start(10)
 
     # ---- enqueue helpers
-    def _enqueue_full(self, sensor: object, params: Dict[str, Any]):
+    def _enqueue_full(self, sensor: object, params: Dict[str, Any]) -> None:
         with self._pending_lock:
-            # keep latest params
+            # Keep latest params
             self._full_params[sensor] = params
             if sensor not in self._full_live:
                 self._full_live.add(sensor)
                 self._full_order.append(sensor)
 
-            # Any pending per-actuator jobs are now stale relative to geometry/params.
+            # Any pending per-actuator jobs are stale relative to geometry/params.
             if sensor in self._subap_live:
                 self._subap_live.discard(sensor)
                 self._subap_req.pop(sensor, None)
 
-    def _enqueue_subap(self, sensor: object, k: int, job_id: int):
+    def _enqueue_subap(self, sensor: object, k: int, job_id: int) -> None:
         with self._pending_lock:
             self._subap_req[sensor] = (int(k), int(job_id))
             if sensor not in self._subap_live:
@@ -112,22 +95,35 @@ class CalculateWorker(QObject):
                 self._subap_order.append(sensor)
 
     # ---- public API
-    def request_initialization(self, sensor, params):
+    def request_initialization(self, sensor: object, params: Dict[str, Any]) -> None:
         """Queue a full computation job for a sensor."""
         self._enqueue_full(sensor, dict(params))
 
-    def request_recompute(self, sensor, params):
+    def request_recompute(self, sensor: object, params: Dict[str, Any]) -> None:
         """Queue a full recompute job for a sensor."""
         self._enqueue_full(sensor, dict(params))
 
-    @Slot(object, int, int, object)
-    def process_subap(self, sensor, k, job_id, params):
+    @Slot(object, int, int)
+    def request_subap(self, sensor: object, k: int, job_id: int) -> None:
         """Queue a per-actuator measurement for a sensor."""
-        # NOTE: params is stored from the last full compute; we ignore it here.
         self._enqueue_subap(sensor, k, job_id)
 
+    # Backwards-compatible slot (older code passed a params arg; we ignore it).
+    @Slot(object, int, int, object)
+    def process_subap(self, sensor: object, k: int, job_id: int, _params: object = None) -> None:
+        self.request_subap(sensor, k, job_id)
+
+    # Optional cleanup hook if tabs/sensors are destroyed.
+    def drop_sensor(self, sensor: object) -> None:
+        with self._pending_lock:
+            self._full_params.pop(sensor, None)
+            self._subap_req.pop(sensor, None)
+            self._full_live.discard(sensor)
+            self._subap_live.discard(sensor)
+        self._sensor_data.pop(sensor, None)
+
     # ---- main loop
-    def _process_one(self):
+    def _process_one(self) -> None:
         """Process a single pending job (full jobs are higher priority)."""
         sensor = None
         full_params = None
@@ -157,13 +153,14 @@ class CalculateWorker(QObject):
 
         if full_params is not None:
             self._do_full_compute(sensor, full_params)
-        elif subap is not None:
+            return
+
+        if subap is not None:
             k, job_id = subap
             self._process_single_subap(sensor, k, job_id)
 
     # ---- heavy jobs
-        
-    def _do_full_compute(self, sensor, params: Dict[str, Any]):
+    def _do_full_compute(self, sensor: object, params: Dict[str, Any]) -> None:
         """Perform full (re)initialization for one sensor.
 
         Uses *lazy* actuator influence maps to avoid allocating an (n_act, N, N) cube on GPU.
@@ -178,25 +175,75 @@ class CalculateWorker(QObject):
             # Pupil on GPU (float32 to reduce memory/bandwidth)
             pupil = cp.asarray(
                 ut.Pupil_tools.generate_pupil(
-                    grid_size=grid_size, telescope_center_obscuration=obsc, dtype=cp.float32
+                    grid_size=grid_size,
+                    telescope_center_obscuration=obsc,
+                    dtype=cp.float32,
                 ),
                 dtype=cp.float32,
             )
 
-            # Ensure sensor uses this pupil/grid and rebuilds its cached geometry
-            try:
-                sensor.recompute(
-                    n_sub=int(params.get('sub_apertures')),
-                    wavelength=float(params.get('wfs_lambda')),
-                    pupil=pupil,
-                    grid_size=grid_size,
-                )
-            except Exception:
-                # Older sensors may not accept pupil/grid_size on recompute; fall back to direct assignment.
+            # Ensure sensor uses this pupil/grid and rebuilds cached geometry
+            n_sub = int(params.get("sub_apertures"))
+            wfs_lambda = float(params.get("wfs_lambda"))
+
+            # Optional per-sensor geometry (safe to omit if absent).
+            recompute_kwargs: Dict[str, Any] = {
+                "n_sub": n_sub,
+                "wavelength": wfs_lambda,
+            }
+            for k in (
+                "dx",
+                "dy",
+                "gs_range_m",
+                "lgs_launch_offset_px",
+                "lgs_thickness_m",
+                "lenslet_f_m",
+                "pixel_pitch_m",
+            ):
+                if k in params and params[k] is not None:
+                    recompute_kwargs[k] = params[k]
+
+            recomputed = False
+            # Try most feature-complete signature first; progressively fall back for older/alternate sensors.
+            for extra in ({"pupil": pupil, "grid_size": grid_size}, {},):
+                if recomputed:
+                    break
+                try:
+                    sensor.recompute(**recompute_kwargs, **extra)
+                    recomputed = True
+                except TypeError:
+                    # Some implementations may use different kw names; try common alternatives.
+                    try:
+                        alt = dict(recompute_kwargs)
+                        alt["sub_apertures"] = alt.pop("n_sub")
+                        alt["wfs_lambda"] = alt.pop("wavelength")
+                        sensor.recompute(**alt, **extra)
+                        recomputed = True
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if not recomputed:
+                # Final fallback: set essentials manually and rebuild apertures if supported.
                 sensor.pupil = pupil
                 sensor.grid_size = grid_size
+                for attr, val in (
+                    ("n_sub", n_sub),
+                    ("sub_apertures", n_sub),
+                    ("wavelength", wfs_lambda),
+                    ("wfs_lambda", wfs_lambda),
+                ):
+                    if hasattr(sensor, attr):
+                        try:
+                            setattr(sensor, attr, val)
+                        except Exception:
+                            pass
                 if hasattr(sensor, "regen_sub_apertures"):
-                    sensor.regen_sub_apertures()
+                    try:
+                        sensor.regen_sub_apertures()
+                    except Exception:
+                        pass
 
             # Actuator centers and lazy influence-map getter
             act_centers = ut.Pupil_tools.generate_actuators(
@@ -216,9 +263,11 @@ class CalculateWorker(QObject):
             )
 
             # Geometry for plotting (CPU)
-            sub_aps = _to_numpy(getattr(sensor, "sub_aps", np.zeros((0, 2), dtype=np.float32))).astype(np.float32, copy=False)
+            sub_aps = _to_numpy(getattr(sensor, "sub_aps", np.zeros((0, 2), dtype=np.float32))).astype(
+                np.float32, copy=False
+            )
 
-            # Reference centroids 
+            # Reference centroids
             N = int(pupil.shape[0])
             zero_phase = cp.zeros((1, N, N), dtype=cp.float32)
             centroids_ref, _slopes_ref, _ = sensor.measure(
@@ -236,14 +285,13 @@ class CalculateWorker(QObject):
                 phase_map=cp.zeros_like(pupil, dtype=cp.float32),
                 pad=science_pad,
             )
-
             ref_fwhm = float(self._compute_img_fwhm(ref_science_img, params))
 
-            # Plot: normalize in-place to reduce temporaries
-            ref_science_img /= ref_science_img.sum()
-            ref_plot = cp.log10(
-                ref_science_img[science_pad:-science_pad, science_pad:-science_pad] + 1e-12
-            ).astype(cp.float32, copy=False)
+            # Plot (normalize in-place)
+            ref_science_img = cp.log10(ref_science_img / ref_science_img.max() + cp.float32(1e-12)) * cp.float32(10.0)
+            ref_plot = ref_science_img[science_pad:-science_pad, science_pad:-science_pad].astype(
+                cp.float32, copy=False
+            )
             ref_plot_cpu = cp.asnumpy(ref_plot)
 
             pupil_mask_cpu = cp.asnumpy(pupil > 0)
@@ -256,9 +304,8 @@ class CalculateWorker(QObject):
                 "pupil_mask": pupil_mask_cpu,
                 "ref_science_plot": ref_plot_cpu,
                 "ref_fwhm": ref_fwhm,
-                "diff_lim": float(1.22 * float(params["science_lambda"]) / float(params["telescope_diameter"])),
+                "diff_lim": float(1.22 * float(params["wfs_lambda"]) / float(params["telescope_diameter"])),
             }
-            self.initialized_result.emit(sensor, res)
 
             # Save shared data for per-actuator jobs
             self._sensor_data[sensor] = {
@@ -269,12 +316,16 @@ class CalculateWorker(QObject):
                 "science_pad": science_pad,
             }
 
+            self.initialized_result.emit(sensor, res)
+
         except Exception:
             import traceback
-            traceback.print_exc()
 
-        
-    def _process_single_subap(self, sensor, k: int, job_id: int):
+            traceback.print_exc()
+            self._sensor_data.pop(sensor, None)
+            self.initialized_result.emit(sensor, {"error": "exception"})
+
+    def _process_single_subap(self, sensor: object, k: int, job_id: int) -> None:
         """Perform per-actuator measurement + science image on the worker thread."""
         try:
             data = self._sensor_data.get(sensor)
@@ -299,12 +350,12 @@ class CalculateWorker(QObject):
                 pad=pad_fp,
                 return_image=True,
             )
-
             centroids_single = (_to_numpy(centroids[0]) - float(pad_fp)).astype(np.float32, copy=False)
             subap_image = _to_numpy(sensor_images[0])
 
             # Science image (heavy) on GPU
-            influence_phase_scale = np.float32(4.0 * np.pi / float(params.get("science_lambda")))
+            sci_lambda = float(params.get("science_lambda") or params.get("wfs_lambda"))
+            influence_phase_scale = np.float32(4.0 * np.pi / sci_lambda)
             influence_map_phase = influence_map * influence_phase_scale
 
             science_img, strehl = ut.Analysis.generate_science_image(
@@ -315,10 +366,8 @@ class CalculateWorker(QObject):
             img_fwhm = float(self._compute_img_fwhm(science_img, params))
 
             # Plot (normalize in-place)
-            science_img /= science_img.sum()
-            science_plot = cp.log10(
-                science_img[science_pad:-science_pad, science_pad:-science_pad] + 1e-12
-            ).astype(cp.float32, copy=False)
+            science_img = cp.log10(science_img / science_img.max() + cp.float32(1e-12)) * cp.float32(10.0)
+            science_plot = science_img[science_pad:-science_pad, science_pad:-science_pad].astype(cp.float32, copy=False)
             science_plot_cpu = cp.asnumpy(science_plot)
 
             influence_map_cpu = cp.asnumpy(influence_map)
@@ -333,18 +382,22 @@ class CalculateWorker(QObject):
                     "img_fwhm": img_fwhm,
                     "influence_map": influence_map_cpu,
                 },
-                job_id,
+                int(job_id),
             )
 
         except Exception:
             import traceback
+
             traceback.print_exc()
-            self.subap_finished.emit(sensor, {"error": "exception"}, job_id)
+            self.subap_finished.emit(sensor, {"error": "exception"}, int(job_id))
 
     @staticmethod
     def _compute_img_fwhm(science_image: cp.ndarray, params: Dict[str, Any]) -> float:
         plate_rad = (
-            float(params["science_lambda"]) * float(params["grid_size"]) /
-            (float(params["telescope_diameter"]) * float(science_image.shape[0]))
+            float(params["wfs_lambda"]) * float(params["grid_size"])
+            / (float(params["telescope_diameter"]) * float(science_image.shape[0]))
         )
-        return plate_rad * float(ut.Analysis.fwhm_radial(science_image))
+        gaussian_fitter = Gaussian2DFitter(roi_half=32, dtype=cp.float32)
+        zoomed = Analysis._zoom2d(science_image, 4, cp.get_array_module(science_image))
+        fwhm = gaussian_fitter.fit_frame(zoomed, zoom=4)[2][0]
+        return plate_rad * float(fwhm)

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import aotools
 import cupy as cp
 import numpy as np
@@ -9,10 +10,18 @@ import math
 # -----------------------------
 # Config / parameter management
 # -----------------------------
-with open(Path(__file__).parent.parent / "config_default.json", "r") as f:
-    config = json.load(f)
+_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config_default.json"
+try:
+    with open(_DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+except FileNotFoundError:
+    # Allow importing utilities in isolation (e.g., unit tests) without the repo config file.
+    config = {}
+except json.JSONDecodeError as e:
+    raise RuntimeError(f"Failed to parse {_DEFAULT_CONFIG_PATH}: {e}") from e
 
 params = config.copy()
+rootdir = Path(__file__).parent.parent
 
 def set_params(new_params):
     """Update module-level params (used as defaults when explicit args are None)."""
@@ -25,7 +34,6 @@ def set_params(new_params):
 _XY_CACHE = {}          # (device, grid_size, dtype) -> (y_col, x_row)
 _PUPIL_CACHE = {}       # (device, grid_size, obsc, dtype) -> pupil
 _SCIENCE_I0PEAK = {}    # (device, grid_size, obsc, pad, science_lambda, dtype) -> float
-_RADIAL_CACHE = {}      # (backend, shape) -> (r_int, radial_cnt)
 _SUBAP_GEOM_CACHE = {}  # (device, n_sub, grid_size, obsc) -> dict geometry (for SH)
 
 def _device_id():
@@ -33,6 +41,18 @@ def _device_id():
         return int(cp.cuda.runtime.getDevice())
     except Exception:
         return 0
+
+def _array_ptr(a) -> int:
+    """Best-effort stable-ish pointer/id for caching.
+
+    For CuPy arrays this is the device pointer; for NumPy arrays it's the Python id.
+    """
+    try:
+        # CuPy: a.data.ptr exists.
+        return int(a.data.ptr)  # type: ignore[attr-defined]
+    except Exception:
+        return int(id(a))
+
 
 def _get_xy(grid_size: int, dtype=cp.float32):
     """Return (y[:,1], x[1,:]) grids on GPU for a given grid_size."""
@@ -374,7 +394,7 @@ class Analysis:
         # cache only when pupil matches default params (most common)
         grid_size = int(pupil.shape[0])
         obsc = float(params.get("telescope_center_obscuration"))
-        key = (_device_id(), int(getattr(pupil, "data", type("x",(object,),{"ptr":0})()).ptr), grid_size, int(pad), float(science_lambda), pupil.dtype)
+        key = (_device_id(), _array_ptr(pupil), grid_size, int(pad), float(science_lambda), str(pupil.dtype))
         peak = _SCIENCE_I0PEAK.get(key)
         if peak is not None:
             return peak
@@ -434,49 +454,400 @@ class Analysis:
 
     @staticmethod
     def fwhm_radial(I):
-        """
-        Compute Full Width Half Max of a given image.
+        """Compute PSF FWHM (in pixels) from the azimuthally-averaged radial profile.
         """
         xp = cp.get_array_module(I)
-        shape = tuple(I.shape)
-        backend = "cupy" if xp is cp else "numpy"
+        I = xp.asarray(I)
 
-        cached = _RADIAL_CACHE.get((backend, shape))
-        if cached is None:
-            ny, nx = shape
-            cy, cx = ny // 2, nx // 2
-            y, x = xp.indices(shape)
-            r = xp.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        # center on peak
+        p = int(xp.argmax(I))
+        y0, x0 = xp.unravel_index(p, I.shape)
+        I0 = float(I[y0, x0])
+        if I0 <= 0:
+            return float("nan")
 
-            r_int = r.ravel().astype(xp.int32)
-            max_r = int(r_int.max()) + 1
+        y, x = xp.indices(I.shape)
+        r = xp.sqrt((x - x0) ** 2 + (y - y0) ** 2).astype(xp.float32)
 
-            radial_cnt = xp.bincount(r_int, minlength=max_r)
-            _RADIAL_CACHE[(backend, shape)] = (r_int, radial_cnt)
-            cached = (r_int, radial_cnt)
+        r0 = xp.floor(r).astype(xp.int32)
+        w1 = (r - r0).astype(xp.float32)      # weight to r0+1
+        w0 = (1.0 - w1).astype(xp.float32)    # weight to r0
 
-        r_int, radial_cnt = cached
+        max_r = int(r0.max()) + 2
+        I_flat = I.ravel().astype(xp.float32)
+        r0f = r0.ravel()
+        w0f = w0.ravel()
+        w1f = w1.ravel()
 
-        I_flat = I.ravel()
-        max_r = int(radial_cnt.shape[0])
+        # weighted sums to bins r0 and r0+1
+        sum0 = xp.bincount(r0f, weights=I_flat * w0f, minlength=max_r)
+        sum1 = xp.bincount(r0f + 1, weights=I_flat * w1f, minlength=max_r)
+        cnt0 = xp.bincount(r0f, weights=w0f, minlength=max_r)
+        cnt1 = xp.bincount(r0f + 1, weights=w1f, minlength=max_r)
 
-        radial_sum = xp.bincount(r_int, weights=I_flat, minlength=max_r)
-        # avoid div-by-zero (shouldn't happen but safe)
-        radial_prof = radial_sum / xp.where(radial_cnt == 0, 1, radial_cnt)
+        radial_sum = sum0 + sum1
+        radial_cnt = cnt0 + cnt1
+        prof = radial_sum / xp.maximum(radial_cnt, 1e-12)
 
-        # normalize to peak
-        radial_prof = radial_prof / radial_prof[0]
+        # normalize to peak (use I0, not prof[0], to avoid bin artifacts)
+        prof = prof / I0
 
-        # find half-maximum
-        half = 0.5
-        idx = int(xp.where(radial_prof <= half)[0][0])
+        # light smoothing to avoid ring-induced early crossings
+        prof = (prof + xp.roll(prof, 1) + xp.roll(prof, -1)) / 3.0
 
-        # linear interpolation
+        # enforce a non-increasing envelope (robust to rings)
+        out = prof.copy()
+        n = int(out.size)
+        stride = 1
+        while stride < n:
+            shifted = xp.empty_like(out)
+            shifted[:stride] = xp.inf
+            shifted[stride:] = out[:-stride]
+            out = xp.minimum(out, shifted)
+            stride <<= 1
+
+        prof_mono = out
+        idxs = xp.where(prof_mono <= 0.5)[0]
+        if idxs.size == 0:
+            return float("nan")
+        idx = int(idxs[0])
+        if idx == 0:
+            return 0.0
+
         r1, r2 = idx - 1, idx
-        y1, y2 = radial_prof[r1], radial_prof[r2]
-        r_half = r1 + (half - y1) / (y2 - y1)
+        y1, y2 = float(prof_mono[r1]), float(prof_mono[r2])
+        if y2 == y1:
+            r_half = float(r2)
+        else:
+            r_half = r1 + (0.5 - y1) / (y2 - y1)
 
         return 2.0 * float(r_half)
+
+    @staticmethod
+    def _zoom2d(I, factor, xp):
+        """Upsample by 'factor' using bilinear zoom if available, else nearest-neighbor repeat."""
+        if factor == 1:
+            return I
+        try:
+            if xp is cp:
+                from cupyx.scipy.ndimage import zoom
+            else:
+                from scipy.ndimage import zoom
+            return zoom(I, factor, order=1)  # bilinear
+        except Exception:
+            f = int(factor)
+        return xp.repeat(xp.repeat(I, f, axis=0), f, axis=1)
+
+    def fwhm_contour(
+        psf,
+        pixelScale,          # e.g. mas/pix (recommended)
+        rebin=1,             # upsample factor
+        min_pts=30,          # required number of half-max pixels
+        bg_percentile=1.0,   # background estimate from low percentile of image (robust for cropped PSFs)
+        use_bg=True,
+        return_ratio_theta=True,
+    ):
+        """
+        Contour FWHM using the half-maximum region.
+        Uses upsampling (rebin) to reduce discretization.
+
+        Returns:
+        if return_ratio_theta:
+            (fwhm_major, fwhm_minor, aRatio, theta_deg)
+        else:
+            (fwhm_major, fwhm_minor)
+        """
+        xp = cp.get_array_module(psf)
+        I0 = xp.asarray(psf).astype(xp.float32, copy=False)
+
+        # Upsample
+        r = int(rebin) if rebin is not None else 1
+        r = max(r, 1)
+        I = Analysis._zoom2d(I0, r, xp)
+
+        peak = float(xp.max(I).item())
+        if peak <= 0:
+            out = (float("nan"),) * (4 if return_ratio_theta else 2)
+            return out
+
+        # Background estimate (low percentile is safer than "outer ring" for cropped long-PSFs)
+        if use_bg:
+            try:
+                B = float(xp.percentile(I, bg_percentile).item())
+            except Exception:
+                # percentile can be slow/unsupported in some builds; fallback to min
+                B = float(xp.min(I).item())
+            level = B + 0.5 * (peak - B)
+            mask = I >= level
+            if int(mask.sum()) < min_pts:
+                # fallback to absolute half-peak
+                level = 0.5 * peak
+                mask = I >= level
+        else:
+            level = 0.5 * peak
+            mask = I >= level
+
+        n = int(mask.sum())
+        if n < min_pts:
+            out = (float("nan"),) * (4 if return_ratio_theta else 2)
+            return out
+
+        ys, xs = xp.nonzero(mask)
+        xs = xs.astype(xp.float32)
+        ys = ys.astype(xp.float32)
+
+        # center: bbox midpoint of the contour region
+        cx = 0.5 * (float(xs.min().item()) + float(xs.max().item()))
+        cy = 0.5 * (float(ys.min().item()) + float(ys.max().item()))
+        dx = xs - cx
+        dy = ys - cy
+
+        # PCA for orientation
+        dx0 = dx - xp.mean(dx)
+        dy0 = dy - xp.mean(dy)
+        cxx = xp.mean(dx0 * dx0)
+        cyy = xp.mean(dy0 * dy0)
+        cxy = xp.mean(dx0 * dy0)
+
+        cov = xp.array([[cxx, cxy],
+                        [cxy, cyy]], dtype=xp.float32)
+        evals, evecs = xp.linalg.eigh(cov)
+
+        # major axis direction = eigenvector with larger eigenvalue
+        u = evecs[:, 1]
+        v = evecs[:, 0]
+
+        pu = dx0 * u[0] + dy0 * u[1]
+        pv = dx0 * v[0] + dy0 * v[1]
+
+        # semi-axes in UPSAMPLED pixels
+        a = 0.5 * float((pu.max() - pu.min()).item())
+        b = 0.5 * float((pv.max() - pv.min()).item())
+        if a < b:
+            a, b = b, a
+            u = v
+
+        # Convert back to ORIGINAL pixels by dividing by rebin, then to angular units
+        fwhm_major = (2.0 * a / r) * float(pixelScale)
+        fwhm_minor = (2.0 * b / r) * float(pixelScale)
+
+        if not return_ratio_theta:
+            return fwhm_major, fwhm_minor
+
+        aRatio = fwhm_major / max(fwhm_minor, 1e-12)
+        theta_deg = float((xp.arctan2(u[1], u[0]) * 180.0 / xp.pi).item())
+        return fwhm_major, fwhm_minor, aRatio, theta_deg
+
+    # ---------- Long Exposure PSF ----------
+    class PSFRingMean:
+        def __init__(self, shape, K, dtype=cp.float32, save_path=rootdir / "output" / "psf", save_label = ""):
+            self.K = int(K)
+            self.shape = shape
+            self.dtype = dtype
+            self.buf = cp.zeros((self.K, *shape), dtype=dtype)
+            self.sum = cp.zeros(shape, dtype=dtype)
+            self.i = 0
+            self.n = 0
+
+            self.first_save = False
+            self.save_path = save_path / (str(id(self)) + save_label)
+
+        def add(self, I):
+            I = cp.asarray(I, dtype=self.buf.dtype)
+            if self.n < self.K:
+                self.buf[self.i] = I
+                self.sum += I
+                self.n += 1
+            else:
+                old = self.buf[self.i].copy()
+                self.buf[self.i] = I
+                self.sum += I - old
+
+            if not self.first_save and self.n == self.K:
+                self.save_frames_to_file()
+                self.first_save = True
+
+            self.i = (self.i + 1) % self.K
+
+        def mean(self):
+            return self.sum / max(self.n, 1)
+        
+        def reset(self):
+            self.buf = cp.zeros((self.K, * self.shape), dtype=self.dtype)
+            self.sum = cp.zeros(self.shape, dtype=self.dtype)
+            self.i = 0
+            self.n = 0
+
+        def _ordered_indices(self, last=None):
+            """Indices into self.buf that yield frames in chronological order (oldest -> newest)."""
+            n = self.n
+            if n == 0:
+                return []
+            m = n if last is None else int(min(max(last, 1), n))
+
+            # self.i points to next write position.
+            # The oldest frame among the last m frames starts at (self.i - m) modulo K.
+            start = (self.i - m) % self.K
+            return [(start + k) % self.K for k in range(m)]
+
+        @staticmethod
+        def _to_uint8(frame_cp, vmin, vmax):
+            """Scale float frame to uint8 [0,255] on GPU, then return numpy."""
+            denom = (vmax - vmin)
+            if denom <= 0:
+                u = cp.zeros(frame_cp.shape, dtype=cp.uint8)
+            else:
+                g = (frame_cp - vmin) / denom
+                g = cp.clip(g, 0.0, 1.0)
+                u = (g * 255.0 + 0.5).astype(cp.uint8)
+            return cp.asnumpy(u)
+
+        def _display(self, I_cp, log10=True, eps=1e-12):
+            I_cp = I_cp.astype(cp.float32, copy=False)
+            if log10:
+                return cp.log10(cp.maximum(I_cp, eps))
+            return I_cp
+        
+        def pad_to_16(self, u8):
+            H, W = u8.shape[:2]
+            H2 = (H + 15) // 16 * 16
+            W2 = (W + 15) // 16 * 16
+            if (H2, W2) == (H, W):
+                return u8
+            if u8.ndim == 2:
+                out = np.zeros((H2, W2), dtype=u8.dtype)
+                out[:H, :W] = u8
+            else:
+                out = np.zeros((H2, W2, u8.shape[2]), dtype=u8.dtype)
+                out[:H, :W, :] = u8
+            return out
+        
+        @staticmethod
+        def _get_writer(path, fps, codec="libx264"):
+            import imageio.v2 as imageio
+
+            path_l = path.lower()
+            if path_l.endswith(".gif"):
+                return imageio.get_writer(Path(path), mode="I", duration=1.0 / float(fps))
+            elif path_l.endswith(".mp4"):
+                return imageio.get_writer(Path(path), fps=fps, codec=codec)
+            else:
+                raise ValueError("Unsupported extension. Use .gif or .mp4")
+
+        def save_frames_to_file(
+            self,
+            raw_path = None,
+            mean_path = None,
+            last=None,
+            fps=30,
+            log10=True,
+            norm="global",              # "global" or "per_frame"
+            clip_percentiles=(1.0, 99.7),
+            eps=1e-12,
+            codec="libx264",
+            save_type = ".mp4",
+            mean_mode="ring",           # "ring" (sliding K) or "cumulative"
+            rgb_for_mp4=True,
+        ):
+            """
+            Writes two animations:
+            - raw_path: raw frames
+            - mean_path: mean frames over time (sliding window by default)
+
+            """
+            if raw_path is None:
+                raw_path = str(self.save_path)+ "_raw"
+            if mean_path is None:
+                mean_path = str(self.save_path)+ "_mean"
+
+
+            idxs = self._ordered_indices(last=last)
+            if not idxs:
+                raise ValueError("No frames to save (buffer is empty).")
+
+            p_lo, p_hi = clip_percentiles
+
+            def frame_percentiles(F_cp):
+                vmin = float(cp.percentile(F_cp, p_lo).item())
+                vmax = float(cp.percentile(F_cp, p_hi).item())
+                return vmin, vmax
+
+            # ---------- Pass 1: determine scaling if norm="global" ----------
+            if norm == "global":
+                # RAW scaling
+                raw_vmin = +np.inf
+                raw_vmax = -np.inf
+                for j in idxs:
+                    F = self._display(self.buf[j], log10=log10, eps=eps)
+                    vmin, vmax = frame_percentiles(F)
+                    raw_vmin = min(raw_vmin, vmin)
+                    raw_vmax = max(raw_vmax, vmax)
+
+                # MEAN scaling
+                mean_vmin = +np.inf
+                mean_vmax = -np.inf
+                sum_cp = cp.zeros(self.shape, dtype=cp.float32)
+                for t, j in enumerate(idxs):
+                    sum_cp += self.buf[j].astype(cp.float32, copy=False)
+                    if mean_mode == "ring" and t >= self.K:
+                        sum_cp -= self.buf[idxs[t - self.K]].astype(cp.float32, copy=False)
+                        denom = float(self.K)
+                    else:
+                        denom = float(t + 1)
+                    mean_cp = sum_cp / denom
+                    Fm = self._display(mean_cp, log10=log10, eps=eps)
+                    vmin, vmax = frame_percentiles(Fm)
+                    mean_vmin = min(mean_vmin, vmin)
+                    mean_vmax = max(mean_vmax, vmax)
+            elif norm == "per_frame":
+                raw_vmin = raw_vmax = mean_vmin = mean_vmax = None
+            else:
+                raise ValueError('norm must be "global" or "per_frame"')
+
+            # ---------- Pass 2: write both animations ----------
+            w_raw  = self._get_writer(str(raw_path)  + save_type, fps=fps, codec=codec)
+            w_mean = self._get_writer(str(mean_path) + save_type, fps=fps, codec=codec)
+
+            try:
+                sum_cp = cp.zeros(self.shape, dtype=cp.float32)
+
+                for t, j in enumerate(idxs):
+                    # --- RAW frame ---
+                    Fr = self._display(self.buf[j], log10=log10, eps=eps)
+                    if norm == "per_frame":
+                        rvmin, rvmax = frame_percentiles(Fr)
+                    else:
+                        rvmin, rvmax = raw_vmin, raw_vmax
+                    raw_u8 = self._to_uint8(Fr, rvmin, rvmax)
+
+                    # --- MEAN frame ---
+                    sum_cp += self.buf[j].astype(cp.float32, copy=False)
+                    if mean_mode == "ring" and t >= self.K:
+                        sum_cp -= self.buf[idxs[t - self.K]].astype(cp.float32, copy=False)
+                        denom = float(self.K)
+                    else:
+                        denom = float(t + 1)
+                    mean_cp = sum_cp / denom
+
+                    Fm = self._display(mean_cp, log10=log10, eps=eps)
+                    if norm == "per_frame":
+                        mvmin, mvmax = frame_percentiles(Fm)
+                    else:
+                        mvmin, mvmax = mean_vmin, mean_vmax
+                    mean_u8 = self._to_uint8(Fm, mvmin, mvmax)
+
+                    # MP4 generally expects RGB; GIF is fine with grayscale too
+                    if rgb_for_mp4 and raw_path.lower().endswith(".mp4"):
+                        raw_u8 = np.stack([raw_u8, raw_u8, raw_u8], axis=-1)
+                    if rgb_for_mp4 and mean_path.lower().endswith(".mp4"):
+                        mean_u8 = np.stack([mean_u8, mean_u8, mean_u8], axis=-1)
+
+                    w_raw.append_data(self.pad_to_16(raw_u8))
+                    w_mean.append_data(self.pad_to_16(mean_u8))
+            finally:
+                w_raw.close()
+                w_mean.close()
+
 
 # -----------------------------
 # WFS tools
@@ -994,7 +1365,15 @@ class WFSensor_tools:
             return yrel, xrel
 
 
-        def measure(self, pupil=None, phase_map=None, pad=None, return_image=True):
+        def measure(
+            self,
+            pupil=None,
+            phase_map=None,
+            pad=None,
+            return_image=True,
+            assume_radians: bool | None = None,
+            method: str = "fft",
+        ):
             """
             Returns:
             centroids: (n_map, n_sub_active, 2) in subap-padded pixel coords
@@ -1013,6 +1392,9 @@ class WFSensor_tools:
 
             if phase_map.ndim == 2:
                 phase_map = phase_map[None, :, :]
+
+            phase_map = phase_map.copy() * (500e-9/self.wavelength) 
+            # if sensor is not default 500nm, multiply 500nm phase map to scale properly
             phase_map = phase_map.astype(cp.float32, copy=False)
 
             n_map = int(phase_map.shape[0])
@@ -1020,12 +1402,94 @@ class WFSensor_tools:
             # (n_map, n_sub, h, w)
             sub_phase = phase_map[:, self.ys, self.xs]
             sub_phase *= self.sub_pupils[None, :, :, :]
-
             # radians (WFS wavelength)
-            if cp.max(phase_map) == params.get("poke_amplitude"):
+            # NOTE: cp.max(...) forces a device sync. Avoid it by passing assume_radians explicitly.
+            if assume_radians is None:
+                if cp.max(phase_map) == params.get("poke_amplitude"):
+                    scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
+                    sub_phase *= scale
+            elif not assume_radians:
                 scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
                 sub_phase *= scale
 
+            method = str(method).lower().strip()
+
+            if method == "southwell":
+                # weighted mean phase at each active lenslet center
+                w = cp.asarray(self.sub_pupils, dtype=cp.float32)              # (n_active,h,w)
+                wsum = cp.sum(w, axis=(1, 2)).astype(cp.float32)              # (n_active,)
+                phi_act = cp.sum(sub_phase, axis=(2, 3)) / (wsum[None, :] + cp.float32(1e-12))  # (n_map,n_active)
+
+                # active lenslet indices (row,col) on the lenslet grid
+                idx = cp.asarray(self.sub_aps_idx)
+                if idx.ndim == 2 and idx.shape[1] == 2:
+                    rr = idx[:, 0].astype(cp.int32, copy=False)
+                    cc = idx[:, 1].astype(cp.int32, copy=False)
+                    nsub = int(cp.max(idx).item()) + 1
+                else:
+                    # Fallback if you store r/c separately
+                    rr = cp.asarray(getattr(self, "sub_aps_rr"), dtype=cp.int32)
+                    cc = cp.asarray(getattr(self, "sub_aps_cc"), dtype=cp.int32)
+                    nsub = int(getattr(self, "sub_aps", 0) or (int(cp.max(cp.stack([rr, cc])).item()) + 1))
+
+                # lenslet pitch in pixels on the pupil grid
+                M = int(getattr(self, "grid_size", sub_phase.shape[-1]))
+                pitch = float(M) / float(nsub)
+
+                # build full lenslet-center phase grid (NaN where inactive)
+                phi_g = cp.full((n_map, nsub, nsub), cp.nan, dtype=cp.float32)
+                phi_g[:, rr, cc] = phi_act
+
+                finite = cp.isfinite(phi_g)
+
+                # x neighbors
+                cur = phi_g
+                left = cp.roll(phi_g, 1, axis=2)
+                right = cp.roll(phi_g, -1, axis=2)
+                left_ok = finite & cp.roll(finite, 1, axis=2)
+                right_ok = finite & cp.roll(finite, -1, axis=2)
+
+                c_idx = cp.arange(nsub, dtype=cp.int32)[None, None, :]
+                left_ok &= (c_idx != 0)                 # prevent wrap
+                right_ok &= (c_idx != (nsub - 1))
+
+                both = left_ok & right_ok
+                only_r = right_ok & ~left_ok
+                only_l = left_ok & ~right_ok
+
+                sx = cp.zeros_like(phi_g, dtype=cp.float32)
+                sx = cp.where(both, (right - left) / (cp.float32(2.0 * pitch)), sx)
+                sx = cp.where(only_r, (right - cur) / (cp.float32(pitch)), sx)
+                sx = cp.where(only_l, (cur - left) / (cp.float32(pitch)), sx)
+
+                # y neighbors
+                up = cp.roll(phi_g, 1, axis=1)          # (r-1)
+                down = cp.roll(phi_g, -1, axis=1)       # (r+1)
+                up_ok = finite & cp.roll(finite, 1, axis=1)
+                down_ok = finite & cp.roll(finite, -1, axis=1)
+
+                r_idx = cp.arange(nsub, dtype=cp.int32)[None, :, None]
+                up_ok &= (r_idx != 0)
+                down_ok &= (r_idx != (nsub - 1))
+
+                bothy = up_ok & down_ok
+                only_d = down_ok & ~up_ok
+                only_u = up_ok & ~down_ok
+
+                sy = cp.zeros_like(phi_g, dtype=cp.float32)
+                sy = cp.where(bothy, (down - up) / (cp.float32(2.0 * pitch)), sy)
+                sy = cp.where(only_d, (down - cur) / (cp.float32(pitch)), sy)
+                sy = cp.where(only_u, (cur - up) / (cp.float32(pitch)), sy)
+
+                # extract only active lenslets back into (n_map,n_active)
+                sy_act = sy[:, rr, cc]
+                sx_act = sx[:, rr, cc]
+                slopes =  cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
+
+                centroids = cp.zeros_like(slopes)
+                return centroids, slopes, None
+
+            # ---------------- full FFT model ----------------
             # complex pupil field
             field = cp.exp(1j * sub_phase).astype(cp.complex64, copy=False)
             field *= self.sub_pupils[None, :, :, :]
@@ -1137,6 +1601,240 @@ class WFSensor_tools:
         def measure(self, phase):
             # TODO
             return
+
+class Gaussian2DFitter:
+    """
+    Robust LM (IRLS) fit of 2D Gaussian + constant background on GPU,
+    Optional tracking that recenters ROI from the brightest pixel.
+
+    fit_frame() returns:
+    p = [A, x0, y0, sx, sy, theta, b0]   - Fitted Gaussian Parameters
+    (xc, yc)   - Gaussian coordinates in full image
+    (fwhm_eq, fwhm_x, fwhm_y)   -  FWHM parameters in full image
+    roi   - zoomed / roi image
+    (x0, y0)   - zoomed / roi origin coordinates in full image
+    (fwhm_eq_zoom, fwhm_x_zoom, fwhm_y_zoom)   - FWHM parameters in zoomed / roi image
+    """
+
+    def __init__(self, roi_half=32, dtype=cp.float32):
+        self.half = int(roi_half)
+        self.H = self.W = 2 * self.half
+        self.dtype = dtype
+
+        yy = cp.arange(self.H, dtype=dtype)
+        xx = cp.arange(self.W, dtype=dtype)
+        self.X, self.Y = cp.meshgrid(xx, yy)
+
+        self.I = cp.eye(5, dtype=dtype)
+        self.ones = cp.ones(self.H * self.W, dtype=dtype)
+
+        self.xc = None
+        self.yc = None
+        self.p_prev = None
+
+    @staticmethod
+    def _rho_prime(s, loss):
+        if loss == "linear":
+            return cp.ones_like(s)
+        if loss == "huber":
+            return cp.where(s <= 1.0, 1.0, 1.0 / cp.sqrt(s))
+        if loss == "soft_l1":
+            return 1.0 / cp.sqrt(1.0 + s)
+        if loss == "cauchy":
+            return 1.0 / (1.0 + s)
+        raise ValueError(loss)
+
+    @staticmethod
+    def _robust_scale_mad(r):
+        med = cp.median(r)
+        mad = cp.median(cp.abs(r - med)) + 1e-12
+        return (1.4826 * mad).astype(r.dtype) + 1e-6
+
+    def _model_and_jac(self, p):
+        A, x0, y0, s, b0 = p
+        s = cp.maximum(s, cp.asarray(1e-6, self.dtype))
+
+        dx = self.X - x0
+        dy = self.Y - y0
+        R2 = dx*dx + dy*dy
+
+        invs2 = 1.0 / (s*s)
+        E = cp.exp(-0.5 * R2 * invs2)
+        M = A * E + b0
+
+        # dE/dx0 = E * (dx / s^2), dE/dy0 = E * (dy / s^2)
+        dE_dx0 = E * (dx * invs2)
+        dE_dy0 = E * (dy * invs2)
+        # dE/ds = E * (R2 / s^3)
+        dE_ds  = E * (R2 / (s*s*s))
+
+        N = self.H * self.W
+        J = cp.empty((N, 5), dtype=self.dtype)
+        J[:, 0] = E.ravel()              # dM/dA
+        J[:, 1] = (A * dE_dx0).ravel()    # dM/dx0
+        J[:, 2] = (A * dE_dy0).ravel()    # dM/dy0
+        J[:, 3] = (A * dE_ds ).ravel()    # dM/ds
+        J[:, 4] = self.ones              # dM/db0
+        return M, J
+
+    def init_from_roi(self, Z):
+        Z = Z.astype(self.dtype, copy=False)
+        border = cp.concatenate([Z[0, :], Z[-1, :], Z[:, 0], Z[:, -1]])
+        b0 = cp.median(border)
+
+        Zp = cp.maximum(Z - b0, 0)
+        clip = cp.maximum(cp.max(Zp) * 0.2, cp.asarray(0, self.dtype))
+        Wgt = cp.minimum(Zp, clip)
+
+        Wsum = cp.sum(Wgt) + 1e-12
+        x0 = cp.sum(self.X * Wgt) / Wsum
+        y0 = cp.sum(self.Y * Wgt) / Wsum
+
+        dx = self.X - x0
+        dy = self.Y - y0
+        s = cp.sqrt(cp.sum(Wgt * (dx*dx + dy*dy)) / (2.0 * Wsum)) + 1e-6
+
+        A = cp.maximum(cp.max(Z) - b0, 0).astype(self.dtype)
+        return cp.array([A, x0, y0, s, b0], dtype=self.dtype)
+
+    def fit_roi(self, roi, p0=None, loss="soft_l1", max_iter=10, tol=1e-4, lam0=1e-2):
+        Z = cp.asarray(roi, dtype=self.dtype)
+        p = self.init_from_roi(Z) if p0 is None else cp.asarray(p0, dtype=self.dtype).copy()
+        lam = cp.asarray(lam0, dtype=self.dtype)
+
+        M, _ = self._model_and_jac(p)
+        fs = self._robust_scale_mad((M - Z).ravel())
+
+        for _ in range(max_iter):
+            M, J = self._model_and_jac(p)
+            r = (M - Z).ravel()
+
+            s2 = (r / fs) ** 2
+            rho_p = self._rho_prime(s2, loss)
+            w2 = rho_p / (fs * fs)
+
+            JW = J * w2[:, None]
+            Hn = J.T @ JW
+            gn = J.T @ (w2 * r)
+
+            Hn = Hn + lam * self.I
+            dp = -cp.linalg.solve(Hn, gn)
+
+            p_new = p + dp
+            p_new[3] = cp.maximum(p_new[3], cp.asarray(1e-6, self.dtype))  # s>0
+
+            M2, _ = self._model_and_jac(p_new)
+            r2 = (M2 - Z).ravel()
+
+            cost  = cp.sum(self._rho_prime((r / fs) ** 2, loss)  * (r  * r))
+            cost2 = cp.sum(self._rho_prime((r2 / fs) ** 2, loss) * (r2 * r2))
+
+            if cost2 < cost:
+                p = p_new
+                lam = cp.maximum(lam * 0.3, cp.asarray(1e-8, self.dtype))
+                if cp.linalg.norm(dp) < tol * (cp.linalg.norm(p) + tol):
+                    break
+            else:
+                lam = cp.minimum(lam * 5.0, cp.asarray(1e6, self.dtype))
+
+        return p
+
+
+    # ---------------- tracking helpers (brightest pixel) ----------------
+    def _brightest_px(self, img, search_r=24):
+        """
+        Returns (xc, yc) in img coordinates.
+        If we have a previous center, search in a (2r+1)x(2r+1) window around it.
+        Otherwise, use global argmax.
+        """
+        H, W = img.shape
+
+        if self.xc is None or self.yc is None:
+            idx = int(cp.argmax(img).get())
+            yc = idx // W
+            xc = idx %  W
+            return xc, yc
+
+        xc0, yc0 = self.xc, self.yc
+        r = int(search_r)
+
+        x1 = max(0, int(round(xc0 - r))); x2 = min(W, int(round(xc0 + r + 1)))
+        y1 = max(0, int(round(yc0 - r))); y2 = min(H, int(round(yc0 + r + 1)))
+
+        patch = img[y1:y2, x1:x2]
+        if patch.size == 0:
+            idx = int(cp.argmax(img).get())
+            yc = idx // W
+            xc = idx %  W
+            return xc, yc
+
+        idx = int(cp.argmax(patch).get())
+        ph, pw = patch.shape
+        dy = idx // pw
+        dx = idx %  pw
+        return (x1 + dx), (y1 + dy)
+
+    def _crop_roi(self, img, xc, yc):
+        """
+        Crop a fixed-size ROI centered at (xc,yc). Returns (roi, x0, y0)
+        where x0,y0 are the ROI origin in img coords.
+        """
+        H, W = img.shape
+        half = self.half
+
+        x0 = max(0, min(W - 2*half, int(round(xc - half))))
+        y0 = max(0, min(H - 2*half, int(round(yc - half))))
+
+        roi = img[y0:y0 + 2*half, x0:x0 + 2*half]
+        return roi, x0, y0
+
+    # ---------------- one-call tracking fit ----------------
+    def fit_frame(self, img, search_r=24, loss="soft_l1", max_iter=10, zoom=1):
+        """
+        img: full image (already zoomed if you use zooming)
+        zoom: set to your upsample factor for FWHM conversion back to native pixels
+
+        Returns:
+            p = [A, x0, y0, sx, sy, theta, b0]   - Fitted Gaussian Parameters,
+        \n    (xc, yc)   - Gaussian coordinates in full image,
+        \n    (fwhm_eq, fwhm)   -  FWHM parameters in full image,
+        \n    roi   - zoomed / roi image,
+        \n    (x0, y0)   - zoomed / roi origin coordinates in full image,
+        \n    (fwhm_eq_zoom, fwhm_zoom)   - FWHM parameters in zoomed / roi image
+        """
+        img = cp.asarray(img, dtype=self.dtype)
+
+        # 1) start from brightest pixel (global first time, local thereafter)
+        xc, yc = self._brightest_px(img, search_r=search_r)
+
+        # 2) crop ROI around brughtest pixel
+        roi, x0, y0 = self._crop_roi(img, xc, yc)
+
+        # 3) warm start: shift previous fit into this ROI coord frame
+        p0 = None
+        if self.p_prev is not None:
+            p0 = self.p_prev.copy()
+            # p = [A, x0, y0, ...] in ROI coords
+            p0[1] = xc - x0  # x in ROI coords
+            p0[2] = yc - y0  # y in ROI coords
+
+        # 4) fit
+        p = self.fit_roi(roi, p0=p0, loss=loss, max_iter=max_iter)
+        self.p_prev = p
+
+        # 5) update global center for next frame
+        self.xc = x0 + float(p[1].get())  # p[1]=x0 (ROI coords)
+        self.yc = y0 + float(p[2].get())  # p[2]=y0 (ROI coords)
+
+        # 6) FWHM (area-equivalent), convert back to native pixels if zoom>1
+        k = 2.354820045
+        fwhm_eq_zoom = k * cp.sqrt(p[3] * p[3])
+        fwhm = k * p[3]
+
+        fwhm_eq_native = fwhm_eq_zoom / float(zoom)
+        fwhm_native = fwhm / zoom
+
+        return p, (self.xc, self.yc), (fwhm_eq_native, fwhm_native), roi, (x0, y0), (fwhm_eq_zoom, fwhm)
 
 # -----------------------------
 # CLI

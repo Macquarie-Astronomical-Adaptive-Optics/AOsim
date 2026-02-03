@@ -16,6 +16,20 @@ from data.CONFIG_DTYPES import enforce_config_types
 ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
 RAD2ARCSEC = (180.0 * 3600.0) / 3.141592653589793
 
+# Keys that are sensor-specific and must NOT be overwritten by main/global config updates
+SENSOR_PARAM_KEYS = {
+    "sub_apertures",
+    "wfs_lambda",
+    "dx",
+    "dy",
+    "gs_range_m",
+    "lgs_launch_offset_px",
+    "lgs_thickness_m",
+    "lenslet_f_m",
+    "pixel_pitch_m",
+}
+
+
 class SensorTabWidget(QWidget):
     """
     WFS sensor tab using the shared calculate worker.
@@ -39,18 +53,7 @@ class SensorTabWidget(QWidget):
             )
 
         self.sensor = sensor
-        for key, val in self.sensor.__dict__.items():
-            self.params[key] = val
-
-        self.params["dx"] = self.sensor.dx * RAD2ARCSEC
-        self.params["dy"] = self.sensor.dy * RAD2ARCSEC
-        print(" -", self.sensor_name)
-
-        params["sub_apertures"] = self.sensor.n_sub
-        params["wfs_lambda"] = self.sensor.wavelength 
-        print("    ", self.sensor.n_sub, "sub apertures")
-        print("     at wavelength/lambda:", self.sensor.wavelength, "m")
-
+        self._seed_params_from_sensor()
         enforce_config_types(self.params)
 
         self.job_id = 0
@@ -91,6 +94,43 @@ class SensorTabWidget(QWidget):
         self._schedule_update(0)
         CalculateWorker.instance().request_initialization(self.sensor, self.params)
 
+        self.initialized = False
+
+    
+    def _seed_params_from_sensor(self) -> None:
+        """Initialize sensor-specific params from the provided sensor object."""
+        self.params["sub_apertures"] = int(getattr(self.sensor, "n_sub", self.params.get("sub_apertures") or 0))
+        self.params["wfs_lambda"] = float(getattr(self.sensor, "wavelength", self.params.get("wfs_lambda") or 500e-9))
+        # Sensor stores angles in radians; UI/config uses arcsec.
+        self.params["dx"] = float(getattr(self.sensor, "dx", 0.0)) * RAD2ARCSEC
+        self.params["dy"] = float(getattr(self.sensor, "dy", 0.0)) * RAD2ARCSEC
+
+        if hasattr(self.sensor, "gs_range_m"):
+            self.params["gs_range_m"] = float(getattr(self.sensor, "gs_range_m"))
+        if hasattr(self.sensor, "lgs_launch_offset_px"):
+            self.params["lgs_launch_offset_px"] = tuple(getattr(self.sensor, "lgs_launch_offset_px"))
+        if hasattr(self.sensor, "lgs_thickness_m"):
+            self.params["lgs_thickness_m"] = float(getattr(self.sensor, "lgs_thickness_m"))
+        if hasattr(self.sensor, "lenslet_f_m"):
+            self.params["lenslet_f_m"] = float(getattr(self.sensor, "lenslet_f_m"))
+        if hasattr(self.sensor, "pixel_pitch_m"):
+            self.params["pixel_pitch_m"] = float(getattr(self.sensor, "pixel_pitch_m"))
+
+    def _apply_sensor_params_to_sensor(self) -> None:
+        """Apply current sensor-specific params to the underlying sensor object."""
+        kw = {}
+        if self.params.get("sub_apertures") is not None:
+            kw["n_sub"] = int(self.params["sub_apertures"])
+        if self.params.get("wfs_lambda") is not None:
+            kw["wavelength"] = float(self.params["wfs_lambda"])
+
+        for k in ("dx", "dy", "gs_range_m", "lgs_launch_offset_px", "lgs_thickness_m", "lenslet_f_m", "pixel_pitch_m"):
+            if k in self.params and self.params[k] is not None:
+                kw[k] = self.params[k]
+
+        if kw:
+            self.sensor.recompute(**kw)
+
     def _build_ui(self):
         main_layout = QHBoxLayout(self)
 
@@ -109,9 +149,9 @@ class SensorTabWidget(QWidget):
         self.calc_values_table.setHorizontalHeaderLabels(["Parameter", "Value"])
         self.calc_values_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.calc_values_table.setItem(0, 0, QTableWidgetItem("Strehl"))
-        self.calc_values_table.setItem(1, 0, QTableWidgetItem("Poke FWHM (mrad)"))
-        self.calc_values_table.setItem(2, 0, QTableWidgetItem("Unperturbed FWHM (mrad)"))
-        self.calc_values_table.setItem(3, 0, QTableWidgetItem("Diffraction Limit (mrad)"))
+        self.calc_values_table.setItem(1, 0, QTableWidgetItem("Poke FWHM (mas)"))
+        self.calc_values_table.setItem(2, 0, QTableWidgetItem("Unperturbed FWHM (mas)"))
+        self.calc_values_table.setItem(3, 0, QTableWidgetItem("Diffraction Limit (mas)"))
 
         # Pre-create value cells to avoid allocating new QTableWidgetItems on every update.
         self._value_items = {}
@@ -140,6 +180,8 @@ class SensorTabWidget(QWidget):
         over_v = QVBoxLayout(f_over)
         over_v.addWidget(QLabel("Sub Aperture Centroids"))
         self.canvas_overview = PGCanvas()
+        self.canvas_overview.set_colorbar(label="surface deformation", units="m")
+
         over_v.addWidget(self.canvas_overview)
         top_h.addWidget(f_over)
 
@@ -156,7 +198,8 @@ class SensorTabWidget(QWidget):
         selector_h.addWidget(self.act_select_spinbox)
         selector_h.addWidget(self.act_select_slider)
         sub_v.addLayout(selector_h)
-        self.canvas_subap = PGCanvas()
+        self.canvas_subap = PGCanvas(show_colorbar = False)
+
         sub_v.addWidget(self.canvas_subap)
         top_h.addWidget(f_sub)
 
@@ -169,8 +212,9 @@ class SensorTabWidget(QWidget):
         f_science.setLineWidth(1)
         sc_v = QVBoxLayout(f_science)
         sc_v.addWidget(QLabel("Poke Science Image"))
-        self.canvas_science = PGCanvas()
+        self.canvas_science = PGCanvas(show_colorbar = False)
         sc_v.addWidget(self.canvas_science)
+
         bottom_h.addWidget(f_science)
 
         f_unpert = QFrame()
@@ -178,7 +222,8 @@ class SensorTabWidget(QWidget):
         f_unpert.setLineWidth(1)
         up_v = QVBoxLayout(f_unpert)
         up_v.addWidget(QLabel("Unperturbed Science Image"))
-        self.canvas_science_pupil = PGCanvas()
+        self.canvas_science_pupil = PGCanvas(show_colorbar = False)
+
         up_v.addWidget(self.canvas_science_pupil)
         bottom_h.addWidget(f_unpert)
 
@@ -211,6 +256,8 @@ class SensorTabWidget(QWidget):
     
         self.busy_label.setText("Ready")
 
+        self.initialized = True
+
         # Cache CPU-side plotting arrays
         self._pupil_mask = result["pupil_mask"]
         self._sub_aps = result["sub_aps"].astype(np.float32, copy=False)
@@ -218,11 +265,11 @@ class SensorTabWidget(QWidget):
         self._ref_points = self._ref_centroids_single
        
         # update the unperturbed science canvas
-        self.canvas_science_pupil.set_image(result["ref_science_plot"])
+        self.canvas_science_pupil.queue_image(result["ref_science_plot"])
 
         # update table values
-        self._value_items[2].setText(f"{result['ref_fwhm']*1e3:.3e}")
-        self._value_items[3].setText(f"{result['diff_lim']*1e3:.3e}")
+        self._value_items[2].setText(f"{RAD2ARCSEC * 1000 * result['ref_fwhm']:.3f}")
+        self._value_items[3].setText(f"{RAD2ARCSEC * 1000 * result['diff_lim']:.3f}")
 
         n_act = result["n_act"]
         self.act_select_spinbox.setRange(0, n_act - 1)
@@ -253,7 +300,7 @@ class SensorTabWidget(QWidget):
         strehl = float(result["strehl"])
         img_fwhm = float(result["img_fwhm"])
 
-        self.canvas_science.set_image(science_plot)
+        self.canvas_science.queue_image(science_plot)
 
         if self._pupil_mask is not None:
             self.canvas_overview.set_image_masked(influence_map, mask=self._pupil_mask)
@@ -265,7 +312,7 @@ class SensorTabWidget(QWidget):
             )
 
         self._value_items[0].setText(f"{strehl:.3f}")
-        self._value_items[1].setText(f"{1e3 * img_fwhm:.3e}")
+        self._value_items[1].setText(f"{RAD2ARCSEC * 1000 * img_fwhm:.3f}")
 
         img = np.asarray(result["subap_image"])
         obsc = self.params.get("telescope_center_obscuration")
@@ -282,39 +329,52 @@ class SensorTabWidget(QWidget):
             self._subap_mask_cache[key] = mask
 
         if mask is None:
-            self.canvas_subap.set_image(img)
+            self.canvas_subap.queue_image(img)
         else:
             self.canvas_subap.set_image_masked(img, mask=mask)
         self.busy_label.setText("Waiting")
-
+        
     def recalculate(self, params):
         """Queue a full recompute on the shared worker whenever this tab's config changes params."""
         self.job_id += 1
         enforce_config_types(params)
-        self.sensor.recompute(
-            **params
-            )
+
+        # Apply only the sensor-specific changes from this table.
+        self.params.update(params)
+        self._apply_sensor_params_to_sensor()
 
         self.busy_label.setText("Recomputing…")
-        
-        CalculateWorker.instance().request_recompute(self.sensor, params)
+
+        # Full recompute uses merged (global + per-sensor) params.
+        CalculateWorker.instance().request_recompute(self.sensor, dict(self.params))
         self._schedule_update(self.act_select_spinbox.value())
 
         self.sensor_changed.emit(self.sensor)
-        
 
-    @Slot(object)
+
     def main_params_changed(self, params):
-        """Queue a full recompute on the shared worker whenever main window config table changes params"""
+        """Apply *global* config changes without clobbering per-sensor values (e.g. wavelength)."""
+        
         self.job_id += 1
         enforce_config_types(params)
-        self.params.update(params)
-        self.sensor.recompute(grid_size=int(params.get("grid_size")))
 
+        # Update only non-sensor-specific keys from the main/global config.
+        for k, v in params.items():
+            if k in SENSOR_PARAM_KEYS:
+                continue
+            self.params[k] = v
+
+        # Keep the local sensor object consistent for any immediate UI reads.
+        if self.params.get("grid_size") is not None:
+            try:
+                self.sensor.recompute(grid_size=int(self.params["grid_size"]))
+            except Exception:
+                self.sensor.grid_size = int(self.params["grid_size"])
         self.busy_label.setText("Recomputing…")
-        
-        CalculateWorker.instance().request_recompute(self.sensor, params)
-        self._schedule_update(self.act_select_spinbox.value())
 
+
+        # Recompute with merged params (ensures per-sensor wfs_lambda/sub_apertures are preserved).
+        CalculateWorker.instance().request_recompute(self.sensor, dict(self.params))
+        self._schedule_update(self.act_select_spinbox.value())
         self.sensor_changed.emit(self.sensor)
 
