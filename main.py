@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from scripts.window_tabs.poke_tab import Poke_tab
 from scripts.window_tabs.turbulence_tab import Turbulence_tab
 from scripts.window_tabs.loop_tab import Loop_tab
+from scripts.window_tabs.long_run_tab import LongRun_tab
 from scripts.window_tabs.log_console import *
 from scripts.widgets.wrap_tab import DetachableTabWidget
 
@@ -84,6 +85,10 @@ class MainWindow(QMainWindow):
         print("> Starting Loop tab building")
         tabs.addTab(loopview := Loop_tab(self.params, turb.scheduler), "Loop")
         print("> Loop tab done!")
+
+        print("> Starting Long Run tab building")
+        tabs.addTab(longrun := LongRun_tab(self.params, turb.scheduler), "Long Run")
+        print("> Long Run tab done!")
 
         self.setCentralWidget(tabs)
         print("> MAIN init done!")

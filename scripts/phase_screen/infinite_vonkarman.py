@@ -1,4 +1,4 @@
-# CuPy-only "infinite phase screen" + layered AO sampling
+# CuPy "infinite phase screen" + layered AO sampling
 #
 # Key idea: keep NxN window and extend by generating new rows/cols:
 #   X = A Z + B b
@@ -408,6 +408,50 @@ class InfiniteVonKarmanScreen2D:
             Yloc_max -= 1.0
 
 
+    def ensure_region_world_integer_bounds(self, Xw_min: float, Xw_max: float, Yw_min: float, Yw_max: float, margin: float = 2.0):
+        """Like ensure_region_world_integer, but uses scalar bounds instead of scanning arrays.
+
+        This avoids expensive device reductions (cp.min/cp.max) on large (S,M,M) grids.
+        Bounds are in *world pixel coordinates*.
+        """
+        Xloc_min = float(Xw_min) - float(self.origin_x)
+        Xloc_max = float(Xw_max) - float(self.origin_x)
+        Yloc_min = float(Yw_min) - float(self.origin_y)
+        Yloc_max = float(Yw_max) - float(self.origin_y)
+
+        lo = 0.0 + float(margin)
+        hi = (self.N - 1.0) - float(margin)
+
+        # Pan in as few Python iterations as possible. Each pan is a 1px AR update.
+        if Xloc_min < lo:
+            n = int(math.ceil(lo - Xloc_min))
+            for _ in range(n):
+                self._pan_include_left()
+            Xloc_min += float(n)
+            Xloc_max += float(n)
+
+        if Xloc_max > hi:
+            n = int(math.ceil(Xloc_max - hi))
+            for _ in range(n):
+                self._pan_include_right()
+            Xloc_min -= float(n)
+            Xloc_max -= float(n)
+
+        if Yloc_min < lo:
+            n = int(math.ceil(lo - Yloc_min))
+            for _ in range(n):
+                self._pan_include_top()
+            Yloc_min += float(n)
+            Yloc_max += float(n)
+
+        if Yloc_max > hi:
+            n = int(math.ceil(Yloc_max - hi))
+            for _ in range(n):
+                self._pan_include_bottom()
+            Yloc_min -= float(n)
+            Yloc_max -= float(n)
+
+
     def sample_integer_world(self, Xw: cp.ndarray, Yw: cp.ndarray, autopan: bool = True, margin: float = 2.0):
         """
         Integer-offset / nearest-neighbor sampling in world pixel coords.
@@ -807,6 +851,190 @@ class LayeredInfinitePhaseScreen:
             out -= cp.mean(out, axis=(1, 2), keepdims=True)
 
         return out if return_gpu else cp.asnumpy(out)
+
+
+    # ------------------------------------------------------------------
+    # Fast sampling for long runs (fixed geometry)
+    # ------------------------------------------------------------------
+    def build_patch_sampler(
+        self,
+        thetas_xy_rad,
+        size_pixels,
+        M=128,
+        angle_deg=0.0,
+        ranges_m=None,
+        margin: float = 2.0,
+        autopan_init: bool = True,
+    ):
+        """Precompute integer world sampling indices for (layers x sensors).
+
+        This removes most per-frame cost in sample_patches_batched:
+        - no per-frame Xw/Yw float grid construction
+        - no per-frame cp.min/cp.max reductions for autopan checks
+
+        Notes:
+        - Designed for *fixed* sensor angles/ranges and fixed patch geometry.
+        - Uses nearest-neighbor sampling (same as sample_integer_world).
+        """
+        thetas = cp.asarray(thetas_xy_rad, dtype=self.dtype)
+        if thetas.ndim != 2 or thetas.shape[1] != 2:
+            raise ValueError("thetas_xy_rad must be shape (S,2)")
+        S = int(thetas.shape[0])
+
+        # ranges -> (S,)
+        if ranges_m is None:
+            ranges = cp.full((S,), cp.inf, dtype=self.dtype)
+        else:
+            ranges = cp.asarray(ranges_m, dtype=self.dtype).reshape(-1)
+            if ranges.size == 1:
+                ranges = cp.full((S,), float(ranges[0].item()), dtype=self.dtype)
+            elif ranges.size != S:
+                raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(ranges.shape)} for S={S}")
+
+        side = float(size_pixels)
+        M = int(M)
+        Xrel_b, Yrel_b = self._get_patch_rel_grid_cached(side, M, angle_deg)
+
+        theta_over_dx = thetas / self.dtype(self.dx)  # (S,2)
+        thx = theta_over_dx[:, 0]
+        thy = theta_over_dx[:, 1]
+
+        finite = cp.isfinite(ranges)
+        inv_ranges = cp.zeros_like(ranges)
+        inv_ranges[finite] = self.dtype(1.0) / ranges[finite]
+
+        # reusable buffers for precompute
+        shiftx = cp.empty((S,), dtype=self.dtype)
+        shifty = cp.empty((S,), dtype=self.dtype)
+        alpha = cp.empty((S,), dtype=self.dtype)
+        Xw = cp.empty((S, M, M), dtype=self.dtype)
+        Yw = cp.empty((S, M, M), dtype=self.dtype)
+
+        xi_layers = []
+        yi_layers = []
+        bounds = []  # list of (xmin,xmax,ymin,ymax) in world integer coords
+
+        for Lyr in self._layers_obj:
+            h = self.dtype(float(Lyr.altitude_m))
+
+            cp.multiply(thx, h, out=shiftx)
+            cp.multiply(thy, h, out=shifty)
+
+            cp.multiply(inv_ranges, h, out=alpha)
+            cp.subtract(self.dtype(1.0), alpha, out=alpha)
+            cp.clip(alpha, self.dtype(0.0), self.dtype(1.0), out=alpha)
+
+            Nl = int(Lyr.screen.N)
+            cx0 = self.dtype((Nl - 1) * 0.5)
+            cy0 = cx0
+
+            cp.multiply(alpha[:, None, None], Xrel_b, out=Xw)
+            Xw += cx0
+            Xw += shiftx[:, None, None]
+
+            cp.multiply(alpha[:, None, None], Yrel_b, out=Yw)
+            Yw += cy0
+            Yw += shifty[:, None, None]
+
+            xi_w = cp.floor(Xw + self.dtype(0.5)).astype(cp.int32)
+            yi_w = cp.floor(Yw + self.dtype(0.5)).astype(cp.int32)
+
+            # bounds (sync once per layer at build-time only)
+            xmin = int(cp.min(xi_w).item())
+            xmax = int(cp.max(xi_w).item())
+            ymin = int(cp.min(yi_w).item())
+            ymax = int(cp.max(yi_w).item())
+            bounds.append((xmin, xmax, ymin, ymax))
+
+            if autopan_init:
+                Lyr.screen.ensure_region_world_integer_bounds(xmin, xmax, ymin, ymax, margin=float(margin))
+
+            xi_layers.append(xi_w)
+            yi_layers.append(yi_w)
+
+        # scratch buffers to avoid per-call allocations
+        xi_tmp = cp.empty((S, M, M), dtype=cp.int32)
+        yi_tmp = cp.empty((S, M, M), dtype=cp.int32)
+
+        return {
+            "S": S,
+            "M": M,
+            "side": side,
+            "angle_deg": float(angle_deg),
+            "ranges": ranges,
+            "thetas": thetas,
+            "margin": float(margin),
+            "xi_world": xi_layers,
+            "yi_world": yi_layers,
+            "bounds": bounds,
+            "xi_tmp": xi_tmp,
+            "yi_tmp": yi_tmp,
+        }
+
+
+    def sample_patches_from_sampler(
+        self,
+        sampler,
+        remove_piston: bool = True,
+        return_gpu: bool = True,
+        return_per_layer: bool = False,
+        layer_first: bool = True,
+        autopan: bool = False,
+    ):
+        """Fast sampling using a sampler returned by build_patch_sampler()."""
+        S = int(sampler["S"])
+        M = int(sampler["M"])
+        margin = float(sampler.get("margin", 2.0))
+
+        xi_layers = sampler["xi_world"]
+        yi_layers = sampler["yi_world"]
+        bounds = sampler["bounds"]
+        xi_tmp = sampler["xi_tmp"]
+        yi_tmp = sampler["yi_tmp"]
+
+        if return_per_layer:
+            L = len(self._layers_obj)
+            outL = cp.zeros((L, S, M, M), dtype=self.dtype)
+        out = cp.zeros((S, M, M), dtype=self.dtype)
+
+        for li, Lyr in enumerate(self._layers_obj):
+            if not Lyr.active:
+                continue
+
+            scr = Lyr.screen
+            if autopan:
+                xmin, xmax, ymin, ymax = bounds[li]
+                scr.ensure_region_world_integer_bounds(xmin, xmax, ymin, ymax, margin=margin)
+
+            ox = int(round(float(scr.origin_x)))
+            oy = int(round(float(scr.origin_y)))
+
+            cp.subtract(xi_layers[li], ox, out=xi_tmp)
+            cp.subtract(yi_layers[li], oy, out=yi_tmp)
+
+            cp.clip(xi_tmp, 0, scr.N - 1, out=xi_tmp)
+            cp.clip(yi_tmp, 0, scr.N - 1, out=yi_tmp)
+
+            patch = scr.scrn[yi_tmp, xi_tmp]
+            out += patch
+            if return_per_layer:
+                outL[li, :, :, :] = patch
+
+        if remove_piston:
+            out -= cp.mean(out, axis=(1, 2), keepdims=True)
+            if return_per_layer:
+                outL -= cp.mean(outL, axis=(2, 3), keepdims=True)
+
+        if not return_gpu:
+            out = cp.asnumpy(out)
+            if return_per_layer:
+                outL = cp.asnumpy(outL)
+
+        if not return_per_layer:
+            return out
+        if layer_first:
+            return outL if return_gpu else outL
+        return outL.transpose(1, 0, 2, 3)
 
 
     def sample_patches_batched_arcsec(self, thetas_xy_arcsec, *args, **kwargs):

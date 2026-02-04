@@ -1,4 +1,3 @@
-from __future__ import annotations
 import aotools
 import cupy as cp
 import numpy as np
@@ -1267,6 +1266,18 @@ class WFSensor_tools:
                 self.grid_nx = cached["grid_nx"]
                 self.sub_slice = cached.get("sub_slice", None)
 
+                # southwell helpers
+                self._southwell_nsub = cached.get("_southwell_nsub", int(self.n_sub))
+                self._southwell_pitch = cached.get("_southwell_pitch", float(self.grid_size) / float(self.n_sub))
+                self._southwell_rr = cached.get("_southwell_rr", None)
+                self._southwell_cc = cached.get("_southwell_cc", None)
+                self._southwell_wsum_inv = cached.get("_southwell_wsum_inv", None)
+                # Optional neighbor-LUT for O(n_active) Southwell slopes
+                self._southwell_left = cached.get("_southwell_left", None)
+                self._southwell_right = cached.get("_southwell_right", None)
+                self._southwell_up = cached.get("_southwell_up", None)
+                self._southwell_down = cached.get("_southwell_down", None)
+
                 # recompute LGS bins/groups from cached top_left
                 top_left_y_cpu = cached.get("top_left_y_cpu", None)
                 top_left_x_cpu = cached.get("top_left_x_cpu", None)
@@ -1312,6 +1323,15 @@ class WFSensor_tools:
 
             sub_pupils = pupil[ys, xs].astype(cp.float32, copy=False)
 
+            # --- helpers for fast southwell slopes (cached; avoids per-call cp.max syncs) ---
+            nsub = int(self.n_sub)
+            idx_flat = sub_aps_idx[:, 0] * nsub + sub_aps_idx[:, 1]
+            rr = (idx_flat // nsub).astype(cp.int32, copy=False)
+            cc = (idx_flat - rr * nsub).astype(cp.int32, copy=False)
+
+            wsum = cp.sum(sub_pupils, axis=(1, 2)).astype(cp.float32, copy=False)
+            wsum_inv = (1.0 / (wsum + cp.float32(1e-12))).astype(cp.float32, copy=False)
+
             # full nominal grid for stitching
             grid_ny = int(self.n_sub)
             grid_nx = int(self.n_sub)
@@ -1328,6 +1348,41 @@ class WFSensor_tools:
             self.grid_ny = grid_ny
             self.grid_nx = grid_nx
             self.sub_slice = sub_slice
+
+            self._southwell_nsub = nsub
+            self._southwell_pitch = float(grid_size) / float(nsub)
+            self._southwell_rr = rr
+            self._southwell_cc = cc
+            self._southwell_wsum_inv = wsum_inv
+
+            # ---- neighbor LUT for fast Southwell slopes (O(n_active)) ----
+            # Build on CPU (n_active is modest) then upload to GPU.
+            try:
+                rr_cpu = cp.asnumpy(rr).astype(np.int32, copy=False)
+                cc_cpu = cp.asnumpy(cc).astype(np.int32, copy=False)
+                idx_of = {(int(r0), int(c0)): k for k, (r0, c0) in enumerate(zip(rr_cpu, cc_cpu))}
+
+                left = np.full((active_sub_aps,), -1, dtype=np.int32)
+                right = np.full((active_sub_aps,), -1, dtype=np.int32)
+                up = np.full((active_sub_aps,), -1, dtype=np.int32)
+                down = np.full((active_sub_aps,), -1, dtype=np.int32)
+
+                for k, (r0, c0) in enumerate(zip(rr_cpu, cc_cpu)):
+                    left[k] = idx_of.get((int(r0), int(c0) - 1), -1)
+                    right[k] = idx_of.get((int(r0), int(c0) + 1), -1)
+                    up[k] = idx_of.get((int(r0) - 1, int(c0)), -1)
+                    down[k] = idx_of.get((int(r0) + 1, int(c0)), -1)
+
+                self._southwell_left = cp.asarray(left, dtype=cp.int32)
+                self._southwell_right = cp.asarray(right, dtype=cp.int32)
+                self._southwell_up = cp.asarray(up, dtype=cp.int32)
+                self._southwell_down = cp.asarray(down, dtype=cp.int32)
+            except Exception:
+                # LUT not critical; fall back to dense (nsub,nsub) approach
+                self._southwell_left = None
+                self._southwell_right = None
+                self._southwell_up = None
+                self._southwell_down = None
 
             # LGS bins/groups based on CPU top_left arrays
             if _iy is not None and _ix is not None:
@@ -1350,6 +1405,15 @@ class WFSensor_tools:
                 "sub_slice": sub_slice,
                 "top_left_y_cpu": _iy,
                 "top_left_x_cpu": _ix,
+                "_southwell_nsub": self._southwell_nsub,
+                "_southwell_pitch": self._southwell_pitch,
+                "_southwell_rr": rr,
+                "_southwell_cc": cc,
+                "_southwell_wsum_inv": wsum_inv,
+                "_southwell_left": getattr(self, "_southwell_left", None),
+                "_southwell_right": getattr(self, "_southwell_right", None),
+                "_southwell_up": getattr(self, "_southwell_up", None),
+                "_southwell_down": getattr(self, "_southwell_down", None),
             }
 
         def _ensure_freq_coords(self, h_p, w_p):
@@ -1393,19 +1457,23 @@ class WFSensor_tools:
             if phase_map.ndim == 2:
                 phase_map = phase_map[None, :, :]
 
-            phase_map = phase_map.copy() * (500e-9/self.wavelength) 
-            # if sensor is not default 500nm, multiply 500nm phase map to scale properly
-            phase_map = phase_map.astype(cp.float32, copy=False)
-
+            # Keep phase_map as a lightweight view; do *not* copy the full (N,N) array.
+            # Instead, apply wavelength scaling on the gathered subaperture phases.
+            phase_map = cp.asarray(phase_map, dtype=cp.float32)
             n_map = int(phase_map.shape[0])
 
-            # (n_map, n_sub, h, w)
-            sub_phase = phase_map[:, self.ys, self.xs]
+            # (n_map, n_active, h, w)
+            sub_phase = phase_map[:, self.ys, self.xs].astype(cp.float32, copy=False)
+
+            # If the turbulence phase is defined at the 500nm reference, scale to sensor wavelength.
+            # (This matches the previous behaviour: phase_map *= 500e-9/self.wavelength)
+            sub_phase *= cp.float32(500e-9 / float(self.wavelength))
             sub_phase *= self.sub_pupils[None, :, :, :]
             # radians (WFS wavelength)
             # NOTE: cp.max(...) forces a device sync. Avoid it by passing assume_radians explicitly.
             if assume_radians is None:
-                if cp.max(phase_map) == params.get("poke_amplitude"):
+                # Preserve previous heuristic but run it on the smaller sub_phase buffer.
+                if float(cp.max(sub_phase).item()) == float(params.get("poke_amplitude")):
                     scale = cp.asarray(4.0 * cp.pi / float(self.wavelength), dtype=cp.float32)
                     sub_phase *= scale
             elif not assume_radians:
@@ -1414,27 +1482,75 @@ class WFSensor_tools:
 
             method = str(method).lower().strip()
 
-            if method == "southwell":
+            if method in ("southwell", "southwell_fast"):
                 # weighted mean phase at each active lenslet center
-                w = cp.asarray(self.sub_pupils, dtype=cp.float32)              # (n_active,h,w)
-                wsum = cp.sum(w, axis=(1, 2)).astype(cp.float32)              # (n_active,)
-                phi_act = cp.sum(sub_phase, axis=(2, 3)) / (wsum[None, :] + cp.float32(1e-12))  # (n_map,n_active)
+                wsum_inv = getattr(self, "_southwell_wsum_inv", None)
+                if wsum_inv is None:
+                    wsum = cp.sum(self.sub_pupils, axis=(1, 2)).astype(cp.float32, copy=False)
+                    wsum_inv = (1.0 / (wsum + cp.float32(1e-12))).astype(cp.float32, copy=False)
+
+                phi_act = cp.sum(sub_phase, axis=(2, 3)) * wsum_inv[None, :]  # (n_map,n_active)
 
                 # active lenslet indices (row,col) on the lenslet grid
-                idx = cp.asarray(self.sub_aps_idx)
-                if idx.ndim == 2 and idx.shape[1] == 2:
-                    rr = idx[:, 0].astype(cp.int32, copy=False)
-                    cc = idx[:, 1].astype(cp.int32, copy=False)
-                    nsub = int(cp.max(idx).item()) + 1
-                else:
-                    # Fallback if you store r/c separately
-                    rr = cp.asarray(getattr(self, "sub_aps_rr"), dtype=cp.int32)
-                    cc = cp.asarray(getattr(self, "sub_aps_cc"), dtype=cp.int32)
-                    nsub = int(getattr(self, "sub_aps", 0) or (int(cp.max(cp.stack([rr, cc])).item()) + 1))
+                nsub = int(getattr(self, "_southwell_nsub", int(self.n_sub)))
+                rr = getattr(self, "_southwell_rr", None)
+                cc = getattr(self, "_southwell_cc", None)
+                if rr is None or cc is None:
+                    idx2 = cp.asarray(self.sub_aps_idx)
+                    rr = idx2[:, 0].astype(cp.int32, copy=False)
+                    cc = idx2[:, 1].astype(cp.int32, copy=False)
 
-                # lenslet pitch in pixels on the pupil grid
-                M = int(getattr(self, "grid_size", sub_phase.shape[-1]))
-                pitch = float(M) / float(nsub)
+                pitch = float(getattr(self, "_southwell_pitch", float(self.grid_size) / float(nsub)))
+
+                # ---- FAST PATH: neighbor LUT on active lenslets (O(n_active)) ----
+                # If the neighbor index LUT is available, avoid building the dense (nsub,nsub)
+                # grid and expensive roll/isfinite operations.
+                left = getattr(self, "_southwell_left", None)
+                right = getattr(self, "_southwell_right", None)
+                up = getattr(self, "_southwell_up", None)
+                down = getattr(self, "_southwell_down", None)
+
+                if left is not None and right is not None and up is not None and down is not None:
+                    n_active = int(phi_act.shape[1])
+                    # clip indices for safe gather; masks keep invalid entries from affecting result
+                    left_c = cp.clip(left, 0, n_active - 1)
+                    right_c = cp.clip(right, 0, n_active - 1)
+                    up_c = cp.clip(up, 0, n_active - 1)
+                    down_c = cp.clip(down, 0, n_active - 1)
+
+                    phi_cur = phi_act
+                    phi_l = phi_act[:, left_c]
+                    phi_r = phi_act[:, right_c]
+                    phi_u = phi_act[:, up_c]
+                    phi_d = phi_act[:, down_c]
+
+                    v_l = (left >= 0)[None, :]
+                    v_r = (right >= 0)[None, :]
+                    v_u = (up >= 0)[None, :]
+                    v_d = (down >= 0)[None, :]
+
+                    both_lr = v_l & v_r
+                    only_r = v_r & ~v_l
+                    only_l = v_l & ~v_r
+
+                    both_ud = v_u & v_d
+                    only_d = v_d & ~v_u
+                    only_u = v_u & ~v_d
+
+                    inv2p = cp.float32(1.0 / (2.0 * pitch))
+                    invp = cp.float32(1.0 / pitch)
+
+                    sx_act = cp.where(both_lr, (phi_r - phi_l) * inv2p,
+                                      cp.where(only_r, (phi_r - phi_cur) * invp,
+                                               cp.where(only_l, (phi_cur - phi_l) * invp, cp.float32(0.0))))
+
+                    sy_act = cp.where(both_ud, (phi_d - phi_u) * inv2p,
+                                      cp.where(only_d, (phi_d - phi_cur) * invp,
+                                               cp.where(only_u, (phi_cur - phi_u) * invp, cp.float32(0.0))))
+
+                    slopes = cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
+                    centroids = cp.zeros_like(slopes)
+                    return centroids, slopes, None
 
                 # build full lenslet-center phase grid (NaN where inactive)
                 phi_g = cp.full((n_map, nsub, nsub), cp.nan, dtype=cp.float32)
@@ -1484,7 +1600,7 @@ class WFSensor_tools:
                 # extract only active lenslets back into (n_map,n_active)
                 sy_act = sy[:, rr, cc]
                 sx_act = sx[:, rr, cc]
-                slopes =  cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
+                slopes = cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
 
                 centroids = cp.zeros_like(slopes)
                 return centroids, slopes, None

@@ -182,7 +182,7 @@ class Loop_tab(QWidget):
         psf = np.asarray(psf)
         residual = np.asarray(residual)
 
-        self.peak_max = max(self.peak_max, float(np.max(psf)))
+        self.peak_max = float(np.max(psf)) #max(self.peak_max, float(np.max(psf)))
         psf_levels = (float(np.min(psf)), self.peak_max)
         self.psf_canvas.queue_image(psf, levels=psf_levels, auto_levels=False)
         self.psf_canvas.set_circle_overlay("fwhm", coord[0], coord[1], coord[2])

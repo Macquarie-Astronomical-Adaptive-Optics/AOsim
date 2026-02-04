@@ -69,17 +69,6 @@ def _slopes_any_to_vec(one):
 # Main reconstructor (with waffle constraint)
 # -----------------------------
 class TomoOnAxisIM_CuPy:
-    """
-    Includes:
-      - consistent actuator ordering between basis & Laplacian (act_centers passed through)
-      - padding during IM build sampling
-      - Laplacian regularization (optional normalize + scale-aware + kron across layers)
-      - REAL-TIME science-angle projection (cached coords)
-      - WAFFLE MODE REMOVAL (recommended):
-          * hard projection: remove the waffle component from xhat each frame
-          * optional soft penalty: add gamma * (w w^T) to H once (rank-1)
-    """
-
     def __init__(
         self,
         sensors,
@@ -176,6 +165,13 @@ class TomoOnAxisIM_CuPy:
         self.nL = len(self.layer_heights_m)
         self.nB = len(self.basis)
         self.nModes = self.nL * self.nB
+
+        # ---- compatibility aliases (older/newer codepaths) ----
+        # Some runtime code (e.g. scheduler/batch runner) expects snake_case names.
+        # Keep both to avoid attribute errors.
+        self.n_modes = self.nModes
+        self.n_layers = self.nL
+        self.n_basis = self.nB
 
         self.A = None
         self.At = None
@@ -603,6 +599,54 @@ class TomoOnAxisIM_CuPy:
             x = self._project_out_waffle(x.astype(cp.float32, copy=False))
 
         return x.astype(cp.float32, copy=False)
+
+    # -----------------------------
+    # fast solve for already-stacked slopes (stack aggregation)
+    # -----------------------------
+    def solve_coeffs_stack(self, slopes_stack):
+        """Solve coefficients when slopes are already stacked into one array.
+
+        Expected input shapes:
+          - (nS, n_sub_active, 2)  (preferred)
+          - (nS, 2*n_sub_active)
+          - (n_slopes,) slope vector
+
+        This avoids Python list handling + per-frame cp.concatenate.
+        """
+        if self.slopes_aggregation != "stack":
+            # preserve behaviour
+            return self.solve_coeffs(slopes_stack)
+
+        s = cp.asarray(slopes_stack)
+        if s.ndim == 3:
+            # (nS, n_sub, 2) -> (n_slopes,)
+            s = s.reshape(-1)
+        elif s.ndim == 2:
+            s = s.reshape(-1)
+        elif s.ndim == 1:
+            pass
+        else:
+            raise ValueError(f"solve_coeffs_stack expects 1D/2D/3D input, got shape {tuple(s.shape)}")
+
+        s = s.astype(self.chol_dtype, copy=False)
+        if self._ref_stack is not None:
+            s = s - self._ref_stack
+
+        rhs = self._At @ s
+        t = self._eig_V.T @ rhs
+        t = t * self._eig_inv
+        x = self._eig_V @ t
+
+        if self.remove_waffle_in_solution and (self._W_waffle is not None):
+            x = self._project_out_waffle(x.astype(cp.float32, copy=False))
+
+        return x.astype(cp.float32, copy=False)
+
+    def reconstruct_onaxis_stack(self, slopes_stack, return_coeffs=False):
+        """On-axis phase reconstruction for already-stacked slopes (stack aggregation)."""
+        xhat = self.solve_coeffs_stack(slopes_stack)
+        ph = self.coeffs_to_onaxis_phase(xhat)
+        return (ph, xhat) if return_coeffs else ph
 
     # -----------------------------
     # science-angle cache + RT projection

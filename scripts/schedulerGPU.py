@@ -1,6 +1,12 @@
 from __future__ import annotations
 # scripts/schedulerGPU.py
 import time
+import datetime
+from pathlib import Path
+import json
+import os
+import inspect
+import math
 from typing import Any, Dict, List, Optional
 
 import cupy as cp
@@ -8,6 +14,7 @@ from PySide6.QtCore import QObject, Signal, Slot, QTimer, Qt
 
 from scripts.reconstructor import TomoOnAxisIM_CuPy
 from scripts.utilities import Pupil_tools, Analysis, Gaussian2DFitter, params
+from scripts.batch_runner import AOBatchRunner
 
 
 def _u8_linear(x, vmin, vmax):
@@ -74,6 +81,12 @@ class SimWorker(QObject):
     all_sensor_phase_ready = Signal(object)    # cp/np (S, psf_M, psf_M) or (S, patch_M, patch_M)
     all_layers_ready = Signal(object)          # cp/np (L, S, layer_M, layer_M)
 
+    # long-run batch outputs
+    long_run_started = Signal(object)
+    long_run_progress = Signal(int, int, float, str)   # done, total, fps, message
+    long_run_finished = Signal(object)
+    long_run_failed = Signal(str)
+
     def __init__(
         self,
         sim_factory,
@@ -121,6 +134,10 @@ class SimWorker(QObject):
 
         self.sensor_method = sensor_method  # southwell or fft
 
+
+        # Prefer fast Southwell implementation (same outputs, less overhead)
+        if str(self.sensor_method).lower().strip() == "southwell":
+            self.sensor_method = "southwell_fast"
         self.dt_s = float(dt_s)
         self.fps_cap = int(fps_cap)
 
@@ -175,6 +192,11 @@ class SimWorker(QObject):
         self._loop_disp_period = self._hz_to_period(loop_display_hz)
 
 
+
+        # long-run batch state
+        self._long_run_active = False
+        self._long_run_cancel = False
+        self._long_run_prev_flags = None
         self._tick_count = 0
 
         # stepping state
@@ -198,6 +220,33 @@ class SimWorker(QObject):
         self._pupil_mask_psf = None
         self._pupil_mask_patch = None
 
+        
+        # Fast patch sampler (fixed geometry) + WFS measure signature cache
+        self._patch_sampler = None
+        self._wfs_measure_accepts = None
+        self._zero_phase_patch = None
+
+        # ---- batched Southwell WFS path (loop optimization) ----
+        self._wfs_batch_enabled = False
+        self._wfs_batch_template = None
+        self._wfs_phase_buf = None           # (n_wfs, M, M)
+        self._slopes_ref_stack = None        # (n_wfs, n_active, 2)
+        self._slopes_err_stack = None        # (n_wfs, n_active, 2)
+        self._slopes_sub_stack = None        # (n_wfs, n_active, 2)  (for recon display)
+
+        # heterogeneous-WFS fallback (vectorized slope packing)
+        self._slopes_meas_vec = None         # (n_slopes_total,) raw measured slopes packed
+        self._slopes_ref_vec = None          # (n_slopes_total,) reference (flat) slopes packed
+        self._slopes_err_vec = None          # (n_slopes_total,) slopes error (meas - ref), loop path
+        self._slopes_sub_vec = None          # (n_slopes_total,) slopes error (meas - ref), recon display path
+        self._wfs_slices = None              # list[(start, stop)] for each WFS in sensors[1:]
+        self._wfs_n_active = None            # list[int] active subaps per WFS
+        self._slopes_total_len = 0           # total packed slope length
+
+        self._wfs_is_lgs = None              # (n_wfs,) bool
+        self._m_f = None                     # float pupil mask cache
+        self._m_sum = None
+        self._sf_cache = None                # structure-function mask cache
         # ------------------ per-frame sampling cache ------------------
         self._frame_tick = -1
         self._frame_need_per_layer = False
@@ -245,6 +294,12 @@ class SimWorker(QObject):
         self.gaussian_fitter = Gaussian2DFitter(roi_half=32, dtype=cp.float32)
         self.gaussian_fitter_uc = Gaussian2DFitter(roi_half=32, dtype=cp.float32)
 
+        # cache last loop-metrics outputs so we can update UI faster than we recompute PSFs
+        self._loop_last_roi = None
+        self._loop_last_fwhm = 0.0
+        self._loop_last_fwhm_uncorr = 0.0
+        self._loop_last_gauss = (0.0, 0.0, 1.0)
+
         self.plate_rad = None
         self.long_exposure_frames = long_exposure_frames
         self.long_exposure_psf = None
@@ -267,6 +322,36 @@ class SimWorker(QObject):
         if self.pupil_mask is None or self.pupil_mask.shape != (M, M):
             self.pupil_mask = self._build_circular_pupil(M)
         return (self.pupil_mask > 0)
+
+    def _ensure_pupil_float_cache(self, M: int):
+        """Return (m_bool, m_float, m_sum) cached for shape (M,M)."""
+        m = self._ensure_pupil_mask(M)
+        if self._m_f is None or self._m_f.shape != (M, M):
+            self._m_f = m.astype(cp.float32)
+            self._m_sum = cp.sum(self._m_f)
+        return m, self._m_f, self._m_sum
+
+    def _remove_piston_tt_fast(self, phi2d):
+        """Fast piston+TT removal using the reconstructor's precomputed projector when available."""
+        phi2d = cp.asarray(phi2d, dtype=cp.float32)
+        if self.R is None or not hasattr(self.R, "_sel"):
+            # fallback: keep behaviour for safety
+            out = phi2d - cp.mean(phi2d)
+            return remove_tt(out, self.pupil_mask)
+
+        sel = self.R._sel
+        flat = phi2d.ravel()
+        z = flat[sel]
+        z = z - cp.mean(z)
+
+        if getattr(self.R, "remove_tt_in_output", True):
+            beta = self.R._XtX_inv @ (self.R._Xt @ z)
+            z = z - (beta[0] * self.R._xx_sel + beta[1] * self.R._yy_sel + beta[2])
+
+        out = phi2d.copy()
+        out_flat = out.ravel()
+        out_flat[sel] = z
+        return out
 
     def _apply_dm_to_phases(self, phases_atm):
         if (not self._loop_enabled) or (self._dm_phi is None):
@@ -337,19 +422,30 @@ class SimWorker(QObject):
         self._frame_phases_psfM = None
         self._frame_layers_layerM = None
 
-        if need_per_layer:
-            outL = self.sim.sample_patches_batched(
-                thetas_xy_rad=self.thetas_gpu,
-                ranges_m=self.ranges_gpu,
-                size_pixels=self.patch_size_px,
-                M=self.patch_M,
-                angle_deg=0.0,
-                remove_piston=False,
-                return_gpu=True,
-                return_per_layer=True,
-                layer_first=True,
-            )
+        use_fast = (self._patch_sampler is not None) and hasattr(self.sim, "sample_patches_from_sampler")
 
+        if need_per_layer:
+            if use_fast:
+                outL = self.sim.sample_patches_from_sampler(
+                    self._patch_sampler,
+                    remove_piston=False,
+                    return_gpu=True,
+                    return_per_layer=True,
+                    layer_first=True,
+                    autopan=True,
+                )
+            else:
+                outL = self.sim.sample_patches_batched(
+                    thetas_xy_rad=self.thetas_gpu,
+                    ranges_m=self.ranges_gpu,
+                    size_pixels=self.patch_size_px,
+                    M=self.patch_M,
+                    angle_deg=0.0,
+                    remove_piston=False,
+                    return_gpu=True,
+                    return_per_layer=True,
+                    layer_first=True,
+                )
             phases = cp.sum(outL, axis=0)
             phases = phases - cp.mean(phases, axis=(1, 2), keepdims=True)
             outL = outL - cp.mean(outL, axis=(2, 3), keepdims=True)
@@ -357,22 +453,138 @@ class SimWorker(QObject):
             self._frame_layers_M = outL
             self._frame_need_per_layer = True
         else:
-            phases = self.sim.sample_patches_batched(
-                thetas_xy_rad=self.thetas_gpu,
-                ranges_m=self.ranges_gpu,
-                size_pixels=self.patch_size_px,
-                M=self.patch_M,
-                angle_deg=0.0,
-                remove_piston=True,
-                return_gpu=True,
-                return_per_layer=False,
-            )
+            if use_fast:
+                phases = self.sim.sample_patches_from_sampler(
+                    self._patch_sampler,
+                    remove_piston=True,
+                    return_gpu=True,
+                    return_per_layer=False,
+                    autopan=True,
+                )
+            else:
+                phases = self.sim.sample_patches_batched(
+                    thetas_xy_rad=self.thetas_gpu,
+                    ranges_m=self.ranges_gpu,
+                    size_pixels=self.patch_size_px,
+                    M=self.patch_M,
+                    angle_deg=0.0,
+                    remove_piston=True,
+                    return_gpu=True,
+                    return_per_layer=False,
+                )
             self._frame_layers_M = None
             self._frame_need_per_layer = False
 
         self._frame_phases_M = phases
         self._frame_tick = self._tick_count
         return phases, self._frame_layers_M
+
+    def _measure_wfs_slopes(self, phases_wfs):
+        """Measure slopes for sensors[1:] on provided phase maps (S-1,M,M)."""
+        if phases_wfs is None:
+            return []
+
+        out = []
+        acc_list = self._wfs_measure_accepts or [{} for _ in range(len(self._sensor_list) - 1)]
+
+        for s0, ph, acc in zip(self._sensor_list[1:], phases_wfs, acc_list):
+            kwargs = {"phase_map": ph, "return_image": False}
+            if acc.get("assume_radians", False):
+                kwargs["assume_radians"] = True
+            if acc.get("method", False):
+                kwargs["method"] = self.sensor_method
+            _, sl, _ = s0.measure(**kwargs)
+            out.append(sl[0])  # (n_sub_active, 2) [sy, sx]
+
+        return out
+
+
+    def _measure_wfs_slopes_vec_into(self, phases_wfs_stack, out_vec):
+        """Measure slopes per WFS and pack into a 1D vector (handles heterogeneous WFS shapes).
+
+        phases_wfs_stack: (n_wfs, M, M) or list/tuple of (M,M)
+        out_vec: preallocated (n_slopes_total,) cupy array
+        """
+        if phases_wfs_stack is None or out_vec is None:
+            return None
+
+        # Ensure slices are available
+        if self._wfs_slices is None or self._wfs_n_active is None:
+            wfs_list = list(self._sensor_list[1:])
+            self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
+            lens = [2 * n for n in self._wfs_n_active]
+            offs = [0]
+            for ln in lens:
+                offs.append(offs[-1] + int(ln))
+            self._wfs_slices = [(offs[i], offs[i+1]) for i in range(len(wfs_list))]
+            self._slopes_total_len = int(offs[-1])
+
+        acc_list = self._wfs_measure_accepts or [{} for _ in range(len(self._sensor_list) - 1)]
+
+        for i, (s0, acc) in enumerate(zip(self._sensor_list[1:], acc_list)):
+            ph = phases_wfs_stack[i]
+            kwargs = {"phase_map": ph, "return_image": False}
+            if acc.get("assume_radians", False):
+                kwargs["assume_radians"] = True
+            if acc.get("method", False):
+                kwargs["method"] = self.sensor_method
+            _, sl, _ = s0.measure(**kwargs)
+            sl0 = sl[0].astype(cp.float32, copy=False)
+            na = int(sl0.shape[0])
+            sx = sl0[:, 1]
+            sy = sl0[:, 0]
+            a, b = self._wfs_slices[i]
+            b = a + 2 * na
+            # clip defensively and pack in [sx..., sy...] ordering
+            b = min(int(b), int(out_vec.size))
+            mid = min(int(a + na), int(b))
+            if mid > a:
+                out_vec[a:mid] = sx[: (mid - a)]
+            if b > mid:
+                out_vec[mid:b] = sy[: (b - mid)]
+
+        return out_vec
+
+    def _measure_wfs_slopes_stack(self, phases_wfs_stack):
+        """Measure slopes for all WFS maps in one call when Southwell batching is available.
+
+        Returns:
+            slopes_stack: (n_wfs, n_active, 2)
+        """
+        if phases_wfs_stack is None:
+            return None
+
+        if self._wfs_batch_enabled and (self._wfs_batch_template is not None):
+            s0 = self._wfs_batch_template
+            kwargs = {"phase_map": phases_wfs_stack, "return_image": False, "method": self.sensor_method, "assume_radians": True}
+            try:
+                _, sl, _ = s0.measure(**kwargs)
+            except TypeError:
+                # older signature: no assume_radians or method
+                kwargs.pop("assume_radians", None)
+                kwargs.pop("method", None)
+                _, sl, _ = s0.measure(**kwargs)
+            return sl.astype(cp.float32, copy=False)
+
+        # Fallback: per-sensor loop, pack into 1D vector (supports heterogeneous WFS geometry).
+        if (self._wfs_slices is None) or (self._slopes_total_len <= 0):
+            wfs_list = list(self._sensor_list[1:])
+            self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
+            lens = [2 * n for n in self._wfs_n_active]
+            offs = [0]
+            for ln in lens:
+                offs.append(offs[-1] + int(ln))
+            self._wfs_slices = [(offs[i], offs[i+1]) for i in range(len(wfs_list))]
+            self._slopes_total_len = int(offs[-1])
+
+        n = int(self._slopes_total_len)
+        if n <= 0:
+            return None
+        if (self._slopes_meas_vec is None) or (int(self._slopes_meas_vec.size) != n):
+            self._slopes_meas_vec = cp.empty((n,), dtype=cp.float32)
+
+        self._measure_wfs_slopes_vec_into(phases_wfs_stack, self._slopes_meas_vec)
+        return self._slopes_meas_vec
 
     # ------------------ lifecycle ------------------
     @Slot()
@@ -406,6 +618,109 @@ class SimWorker(QObject):
             self._pupil_mask_patch = self.pupil_mask
             if self._pupil_mask_patch.shape != (self.patch_M, self.patch_M):
                 self._pupil_mask_patch = self._build_circular_pupil(self.patch_M)
+
+
+        # --- fast patch sampler for fixed sensor geometry (reduces per-frame cost) ---
+        self._patch_sampler = None
+        if hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+            try:
+                self._patch_sampler = self.sim.build_patch_sampler(
+                    thetas_xy_rad=self.thetas_gpu,
+                    ranges_m=self.ranges_gpu,
+                    size_pixels=self.patch_size_px,
+                    M=self.patch_M,
+                    angle_deg=0.0,
+                    margin=2.0,
+                    autopan_init=True,
+                )
+                self.status_log.emit("Fast patch sampler initialized.")
+            except Exception as e:
+                self.status_log.emit(f"Fast patch sampler unavailable (falling back): {e}")
+                self._patch_sampler = None
+
+        # Cache measure() signature support per WFS to avoid per-frame try/except overhead
+        self._wfs_measure_accepts = []
+        for s0 in self._sensor_list[1:]:
+            try:
+                ps = inspect.signature(s0.measure).parameters
+                self._wfs_measure_accepts.append({
+                    "assume_radians": "assume_radians" in ps,
+                    "method": "method" in ps,
+                    "return_image": "return_image" in ps,
+                })
+            except Exception:
+                self._wfs_measure_accepts.append({"assume_radians": False, "method": False, "return_image": False})
+
+        # --- batched Southwell slopes for the control loop (huge per-frame win) ---
+        self._wfs_batch_enabled = False
+        self._wfs_batch_template = None
+        self._wfs_phase_buf = None
+        self._slopes_ref_stack = None
+        self._slopes_err_stack = None
+        self._slopes_sub_stack = None
+        self._wfs_is_lgs = None
+
+        sm = str(getattr(self, "sensor_method", "southwell")).lower().strip()
+        if sm in ("southwell", "southwell_fast") and len(self._sensor_list) > 1:
+            try:
+                tmpl = self._sensor_list[1]
+                wfs_list = list(self._sensor_list[1:])
+                n_wfs = int(len(wfs_list))
+                n_active = int(len(getattr(tmpl, "sub_aps_idx")))
+
+                # Conservative compatibility check: identical active-subap count + same grid geometry.
+                ok = True
+                for s0 in wfs_list:
+                    if type(s0) is not type(tmpl):
+                        ok = False
+                        break
+                    if int(getattr(s0, "grid_size", -1)) != int(getattr(tmpl, "grid_size", -2)):
+                        ok = False
+                        break
+                    if int(getattr(s0, "n_sub", -1)) != int(getattr(tmpl, "n_sub", -2)):
+                        ok = False
+                        break
+                    if int(len(getattr(s0, "sub_aps_idx"))) != n_active:
+                        ok = False
+                        break
+
+                if ok and n_active > 0:
+                    self._wfs_batch_enabled = True
+                    self._wfs_batch_template = tmpl
+                    self._wfs_phase_buf = cp.empty((n_wfs, self.patch_M, self.patch_M), dtype=cp.float32)
+                    self._slopes_ref_stack = cp.zeros((n_wfs, n_active, 2), dtype=cp.float32)
+                    self._slopes_err_stack = cp.empty_like(self._slopes_ref_stack)
+                    self._slopes_sub_stack = cp.empty_like(self._slopes_ref_stack)
+                    self._wfs_is_lgs = [math.isfinite(float(getattr(s0, "gs_range_m", float("inf")))) for s0 in wfs_list]
+                    self.status_log.emit(f"Batched Southwell slopes enabled for {n_wfs} WFS ({n_active} active subaps each).")
+                else:
+                    self.status_log.emit("Batched Southwell slopes disabled (WFS geometry mismatch).")
+            except Exception as e:
+                self.status_log.emit(f"Batched Southwell slopes disabled: {e}")
+
+
+        # --- heterogeneous WFS support: pack slopes into one vector when batching is disabled ---
+        if (sm in ("southwell", "southwell_fast")) and (len(self._sensor_list) > 1) and (not self._wfs_batch_enabled):
+            try:
+                wfs_list = list(self._sensor_list[1:])
+                self._wfs_is_lgs = [math.isfinite(float(getattr(s0, "gs_range_m", float("inf")))) for s0 in wfs_list]
+                self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
+                lens = [2 * n for n in self._wfs_n_active]
+                offs = [0]
+                for ln in lens:
+                    offs.append(offs[-1] + int(ln))
+                self._wfs_slices = [(offs[i], offs[i+1]) for i in range(len(wfs_list))]
+                self._slopes_total_len = int(offs[-1])
+
+                # vectors are allocated lazily on first use (tick) to avoid build-time stalls
+                self._slopes_meas_vec = None
+                self._slopes_ref_vec = None
+                self._slopes_err_vec = None
+                self._slopes_sub_vec = None
+
+                self.status_log.emit(f"Packed-slope vector mode enabled (heterogeneous WFS): total_len={self._slopes_total_len}.")
+            except Exception as e:
+                self.status_log.emit(f"Packed-slope vector mode init failed (falling back to legacy list): {e}")
 
         self.status_log.emit(f"Built sim with {len(self.layer_cfgs)} layers.")
         self.status.emit("Building tomographic reconstructor")
@@ -602,6 +917,202 @@ class SimWorker(QObject):
 
         self._invalidate_frame_cache()
         self._emit_once()
+
+
+    # ------------------ long-run batch API ------------------
+    @Slot(dict)
+    def start_long_run(self, cfg: dict):
+        '''Run a long batch simulation in this worker thread.
+
+        This pauses the realtime timer (if running), runs AOBatchRunner for the requested
+        number of frames, writes memmaps / npy outputs to disk, and emits a compact results
+        dict suitable for UI display.
+        '''
+        if self._long_run_active:
+            self.long_run_failed.emit("Long run already active")
+            return
+
+        if self.sim is None:
+            self.build_sim()
+        if self.R is None:
+            # If a reconstructor hasn't been built yet, build one now.
+            try:
+                self.build_reconstructor()
+            except Exception as e:
+                self.long_run_failed.emit(f"Failed to build reconstructor: {e}")
+                return
+
+        cfg = dict(cfg or {})
+
+        # Pause realtime timer and suppress heavy GUI emissions during the long run.
+        was_running = bool(self.timer.isActive())
+        if was_running:
+            self.timer.stop()
+            self.status_running.emit(False)
+
+        self._long_run_prev_flags = {
+            "overview": self._overview_enabled,
+            "reconstructor": self._reconstructor_enabled,
+            "detailed": self._detailed_enabled,
+            "loop": self._loop_enabled,
+        }
+        self._overview_enabled = False
+        self._reconstructor_enabled = False
+        self._detailed_enabled = False
+        self._loop_enabled = False
+
+        self._long_run_active = True
+        self._long_run_cancel = False
+
+        try:
+            duration_s = float(cfg.get("duration_s", 60.0))
+            discard_first_s = float(
+                cfg.get("discard_first_s",
+                cfg.get("discard_s",
+                cfg.get("discard_seconds",
+                cfg.get("discard", 0.0))))
+            )
+            n_frames = cfg.get("n_frames", None)
+            if n_frames is None:
+                n_frames = int(round(duration_s / max(self.dt_s, 1e-12)))
+            n_frames = int(n_frames)
+
+            chunk_frames = int(cfg.get("chunk_frames", 256))
+            psf_roi = int(cfg.get("psf_roi", 128))
+            record_psfs = bool(cfg.get("record_psfs", True))
+            record_psfs_ttremoved = bool(cfg.get("record_psfs_ttremoved", False))
+            save_tt_series = bool(cfg.get("save_tt_series", True))
+
+            psf_tt_mode = str(cfg.get("psf_tt_mode", "hybrid")).lower().strip()
+
+            reset_before = bool(cfg.get("reset_before", True))
+            base_out = str(cfg.get("out_dir", str(Path.cwd() / "output" / "batch_runs")))
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_dir = Path(base_out) / f"longrun_{ts}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            if reset_before:
+                self.reset()
+
+            # progress callback
+            def _prog(done: int, total: int, fps: float, msg: str):
+                self.long_run_progress.emit(int(done), int(total), float(fps), str(msg))
+
+            def _stop() -> bool:
+                return bool(self._long_run_cancel)
+
+            self.long_run_started.emit({
+                "out_dir": str(out_dir),
+                "n_frames": int(n_frames),
+                "discard_first_s": float(discard_first_s),
+                "discard_first_frames": int(max(0, int(math.floor(discard_first_s / max(self.dt_s, 1e-12))))),
+            })
+
+            runner = AOBatchRunner(
+                sim=self.sim,
+                sensors=self._sensor_list,
+                reconstructor=self.R,
+                pupil=self._pupil_mask_patch,
+                dt_s=self.dt_s,
+                gain=float(cfg.get("gain", getattr(self, "_loop_gain", 0.3))),
+                leak=float(cfg.get("leak", getattr(self, "_loop_leak", 0.0))),
+                wfs_method=self.sensor_method,
+                strip_tt_lgs=True,
+                psf_tt_mode=psf_tt_mode,
+                tt_wfs_indices=None,
+            )
+
+            res = runner.run(
+                n_frames=n_frames,
+                discard_first_s=discard_first_s,
+                record_psfs=record_psfs,
+                record_psfs_ttremoved=record_psfs_ttremoved,
+                save_tt_series=save_tt_series,
+                out_dir=str(out_dir),
+                psf_roi=psf_roi,
+                chunk_frames=chunk_frames,
+                progress_cb=_prog,
+                should_stop=_stop,
+                progress_every=int(cfg.get("progress_every", max(256, chunk_frames))),
+            )
+
+            # Convert key arrays for UI (small) and write a summary JSON
+            def _to_np(x):
+                try:
+                    return cp.asnumpy(x)
+                except Exception:
+                    return x
+
+            summary = {
+                "out_dir": str(out_dir),
+                "psf_tt_mode": res.get("psf_tt_mode"),
+                "n_frames_requested": int(res.get("n_frames_requested", n_frames)),
+                "n_frames_done": int(res.get("n_frames_done", n_frames)),
+                "discard_first_s": float(res.get("discard_first_s", discard_first_s)),
+                "discard_first_frames": int(res.get("discard_first_frames", 0)),
+                "n_frames_used": int(res.get("n_frames_used", 0)),
+                "cancelled": bool(res.get("cancelled", False)),
+                "fwhm_rad_corrected": float(res.get("fwhm_rad_corrected", 0.0)),
+                "fwhm_rad_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)),
+                "fwhm_arcsec_corrected": float(res.get("fwhm_rad_corrected", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)) * (180.0 * 3600.0) / math.pi,
+            }
+            if "fwhm_rad_corrected_ttremoved" in res:
+                summary["fwhm_rad_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"])
+                summary["fwhm_arcsec_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"]) * (180.0 * 3600.0) / math.pi
+
+            for k in ("r0_est_m", "r0_uncorrected_m", "r0_corrected_m", "r0_effective_m"):
+                if k in res:
+                    try:
+                        summary[k] = float(res[k])
+                    except Exception:
+                        pass
+
+            with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+
+            ui_res = dict(summary)
+            ui_res["psf_long_corrected"] = _to_np(res.get("psf_long_corrected"))
+            ui_res["psf_long_uncorrected"] = _to_np(res.get("psf_long_uncorrected"))
+            if "psf_long_corrected_ttremoved" in res:
+                ui_res["psf_long_corrected_ttremoved"] = _to_np(res.get("psf_long_corrected_ttremoved"))
+
+            # also pass file paths if present
+            for k in (
+                "psf_corrected_memmap",
+                "psf_uncorrected_memmap",
+                "psf_corrected_ttremoved_memmap",
+                "tt_yx_series_path",
+                "psf_frames_written",
+                "psf_shape",
+                "psf_dtype",
+            ):
+                if k in res:
+                    ui_res[k] = res[k]
+
+            self.long_run_finished.emit(ui_res)
+
+        except Exception as e:
+            self.long_run_failed.emit(str(e))
+
+        finally:
+            self._long_run_active = False
+            self._long_run_cancel = False
+            if isinstance(self._long_run_prev_flags, dict):
+                self._overview_enabled = bool(self._long_run_prev_flags.get("overview", False))
+                self._reconstructor_enabled = bool(self._long_run_prev_flags.get("reconstructor", False))
+                self._detailed_enabled = bool(self._long_run_prev_flags.get("detailed", True))
+                self._loop_enabled = bool(self._long_run_prev_flags.get("loop", False))
+            self._long_run_prev_flags = None
+
+            if was_running:
+                self.timer.start(self._interval_ms)
+                self.status_running.emit(True)
+
+    @Slot()
+    def cancel_long_run(self):
+        self._long_run_cancel = True
+
 
     # ------------------ stepping ------------------
     @Slot(bool)
@@ -912,33 +1423,23 @@ class SimWorker(QObject):
         phases_res = self._apply_dm_to_phases(phases_atm)
 
         # --- slopes from non-science sensors (measure on residual) ---
-        slopes_list = []
-        for s0, ph in zip(self._sensor_list[1:], phases_res[1:]):
-            try:
-                _, sl, _ = s0.measure(
-                    phase_map=ph,
-                    return_image=False,
-                    assume_radians=True,
-                    method=self.sensor_method,
-                )
-            except TypeError:
-                _, sl, _ = s0.measure(phase_map=ph, return_image=False)
-            slopes_list.append(sl[0])
+        slopes_list = self._measure_wfs_slopes(phases_res[1:])
 
         # --- reference slopes (flat) ---
         if self._s_ref is None:
             self._s_ref = []
-            for s0, ph in zip(self._sensor_list[1:], phases_atm[1:]):
-                ph0 = cp.zeros_like(ph)
-                try:
-                    _, sl0, _ = s0.measure(
-                        phase_map=ph0,
-                        return_image=False,
-                        assume_radians=True,
-                        method=self.sensor_method,
-                    )
-                except TypeError:
-                    _, sl0, _ = s0.measure(phase_map=ph0, return_image=False)
+            # Reuse one zero phase map (shape matches patch) where possible.
+            if self._zero_phase_patch is None or self._zero_phase_patch.shape != phases_atm.shape[1:]:
+                self._zero_phase_patch = cp.zeros(phases_atm.shape[1:], dtype=cp.float32)
+            ph0 = self._zero_phase_patch
+            acc_list = self._wfs_measure_accepts or [{} for _ in range(len(self._sensor_list) - 1)]
+            for s0, acc in zip(self._sensor_list[1:], acc_list):
+                kwargs = {"phase_map": ph0, "return_image": False}
+                if acc.get("assume_radians", False):
+                    kwargs["assume_radians"] = True
+                if acc.get("method", False):
+                    kwargs["method"] = self.sensor_method
+                _, sl0, _ = s0.measure(**kwargs)
                 self._s_ref.append(sl0[0].copy())
 
         # display recon: subtract s_ref (TT removal is display-only)
@@ -1006,73 +1507,99 @@ class SimWorker(QObject):
 
         t1 = tn()
 
-        # Sample atmosphere (cached) then apply DM (without mutating cache)
+        # Sample atmosphere (cached). Avoid DM subtraction/copies unless needed.
         phases_atm, _ = self._sample_frame_once(need_per_layer=False)   # (S,M,M)
         if phases_atm is None:
             return
-        phase_atm0 = phases_atm[0].copy()
-        phase_atm0 -= cp.mean(phases_atm[0], keepdims=True)
-        
 
-        m = self._ensure_pupil_mask(phases_atm.shape[-1])
-        phases_res = self._apply_dm_to_phases(phases_atm)
+        M = int(phases_atm.shape[-1])
+        m, m_f, m_sum = self._ensure_pupil_float_cache(M)
 
-        do_recon = bool(self._reconstructor_enabled and (phases_atm is not None) and (self.R is not None))
-        need_slopes = bool(do_recon or self._loop_enabled)
+        # IMPORTANT: WFS slopes + recon are expensive. Only compute at 1 kHz when the loop is enabled.
+        want_recon = bool(self._reconstructor_enabled and (self.R is not None))
+        need_recon_calc = bool(want_recon and need_combined)
+        need_slopes = bool(self._loop_enabled or need_recon_calc)
 
-        # on-axis phase for display (residual, TT removed only for metrics panels)
-        phase0 = None
-        if need_slopes:
-            phase0 = (phases_res[0] - cp.mean(phases_res[0][m]))
-            phase0 = remove_tt(phase0, self.pupil_mask)
+        # DM phase applied for *this* measurement tick (new DM command becomes active next tick)
+        dm_phi_prev = self._dm_phi
 
         t2 = tn()
 
-        slopes_list = []
-        if need_slopes:
-            # --- measure slopes on residual ---
-            for s0, ph in zip(self._sensor_list[1:], phases_res[1:]):
-                try:
-                    _, sl, _ = s0.measure(
-                        phase_map=ph,
-                        return_image=False,
-                        assume_radians=True,
-                        method=self.sensor_method,
-                    )
-                except TypeError:
-                    _, sl, _ = s0.measure(phase_map=ph, return_image=False)
-                slopes_list.append(sl[0])   # (n_sub, 2)
+        slopes_stack = None
+        if need_slopes and (len(self._sensor_list) > 1):
+            # Residual WFS phases into reusable buffer (WFS only) to avoid allocating phases_res every frame.
+            n_wfs = len(self._sensor_list) - 1
+            if (self._wfs_phase_buf is None) or (self._wfs_phase_buf.shape != (n_wfs, M, M)):
+                self._wfs_phase_buf = cp.empty((n_wfs, M, M), dtype=cp.float32)
+            cp.copyto(self._wfs_phase_buf, phases_atm[1:].astype(cp.float32, copy=False))
+            if dm_phi_prev is not None:
+                self._wfs_phase_buf -= dm_phi_prev[None, :, :]
+            slopes_stack = self._measure_wfs_slopes_stack(self._wfs_phase_buf)
 
-            # --- one-time reference slope calibration (flat) ---
-            if self._s_ref is None:
-                self._s_ref = []
-                for s0, ph in zip(self._sensor_list[1:], phases_res[1:]):
-                    ph0 = cp.zeros_like(ph)
-                    try:
-                        _, sl0, _ = s0.measure(
-                            phase_map=ph0,
-                            return_image=False,
-                            assume_radians=True,
-                            method=self.sensor_method,
-                        )
-                    except TypeError:
-                        _, sl0, _ = s0.measure(phase_map=ph0, return_image=False)
-
-                    self._s_ref.append(sl0[0].copy())
+            # One-time reference slopes (flat). Handle both stack and packed-vector modes.
+            if slopes_stack is not None:
+                if slopes_stack.ndim == 3:
+                    if self._slopes_ref_stack is None:
+                        zph = cp.zeros((slopes_stack.shape[0], M, M), dtype=cp.float32)
+                        self._slopes_ref_stack = self._measure_wfs_slopes_stack(zph)
+                        self._slopes_err_stack = cp.empty_like(self._slopes_ref_stack)
+                        self._slopes_sub_stack = cp.empty_like(self._slopes_ref_stack)
+                else:
+                    # packed vector mode (heterogeneous WFS)
+                    if self._slopes_ref_vec is None:
+                        self._slopes_ref_vec = cp.empty_like(slopes_stack)
+                        self._slopes_err_vec = cp.empty_like(slopes_stack)
+                        self._slopes_sub_vec = cp.empty_like(slopes_stack)
+                        zph = cp.zeros((len(self._sensor_list) - 1, M, M), dtype=cp.float32)
+                        self._measure_wfs_slopes_vec_into(zph, self._slopes_ref_vec)
 
         t3 = tn()
 
-        # ---- optional recon display (subtract s_ref; TT removed for display) ----
+        # ---- optional recon display (subtract ref only; TT removal already handled in recon output) ----
         rec = None
         surf_m = cp.zeros_like(phases_atm[0])
         phi_res_disp = None
+        phase0 = None
 
-        if do_recon and slopes_list:
-            slopes_sub = [sl - ref for sl, ref in zip(slopes_list, self._s_ref)]
-            self.reconstructed, xhat_disp = self.R.reconstruct_onaxis(slopes_sub, return_coeffs=True)
-            self.reconstructed -= cp.mean(self.reconstructed[m])
-            self.reconstructed = remove_tt(self.reconstructed, self.pupil_mask)
+        if need_recon_calc and (slopes_stack is not None) and want_recon:
+            if slopes_stack.ndim == 3:
+                if self._slopes_ref_stack is None:
+                    # should have been initialized above, but be safe
+                    zph = cp.zeros((slopes_stack.shape[0], M, M), dtype=cp.float32)
+                    self._slopes_ref_stack = self._measure_wfs_slopes_stack(zph)
+                    self._slopes_err_stack = cp.empty_like(self._slopes_ref_stack)
+                    self._slopes_sub_stack = cp.empty_like(self._slopes_ref_stack)
+
+                cp.subtract(slopes_stack, self._slopes_ref_stack, out=self._slopes_sub_stack)
+                # pack to [sx..., sy...] ordering to match interaction-matrix convention
+                nS, nA = int(self._slopes_sub_stack.shape[0]), int(self._slopes_sub_stack.shape[1])
+                nvec = nS * 2 * nA
+                if (self._slopes_sub_vec is None) or (int(self._slopes_sub_vec.size) != int(nvec)):
+                    self._slopes_sub_vec = cp.empty((nvec,), dtype=cp.float32)
+                sub2d = self._slopes_sub_vec.reshape(nS, 2 * nA)
+                sub2d[:, :nA] = self._slopes_sub_stack[..., 1]  # sx
+                sub2d[:, nA:] = self._slopes_sub_stack[..., 0]  # sy
+                self.reconstructed, xhat_disp = self.R.reconstruct_onaxis_stack(self._slopes_sub_vec, return_coeffs=True)
+
+            else:
+                if self._slopes_ref_vec is None:
+                    # should have been initialized above, but be safe
+                    self._slopes_ref_vec = cp.empty_like(slopes_stack)
+                    self._slopes_err_vec = cp.empty_like(slopes_stack)
+                    self._slopes_sub_vec = cp.empty_like(slopes_stack)
+                    zph = cp.zeros((len(self._sensor_list) - 1, M, M), dtype=cp.float32)
+                    self._measure_wfs_slopes_vec_into(zph, self._slopes_ref_vec)
+
+                cp.subtract(slopes_stack, self._slopes_ref_vec, out=self._slopes_sub_vec)
+                self.reconstructed, xhat_disp = self.R.reconstruct_onaxis_stack(self._slopes_sub_vec, return_coeffs=True)
+
             rec = self.reconstructed - cp.mean(self.reconstructed)
+
+            # on-axis residual (science sees this tick)
+            sci_res = phases_atm[0]
+            if dm_phi_prev is not None:
+                sci_res = sci_res - dm_phi_prev
+            phase0 = self._remove_piston_tt_fast(sci_res)
 
             # “perfect instantaneous” correction preview
             phi_dm_perf = -self.R.coeffs_to_onaxis_phase(xhat_disp)
@@ -1086,117 +1613,185 @@ class SimWorker(QObject):
                 dtype=cp.float32,
             )
 
-        # ---- CLOSED LOOP ----
-        if self._closed_loop and self._loop_enabled and slopes_list:
-            slopes_err_list = [sl - ref for sl, ref in zip(slopes_list, self._s_ref)]
-            slopes_err_list = [strip_tt_from_slopes(sl) if sens.gs_range_m != cp.inf else cp.zeros_like(sl) for sl, sens in zip(slopes_err_list, self._sensor_list[1:]) ]
-            xhat = self.R.solve_coeffs(slopes_err_list)
+        # ---- CLOSED LOOP (optimized) ----
+
+        if self._closed_loop and self._loop_enabled and (slopes_stack is not None):
+            if slopes_stack.ndim == 3:
+                if self._slopes_ref_stack is None:
+                    # should have been initialized above, but be safe
+                    zph = cp.zeros((slopes_stack.shape[0], M, M), dtype=cp.float32)
+                    self._slopes_ref_stack = self._measure_wfs_slopes_stack(zph)
+                    self._slopes_err_stack = cp.empty_like(self._slopes_ref_stack)
+                    self._slopes_sub_stack = cp.empty_like(self._slopes_ref_stack)
+
+                # slope error relative to flat
+                cp.subtract(slopes_stack, self._slopes_ref_stack, out=self._slopes_err_stack)
+
+                # LGS cannot sense global TT; strip mean slopes. Off-axis NGS: keep prior behaviour (ignore).
+                if self._wfs_is_lgs is not None:
+                    lgs_idx = [i for i, is_lgs in enumerate(self._wfs_is_lgs) if is_lgs]
+                    ngs_idx = [i for i, is_lgs in enumerate(self._wfs_is_lgs) if not is_lgs]
+                    if lgs_idx:
+                        means = self._slopes_err_stack[lgs_idx].mean(axis=1, keepdims=True)
+                        self._slopes_err_stack[lgs_idx] -= means
+                    if ngs_idx:
+                        self._slopes_err_stack[ngs_idx].fill(0.0)
+
+                # pack to [sx..., sy...] ordering to match interaction-matrix convention
+                nS, nA = int(self._slopes_err_stack.shape[0]), int(self._slopes_err_stack.shape[1])
+                nvec = nS * 2 * nA
+                if (self._slopes_err_vec is None) or (int(self._slopes_err_vec.size) != int(nvec)):
+                    self._slopes_err_vec = cp.empty((nvec,), dtype=cp.float32)
+                err2d = self._slopes_err_vec.reshape(nS, 2 * nA)
+                err2d[:, :nA] = self._slopes_err_stack[..., 1]  # sx
+                err2d[:, nA:] = self._slopes_err_stack[..., 0]  # sy
+                xhat = self.R.solve_coeffs_stack(self._slopes_err_vec)
+
+            else:
+                if self._slopes_ref_vec is None:
+                    # should have been initialized above, but be safe
+                    self._slopes_ref_vec = cp.empty_like(slopes_stack)
+                    self._slopes_err_vec = cp.empty_like(slopes_stack)
+                    self._slopes_sub_vec = cp.empty_like(slopes_stack)
+                    zph = cp.zeros((len(self._sensor_list) - 1, M, M), dtype=cp.float32)
+                    self._measure_wfs_slopes_vec_into(zph, self._slopes_ref_vec)
+
+                # slope error relative to flat
+                cp.subtract(slopes_stack, self._slopes_ref_vec, out=self._slopes_err_vec)
+
+                # LGS cannot sense global TT; strip mean slopes per-WFS block. Off-axis NGS: ignore (fill 0).
+                if (self._wfs_is_lgs is not None) and (self._wfs_slices is not None) and (self._wfs_n_active is not None):
+                    for wi, is_lgs in enumerate(self._wfs_is_lgs):
+                        a, b = self._wfs_slices[wi]
+                        na = int(self._wfs_n_active[wi])
+                        if na <= 0:
+                            continue
+                        # vector layout per WFS is [sx(0..na-1), sy(0..na-1)]
+                        sx = self._slopes_err_vec[a : a + na]
+                        sy = self._slopes_err_vec[a + na : a + 2 * na]
+                        if is_lgs:
+                            sx -= sx.mean()
+                            sy -= sy.mean()
+                        else:
+                            sx.fill(0.0)
+                            sy.fill(0.0)
+
+                xhat = self.R.solve_coeffs_stack(self._slopes_err_vec)
 
             if self._dm_cmd is None:
                 self._dm_cmd = cp.zeros_like(xhat)
 
             self._dm_cmd = (1.0 - self._loop_leak) * self._dm_cmd - self._loop_gain * xhat
 
-            dm_phi = -self.R.coeffs_to_onaxis_phase(self._dm_cmd)
-            dm_phi -= cp.mean(dm_phi[m])
-            dm_phi = remove_tt(dm_phi, self.pupil_mask)
-            self._dm_phi = dm_phi
+            # DM phase already piston+TT removed in coeffs_to_onaxis_phase (remove_tt_in_output=True)
+            self._dm_phi = -self.R.coeffs_to_onaxis_phase(self._dm_cmd)
 
-            # ---- UI at limited rate ----
-            if (self._fps_frames % self._loop_disp_period) == 0 or self._loop_t == 0:
-                phi_sci = phases_res[0]
-                m_f = self.pupil_mask.astype(cp.float32)
-                m_sum = cp.sum(m_f)
+            # ---- loop tab outputs (decoupled from 1 kHz control) ----
+            if ((tc % self._loop_disp_period) == 0) or (self._loop_t == 0):
+                phi_corr = self._remove_piston_tt_fast(phases_atm[0] - (dm_phi_prev if dm_phi_prev is not None else 0.0))
+                phi_unc = self._remove_piston_tt_fast(phases_atm[0])
 
-                phi_sci = phi_sci - cp.sum(phi_sci * m_f) / (m_sum + 1e-12)
-                phi_sci = remove_tt(phi_sci, self.pupil_mask)
-
-                # r0 calculation
-                V = cp.stack([phi_sci, phase_atm0], axis=0)   # (2,H,W)
+                # r0 via phase structure function at a few lags
+                # Dϕ​(ρ)=⟨(ϕ(x+ρ)−ϕ(x))^2⟩ ≈ 6.88(r0​ρ​)^5/3
+                V = cp.stack([phi_corr, phi_unc], axis=0)   # (2,H,W)
                 Ds = []
                 rhos = []
-                for lag in (2,4,8):
-                    mx_f = (m[:, lag:] & m[:, :-lag]).astype(cp.float32)
-                    my_f = (m[lag:, :] & m[:-lag, :]).astype(cp.float32)
+                if self._sf_cache is None:
+                    self._sf_cache = {}
+                for lag in (2, 4, 8):
+                    # calculate structure function Dϕ​(ρ) with separation ρ = lag
+                    if lag not in self._sf_cache or self._sf_cache[lag][0].shape != (M, M - lag):
+                        mx_f = (m[:, lag:] & m[:, :-lag]).astype(cp.float32)
+                        my_f = (m[lag:, :] & m[:-lag, :]).astype(cp.float32)
+                        self._sf_cache[lag] = (mx_f, my_f, cp.sum(mx_f), cp.sum(my_f))
+                    mx_f, my_f, mx_sum, my_sum = self._sf_cache[lag]
 
-                    dpx = V[:, :, lag:] - V[:, :, :-lag]      # (2,H,W-lag)
-                    dpy = V[:, lag:, :] - V[:, :-lag, :]      # (2,H-lag,W)
+                    dpx = V[:, :, lag:] - V[:, :, :-lag]
+                    dpy = V[:, lag:, :] - V[:, :-lag, :]
+                    Dx = (dpx*dpx*mx_f[None, :, :]).sum(axis=(1, 2)) / (mx_sum + 1e-12)
+                    Dy = (dpy*dpy*my_f[None, :, :]).sum(axis=(1, 2)) / (my_sum + 1e-12)
+                    Ds.append(0.5 * (Dx + Dy))
+                    rhos.append(self.sim.dx * lag)
 
-                    Dx = (dpx*dpx*mx_f[None, :, :]).sum(axis=(1,2)) / (mx_f.sum() + 1e-12)
-                    Dy = (dpy*dpy*my_f[None, :, :]).sum(axis=(1,2)) / (my_f.sum() + 1e-12)
-                    D  = 0.5*(Dx + Dy) # Phase Structure Function estimation
-                    Ds.append(D)
+                Ds = cp.stack(Ds, axis=0)  # (nlag, 2)
+                rhos = cp.asarray(rhos, dtype=cp.float32)[:, None]
 
-                    rho = self.sim.dx * lag
-                    rhos.append(rho)
+                slope = 5.0 / 3.0
 
-
-                Ds = cp.stack(Ds, axis=0)        # (nlag, 2)
-                rhos = cp.asarray(rhos, dtype=cp.float32)[:, None]  # (nlag,1)
-
-                slope = 5.0/3.0
-                y = cp.log(Ds) - cp.log(cp.float32(6.88)) - slope*cp.log(rhos)
+                # fit in log space (for log(r0) linearity)
+                y = cp.log(Ds) - cp.log(cp.float32(6.88)) - slope * cp.log(rhos)
                 log_r0 = -cp.mean(y, axis=0) / slope
-                r0_eff_corrected, r0_eff_uncorrected = cp.exp(log_r0)
-                            
-                # Kolmogorov: Dphi(rho) = 6.88 * (rho/r0)^(5/3)
-                
-                if not self._loop_r0_only:
-                        
-                    fft_pad = self.patch_M // 2
-                    I, I_uncorrected = self._sensor_list[0].measure(pupil = None, phase_map = cp.stack((phi_sci, phase_atm0), axis = 0), pad = fft_pad, assume_radians = True)[2]
 
-                    if self.plate_rad is None:
-                        self.plate_rad = (
-                            float(self._sensor_list[0].wavelength) * float(self.patch_M) /
-                            (float(params["telescope_diameter"]) * float(I.shape[0] + 2 * fft_pad))
+                # linearize back from log
+                r0_eff_corrected, r0_eff_uncorrected = cp.exp(log_r0)
+
+                if not self._loop_r0_only:
+                    # Heavy PSF+fit capped at ~30 Hz; UI can still update faster using cached outputs.
+                    psf_period = max(1, self._hz_to_period(min(30, max(1, int(self.loop_display_hz)))))
+                    do_psf = ((tc % psf_period) == 0) or (self._loop_t == 0) or (self.long_exposure_psf is None)
+                    if do_psf:
+                        fft_pad = self.patch_M // 2
+                        I, I_uncorrected = self._sensor_list[0].measure(
+                            pupil=None,
+                            phase_map=cp.stack((phi_corr, phi_unc), axis=0),
+                            pad=fft_pad,
+                            assume_radians=True,
+                        )[2]
+
+                        if self.plate_rad is None:
+                            self.plate_rad = (
+                                float(self._sensor_list[0].wavelength) * float(self.patch_M) /
+                                (float(params["telescope_diameter"]) * float(I.shape[0] + 2 * fft_pad))
+                            )
+
+                        if self.long_exposure_psf is None:
+                            self.long_exposure_psf = Analysis.PSFRingMean(shape=I.shape, K=self.long_exposure_frames, save_label="Corrected")
+                            self.long_exposure_psf_uncorrected = Analysis.PSFRingMean(shape=I_uncorrected.shape, K=self.long_exposure_frames, save_label="Uncorrected")
+
+                        self.long_exposure_psf.add(I)
+                        self.long_exposure_psf_uncorrected.add(I_uncorrected)
+
+                        sci_long = self.long_exposure_psf.mean()
+                        raw_long = self.long_exposure_psf_uncorrected.mean()
+
+                        zoom = 2
+                        zimg = Analysis._zoom2d(sci_long, zoom, cp)
+                        p, (_xc, _yc), fwhm, roi, (_x0, _y0), fwhm_z = self.gaussian_fitter.fit_frame(
+                            zimg, search_r=24, loss="soft_l1", max_iter=10, zoom=zoom
+                        )
+                        zimg_uc = Analysis._zoom2d(raw_long, zoom, cp)
+                        _, _, fwhm_uncorr, _, _, _ = self.gaussian_fitter_uc.fit_frame(
+                            zimg_uc, search_r=24, loss="soft_l1", max_iter=10, zoom=zoom
                         )
 
-                    if self.long_exposure_psf is None:
-                        self.long_exposure_psf = Analysis.PSFRingMean(shape=I.shape, K=self.long_exposure_frames, save_label = "Corrected")
-                        self.long_exposure_psf_uncorrected = Analysis.PSFRingMean(shape=I_uncorrected.shape, K=self.long_exposure_frames, save_label = "Uncorrected")
-
-                    self.long_exposure_psf.add(I)
-                    self.long_exposure_psf_uncorrected.add(I_uncorrected)
-
-                    sci_long = self.long_exposure_psf.mean()
-                    raw_long = self.long_exposure_psf_uncorrected.mean()
-
-                    zoom = 2
-                    zimg = Analysis._zoom2d(sci_long, zoom, cp)     # (H*zoom, W*zoom)
-                    p, (xc, yc), fwhm, roi, (x0, y0), fwhm_z = self.gaussian_fitter.fit_frame(
-                        zimg, search_r=24, loss="soft_l1", max_iter=10, zoom=zoom
-                    )
-                    zimg_uc = Analysis._zoom2d(raw_long, zoom, cp)     # (H*zoom, W*zoom)
-                    _, _, fwhm_uncorrected, _, _, _  = self.gaussian_fitter_uc.fit_frame(
-                        zimg_uc, search_r=24, loss="soft_l1", max_iter=10, zoom=zoom
-                    )
+                        self._loop_last_roi = (roi.astype(cp.float16)).get()
+                        self._loop_last_fwhm = float(self.plate_rad * fwhm[0])
+                        self._loop_last_fwhm_uncorr = float(self.plate_rad * fwhm_uncorr[0])
+                        self._loop_last_gauss = (float(p[1]), float(p[2]), float(fwhm_z[1] / 2))
 
                     self.loop_ready.emit(
-                        (roi.astype(cp.float16)).get(),
-                        (phi_sci * self.pupil_mask).get(), 
-                        (r0_eff_corrected),
-                        (r0_eff_uncorrected),
-                        (self.plate_rad * fwhm[0]),
-                        (self.plate_rad * fwhm_uncorrected[0]),
+                        self._loop_last_roi,
+                        (phi_corr * self.pupil_mask).get(),
+                        r0_eff_corrected,
+                        r0_eff_uncorrected,
+                        self._loop_last_fwhm,
+                        self._loop_last_fwhm_uncorr,
                         self._loop_t,
-                        (p[1], p[2], fwhm_z[1]/2) # gaussian x, y, radius
+                        self._loop_last_gauss,
                     )
                 else:
                     self.loop_ready.emit(
                         None,
-                        (phi_sci * self.pupil_mask).get(), 
-                        (r0_eff_corrected),
-                        (r0_eff_uncorrected),
+                        (phi_corr * self.pupil_mask).get(),
+                        r0_eff_corrected,
+                        r0_eff_uncorrected,
                         0,
                         0,
                         self._loop_t,
-                        (0, 0, 1, 1, 0) # gaussian x, y, x width, y width, rotation
+                        (0, 0, 1, 1, 0),
                     )
 
             self._loop_t += self.dt_s
-            
-
 
         t4 = tn()
 
@@ -1209,7 +1804,7 @@ class SimWorker(QObject):
                 self._update_levels(phase_like=combined)
                 self.combined_ready.emit(self._phase_to_u8_cached(combined))
 
-            if rec is not None and do_recon and phase0 is not None and phi_res_disp is not None:
+            if rec is not None and want_recon and phase0 is not None and phi_res_disp is not None:
                 self.reconstructed_ready.emit(
                     cp.asnumpy(phase0 * self._pupil_mask_patch),
                     cp.asnumpy(rec),
