@@ -1,6 +1,4 @@
 # scripts/worker.py
-from __future__ import annotations
-
 from collections import deque
 import threading
 from typing import Any, Dict, Optional, Tuple

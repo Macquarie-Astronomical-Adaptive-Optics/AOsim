@@ -20,7 +20,7 @@ from cupyx.scipy.special import gamma  # GPU special functions
 
 ARCSEC_TO_RAD = math.pi / (180.0 * 3600.0)
 
-from . import kv
+from . import kv # custom kernel for GPU kv calculation; cupy does not have kv implementation yet
 
 # ---------- von Karman phase covariance ----------
 def phase_covariance_vk_cp(r: cp.ndarray, r0: float, L0: float, dtype=cp.float32) -> cp.ndarray:
@@ -41,7 +41,7 @@ def phase_covariance_vk_cp(r: cp.ndarray, r0: float, L0: float, dtype=cp.float32
     return (A * B1 * B2 * C).astype(dtype)
 
 
-# ---------- FFT initialisation (CuPy) ----------
+# ---------- FFT initialisation ----------
 def _ft_phase_screen_vk_cp(N: int, dx: float, r0: float, L0: float, seed: int, dtype=cp.float32) -> cp.ndarray:
     """
     Initial screen (periodic) via FFT-based von Karman PSD.

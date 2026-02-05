@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import time
 import math
@@ -10,8 +8,9 @@ import cupy as cp
 import numpy as np
 
 from scripts.reconstructor import TomoOnAxisIM_CuPy
+from scripts.fits_writer import PsfFITSRecorder
 from scripts.utilities import Analysis, Gaussian2DFitter, params
-
+from astropy.modeling import models, fitting
 
 def remove_tt(phi: cp.ndarray, pupil: cp.ndarray) -> cp.ndarray:
     """Remove best-fit tip/tilt plane from phi over the pupil.
@@ -111,6 +110,74 @@ def _phase_to_psf_batch(
         h = r // 2
         I = I[:, c - h : c - h + r, c - h : c - h + r]
     return I
+
+import numpy as np
+from astropy.modeling import models, fitting
+
+def fit_moffat2d(psf: np.ndarray, fit_box: int = 128, bkg: float | None = None, zoom: float = 2):
+    """
+    Fit astropy.modeling.models.Moffat2D to the PSF core.
+
+    Parameters
+    ----------
+    psf : (H,W) ndarray
+        Long-exposure PSF image (intensity).
+    fit_box : int
+        Size of the square window (pixels) around the peak to fit.
+    bkg : float or None
+        Background level to subtract before fitting. If None, estimate from border.
+    float : float
+        Divide final FWHM by image zoom level
+
+    Returns
+    -------
+    model_fit : astropy Moffat2D model (fitted)
+    fwhm_px : float
+        FWHM in pixels from the fitted Moffat parameters.
+    """
+    psf = np.asarray(psf, dtype=float)
+
+    # center on peak
+    y0p, x0p = np.unravel_index(np.argmax(psf), psf.shape)
+    half = fit_box // 2
+    y1, y2 = max(0, y0p - half), min(psf.shape[0], y0p + half)
+    x1, x2 = max(0, x0p - half), min(psf.shape[1], x0p + half)
+
+    cut = psf[y1:y2, x1:x2].copy()
+
+    # background estimate from the cutout border if not provided
+    if bkg is None:
+        border = np.concatenate([
+            cut[0, :], cut[-1, :], cut[:, 0], cut[:, -1]
+        ])
+        bkg = np.median(border)
+
+    cut -= bkg
+    cut[cut < 0] = 0.0  # keep fitter stable
+
+    yy, xx = np.mgrid[0:cut.shape[0], 0:cut.shape[1]]
+
+    # initial guesses
+    amp0 = float(np.max(cut))
+    x0 = float(np.argmax(np.sum(cut, axis=0)))  # crude centroid
+    y0 = float(np.argmax(np.sum(cut, axis=1)))
+    gamma0 = 2.0          # core width (pixels) initial
+    alpha0 = 2.5          # wing slope initial
+
+    m0 = models.Moffat2D(amplitude=amp0, x_0=x0, y_0=y0, gamma=gamma0, alpha=alpha0)
+
+    # bounds 
+    m0.amplitude.min = 0.0
+    m0.gamma.min = 0.2
+    m0.gamma.max = max(cut.shape)  
+    m0.alpha.min = 1.01            # alpha<=1 gives infinite variance; avoid
+    m0.alpha.max = 20.0
+    m0.x_0.min, m0.x_0.max = 0, cut.shape[1] - 1
+    m0.y_0.min, m0.y_0.max = 0, cut.shape[0] - 1
+
+    fitter = fitting.TRFLSQFitter()
+    mfit = fitter(m0, xx, yy, cut, inplace=True)
+    return mfit, float(mfit.fwhm) / float(zoom)
 
 
 @dataclass
@@ -363,7 +430,9 @@ class AOBatchRunner:
         # long-exposure PSFs, r0 estimates), while still recording all per-frame
         # data products (memmaps, TT series) if enabled.
         discard_first_s: float = 0.0,
-        discard_first_frames = None,
+        # Optional explicit override for warm-up discard expressed in frames.
+        # If provided, it takes precedence over discard_first_s.
+        discard_first_frames: Optional[int] = None,
         record_psfs: bool = True,
         record_psfs_ttremoved: bool = False,
         save_tt_series: bool = True,
@@ -375,6 +444,7 @@ class AOBatchRunner:
         progress_cb: Optional[Callable[[int, int, float, str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         progress_every: int = 512,
+        dt_s : float = 0.001,
     ) -> Dict[str, object]:
         n_frames = int(n_frames)
         patch_M = int(self.sensors[0].grid_size)
@@ -405,33 +475,48 @@ class AOBatchRunner:
         rec_corr = None
         rec_unc = None
         rec_corr_tt = None
+
+        # Per-frame PSF recording (optional)
         if record_psfs:
-            rec_corr = PsfMemmapRecorder(
-                out_path=os.path.join(out_dir, "psf_corrected.f16"),
-                n_frames=n_frames,
+            # Stream per-frame PSFs to FITS (multiple IMAGE extensions), float32.
+            hdr = {
+                "DT": float(dt_s),
+                "LAMSCI": float(lam_sci),
+                "ROI": int(psf_roi),
+                "CHUNK": int(chunk_frames),
+                "TTMODE": str(self.psf_tt_mode),
+            }
+            rec_corr = PsfFITSRecorder(
+                out_path=os.path.join(out_dir, "psf_corrected.fits"),
                 psf_shape=(psf_roi, psf_roi),
-                chunk=chunk_frames,
-                dtype=np.float16,
+                extra_header=hdr,
+                extname_chunks="PSF",
             )
-            rec_unc = PsfMemmapRecorder(
-                out_path=os.path.join(out_dir, "psf_uncorrected.f16"),
-                n_frames=n_frames,
+            rec_unc = PsfFITSRecorder(
+                out_path=os.path.join(out_dir, "psf_uncorrected.fits"),
                 psf_shape=(psf_roi, psf_roi),
-                chunk=chunk_frames,
-                dtype=np.float16,
+                extra_header=hdr,
+                extname_chunks="PSF",
             )
 
         # Optional: record TT-removed corrected PSFs (hybrid mode only)
         if record_psfs_ttremoved and self.psf_tt_mode == "hybrid":
-            rec_corr_tt = PsfMemmapRecorder(
-                out_path=os.path.join(out_dir, "psf_corrected_ttremoved.f16"),
-                n_frames=n_frames,
+            hdr_tt = {
+                "DT": float(dt_s),
+                "LAMSCI": float(lam_sci),
+                "ROI": int(psf_roi),
+                "CHUNK": int(chunk_frames),
+                "TTMODE": "hybrid",
+                "TTREM": True,
+            }
+            rec_corr_tt = PsfFITSRecorder(
+                out_path=os.path.join(out_dir, "psf_corrected_ttremoved.fits"),
                 psf_shape=(psf_roi, psf_roi),
-                chunk=chunk_frames,
-                dtype=np.float16,
+                extra_header=hdr_tt,
+                extname_chunks="PSF",
             )
 
-        # Accumulators
+# Accumulators
         dx_m = float(params.get("telescope_diameter")) / float(patch_M)
         sf = StructureFunctionAccumulator(self.pupil, dx_m=dx_m, lags_px=structure_lags_px)
 
@@ -640,7 +725,7 @@ class AOBatchRunner:
                         )
                         if B_used > 0:
                             sum_psf_corr_tt += cp.sum(Icorr_tt[off_used:], axis=0)
-                        rec_corr_tt.write_chunk(Icorr_tt.astype(cp.float16, copy=False))
+                        rec_corr_tt.write_chunk(Icorr_tt)
                     elif B_used > 0:
                         Icorr_tt = _phase_to_psf_batch(
                             buf_corr[off_used:B],
@@ -656,8 +741,8 @@ class AOBatchRunner:
 
                 if record_psfs:
                     # When recording PSFs, Icorr/Iunc are always full-chunk.
-                    rec_corr.write_chunk(Icorr.astype(cp.float16, copy=False))
-                    rec_unc.write_chunk(Iunc.astype(cp.float16, copy=False))
+                    rec_corr.write_chunk(Icorr)
+                    rec_unc.write_chunk(Iunc)
                 b = 0
 
                 # Progress callback (rate-limited)
@@ -669,11 +754,8 @@ class AOBatchRunner:
                         progress_cb(done, int(n_frames), fps, "running")
                         last_prog = done
 
-        if record_psfs:
-            rec_corr.flush()
-            rec_unc.flush()
-        if rec_corr_tt is not None:
-            rec_corr_tt.flush()
+                # (FITS recorders are finalized after long-exposure PSFs are computed)
+
 
         if self.psf_tt_mode == "hybrid" and tt_series is not None:
             np.save(os.path.join(out_dir, "tt_yx_from_wfs.npy"), cp.asnumpy(tt_series[:n_done]))
@@ -687,6 +769,43 @@ class AOBatchRunner:
         if self.psf_tt_mode == "hybrid":
             psf_long_corr_tt = (sum_psf_corr_tt / denom_used).astype(cp.float32)
 
+        # --- Write long-exposure PSFs to FITS ---
+        # Always write 2D long-exposure PSFs as separate FITS files for convenience.
+        # If recording per-frame PSFs, also append LONGEXP extensions to those files.
+        from scripts.fits_writer import write_primary_empty, append_image_hdu
+
+        # Separate files
+        with open(os.path.join(out_dir, "psf_long_corrected.fits"), "wb") as f:
+            write_primary_empty(f, {"DT": float(dt_s), "LAMSCI": float(lam_sci), "ROI": int(psf_roi), "USED": int(n_used)})
+            append_image_hdu(f, cp.asnumpy(psf_long_corr), extname="LONGEXP", extver=1)
+        with open(os.path.join(out_dir, "psf_long_uncorrected.fits"), "wb") as f:
+            write_primary_empty(f, {"DT": float(dt_s), "LAMSCI": float(lam_sci), "ROI": int(psf_roi), "USED": int(n_used)})
+            append_image_hdu(f, cp.asnumpy(psf_long_unc), extname="LONGEXP", extver=1)
+        if psf_long_corr_tt is not None:
+            with open(os.path.join(out_dir, "psf_long_corrected_ttremoved.fits"), "wb") as f:
+                write_primary_empty(f, {"DT": float(dt_s), "LAMSCI": float(lam_sci), "ROI": int(psf_roi), "USED": int(n_used), "TTREM": True})
+                append_image_hdu(f, cp.asnumpy(psf_long_corr_tt), extname="LONGEXP", extver=1)
+
+        # Append LONGEXP extensions into the per-frame PSF FITS files
+        if record_psfs and rec_corr is not None and rec_unc is not None:
+            try:
+                rec_corr.write_longexp(psf_long_corr, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
+                rec_unc.write_longexp(psf_long_unc, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
+            except Exception:
+                pass
+        if rec_corr_tt is not None and psf_long_corr_tt is not None:
+            try:
+                rec_corr_tt.write_longexp(psf_long_corr_tt, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
+            except Exception:
+                pass
+
+        # Finalize recorders
+        if record_psfs and rec_corr is not None and rec_unc is not None:
+            rec_corr.close()
+            rec_unc.close()
+        if rec_corr_tt is not None:
+            rec_corr_tt.close()
+
         # FWHM estimates via Gaussian fit (uses GPU LM fit)
         zoom = int(params.get("fwhm_zoom", 2))
         fitter = Gaussian2DFitter(roi_half=int(params.get("fwhm_roi_half", 32)))
@@ -696,6 +815,8 @@ class AOBatchRunner:
             Iunc_zoom = Analysis._zoom2d(psf_long_unc, zoom, cp)
             fwhm_px_corr = float(fitter.fit_frame(Icorr_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom)[2][0].get())
             fwhm_px_unc = float(fitter.fit_frame(Iunc_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom)[2][0].get())
+            Icorr_moffat = fit_moffat2d(Icorr_zoom.get())[1]
+            Iunc_moffat = fit_moffat2d(Iunc_zoom.get())[1]
         else:
             fwhm_px_corr = float("nan")
             fwhm_px_unc = float("nan")
@@ -714,6 +835,8 @@ class AOBatchRunner:
             "psf_long_uncorrected": psf_long_unc,
             "fwhm_rad_corrected": fwhm_px_corr * plate_rad,
             "fwhm_rad_uncorrected": fwhm_px_unc * plate_rad,
+            "fwhm_rad_corrected_moffat": Icorr_moffat * plate_rad,
+            "fwhm_rad_uncorrected_moffat": Iunc_moffat * plate_rad,
             "psf_tt_mode": self.psf_tt_mode,
             "n_frames_requested": int(n_frames),
             "n_frames_done": int(n_done),
@@ -734,13 +857,19 @@ class AOBatchRunner:
         if record_psfs:
             out.update(
                 {
-                    "psf_corrected_memmap": os.path.join(out_dir, "psf_corrected.f16"),
-                    "psf_uncorrected_memmap": os.path.join(out_dir, "psf_uncorrected.f16"),
+                    # Backward-compatible keys (used by older UI code)
+                    "psf_corrected_memmap": os.path.join(out_dir, "psf_corrected.fits"),
+                    "psf_uncorrected_memmap": os.path.join(out_dir, "psf_uncorrected.fits"),
+                    # Preferred keys
+                    "psf_corrected_fits": os.path.join(out_dir, "psf_corrected.fits"),
+                    "psf_uncorrected_fits": os.path.join(out_dir, "psf_uncorrected.fits"),
+                    "psf_format": "fits_image_extensions",
                     "psf_shape": (n_frames, psf_roi, psf_roi),
                     "psf_frames_written": int(n_done),
-                    "psf_dtype": "float16",
+                    "psf_dtype": "float32",
                 }
-            )
-        if rec_corr_tt is not None:
-            out["psf_corrected_ttremoved_memmap"] = os.path.join(out_dir, "psf_corrected_ttremoved.f16")
+            )        
+            if rec_corr_tt is not None:
+                out["psf_corrected_ttremoved_memmap"] = os.path.join(out_dir, "psf_corrected_ttremoved.fits")
+                out["psf_corrected_ttremoved_fits"] = os.path.join(out_dir, "psf_corrected_ttremoved.fits")
         return out

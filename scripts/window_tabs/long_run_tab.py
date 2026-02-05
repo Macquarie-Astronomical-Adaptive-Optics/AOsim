@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -113,11 +111,11 @@ class LongRun_tab(QWidget):
         grid.addWidget(self.btn_tt_mode, row, 3)
         row += 1
 
-        self.chk_record_psfs = QCheckBox("Record per-frame PSFs (memmap)")
+        self.chk_record_psfs = QCheckBox("Record per-frame PSFs")
         self.chk_record_psfs.setChecked(True)
         grid.addWidget(self.chk_record_psfs, row, 0, 1, 2)
 
-        self.chk_record_ttremoved = QCheckBox("Also record TT-removed corrected PSFs")
+        self.chk_record_ttremoved = QCheckBox("Record TT-removed corrected PSFs")
         self.chk_record_ttremoved.setChecked(False)
         grid.addWidget(self.chk_record_ttremoved, row, 2, 1, 2)
         row += 1
@@ -133,7 +131,7 @@ class LongRun_tab(QWidget):
 
         grid.addWidget(QLabel("Output dir"), row, 0)
         self.edit_out = QLineEdit()
-        base = Path(self.params.get("data_path", "output")) / "batch_runs"
+        base = Path("output") / "batch_runs"
         self.edit_out.setText(str(base))
         grid.addWidget(self.edit_out, row, 1, 1, 3)
         row += 1
@@ -160,6 +158,11 @@ class LongRun_tab(QWidget):
         # Results
         self.lbl_results = QLabel("")
         self.lbl_results.setWordWrap(True)
+        self.lbl_results.setTextFormat(Qt.PlainText)
+        self.lbl_results.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_results.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        left_layout.addWidget(self.lbl_results)
+        
         left_layout.addWidget(self.lbl_results)
 
         # Open folder button
@@ -217,7 +220,7 @@ class LongRun_tab(QWidget):
 
     # ---- UI helpers ----
     def _cycle_tt_mode(self):
-        modes = ["none", "fit", "hybrid"]
+        modes = ["none", "fit"]
         i = modes.index(self._tt_mode)
         self._tt_mode = modes[(i + 1) % len(modes)]
         self.btn_tt_mode.setText(self._tt_mode)
@@ -304,6 +307,8 @@ class LongRun_tab(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
 
+        self.lbl_results.setStyleSheet("")
+
         out_dir = res.get("out_dir")
         if out_dir:
             self._last_out_dir = str(out_dir)
@@ -318,14 +323,20 @@ class LongRun_tab(QWidget):
         # Show summary
         fwhm_c = float(res.get("fwhm_arcsec_corrected", 0.0))
         fwhm_u = float(res.get("fwhm_arcsec_uncorrected", 0.0))
+        fwhm_cmof = float(res.get("fwhm_arcsec_corrected_moffat", 0.0))
+        fwhm_umof = float(res.get("fwhm_arcsec_uncorrected_moffat", 0.0))
         used = int(res.get("n_frames_used", done))
         discard_frames = int(res.get("discard_first_frames", 0))
         discard_s = float(res.get("discard_first_s", 0.0))
+        r0_est = float(res.get("r0_uncorrected_m", 0.0))
         lines = [
             f"Frames: {done}/{total}",
             f"Used for fit: {used} (discarded {discard_frames} frames = {discard_s:.1f} s)",
-            f"FWHM corrected: {fwhm_c:.3f} arcsec",
-            f"FWHM uncorrected: {fwhm_u:.3f} arcsec",
+            f"Gaussian FWHM corrected: {fwhm_c:.3f} arcsec",
+            f"Gaussian FWHM uncorrected: {fwhm_u:.3f} arcsec",
+            f"Moffat FWHM corrected: {fwhm_cmof:.3f} arcsec",
+            f"Moffat FWHM uncorrected: {fwhm_umof:.3f} arcsec",
+            f"Uncorrected r0: {r0_est:.3f} m",
         ]
         if "fwhm_arcsec_corrected_ttremoved" in res:
             lines.append(f"FWHM corrected (TT-removed): {float(res['fwhm_arcsec_corrected_ttremoved']):.3f} arcsec")
@@ -348,15 +359,24 @@ class LongRun_tab(QWidget):
             a = np.log10(a + 1e-12)
             canvas.queue_image(a)
 
-        _show(self.canvas_corr, res.get("psf_long_corrected"))
-        _show(self.canvas_unc, res.get("psf_long_uncorrected"))
-        _show(self.canvas_tt, res.get("psf_long_corrected_ttremoved"))
+        img_corr = res.get("psf_long_corrected")
+        img_unc = res.get("psf_long_uncorrected")
+        _show(self.canvas_corr, img_corr)
+        # self.canvas_corr.set_circle_overlay("fwhm gaussian", img_corr.shape[0]/2, img_corr.shape[1]/2, fwhm_c)
+        # self.canvas_corr.set_circle_overlay("fwhm moffat", img_corr.shape[0]/2, img_corr.shape[1]/2, fwhm_cmof)
+
+        _show(self.canvas_unc, img_unc)
+        # self.canvas_unc.set_circle_overlay("fwhm gaussian", img_unc.shape[0]/2, img_unc.shape[1]/2, fwhm_u)
+        # self.canvas_unc.set_circle_overlay("fwhm moffat", img_unc.shape[0]/2, img_unc.shape[1]/2, fwhm_umof)
 
     @Slot(str)
     def _on_long_run_failed(self, err: str):
+        self.lbl_progress.setText("Failed")
+        self.lbl_results.setStyleSheet("font-family: Consolas, monospace;")
+        self.lbl_results.setText(str(err))
+
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.progress.setValue(0)
-        self.lbl_progress.setText("Failed")
-        self.lbl_results.setText(str(err))
+
         self.btn_open_dir.setEnabled(bool(self._last_out_dir))

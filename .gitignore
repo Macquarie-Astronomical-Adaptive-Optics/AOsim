@@ -217,3 +217,5 @@ __marimo__/
 
 output/
 *.zip
+*/__pycache__/
+scripts/__pycache__/

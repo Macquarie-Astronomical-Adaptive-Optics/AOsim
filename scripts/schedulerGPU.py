@@ -1,4 +1,3 @@
-from __future__ import annotations
 # scripts/schedulerGPU.py
 import time
 import datetime
@@ -6,6 +5,7 @@ from pathlib import Path
 import json
 import os
 import inspect
+import traceback
 import math
 from typing import Any, Dict, List, Optional
 
@@ -85,7 +85,7 @@ class SimWorker(QObject):
     long_run_started = Signal(object)
     long_run_progress = Signal(int, int, float, str)   # done, total, fps, message
     long_run_finished = Signal(object)
-    long_run_failed = Signal(str)
+    long_run_failed = Signal(object)
 
     def __init__(
         self,
@@ -1054,8 +1054,12 @@ class SimWorker(QObject):
                 "cancelled": bool(res.get("cancelled", False)),
                 "fwhm_rad_corrected": float(res.get("fwhm_rad_corrected", 0.0)),
                 "fwhm_rad_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)),
+                "fwhm_rad_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)),
+                "fwhm_rad_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)),
                 "fwhm_arcsec_corrected": float(res.get("fwhm_rad_corrected", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
             }
             if "fwhm_rad_corrected_ttremoved" in res:
                 summary["fwhm_rad_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"])
@@ -1092,8 +1096,26 @@ class SimWorker(QObject):
 
             self.long_run_finished.emit(ui_res)
 
-        except Exception as e:
-            self.long_run_failed.emit(str(e))
+        except Exception:
+            tb = traceback.format_exc()
+
+            # best-effort: save traceback into the run folder if it exists
+            try:
+                if "out_dir" in locals() and out_dir is not None:
+                    p = Path(out_dir) if not isinstance(out_dir, Path) else out_dir
+                    p.mkdir(parents=True, exist_ok=True)
+                    with open(p / "traceback.txt", "w", encoding="utf-8") as f:
+                        f.write(tb)
+            except Exception:
+                pass
+
+            try:
+                self.status_log.emit(tb)
+            except Exception:
+                pass
+
+            print(tb)  # console
+            self.long_run_failed.emit(tb)
 
         finally:
             self._long_run_active = False
