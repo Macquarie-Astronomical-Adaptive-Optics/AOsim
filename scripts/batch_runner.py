@@ -177,7 +177,14 @@ def fit_moffat2d(psf: np.ndarray, fit_box: int = 128, bkg: float | None = None, 
 
     fitter = fitting.TRFLSQFitter()
     mfit = fitter(m0, xx, yy, cut, inplace=True)
-    return mfit, float(mfit.fwhm) / float(zoom)
+    fwhm_px = float(mfit.fwhm) / float(zoom)
+    # Convert fitted center (in cutout coords) back to full image coords, then to native pixels.
+    x0_full = float(x1) + float(getattr(mfit.x_0, 'value', mfit.x_0))
+    y0_full = float(y1) + float(getattr(mfit.y_0, 'value', mfit.y_0))
+    x0_px = x0_full / float(zoom)
+    y0_px = y0_full / float(zoom)
+    r_px = 0.5 * float(fwhm_px)
+    return mfit, {"fwhm_px": float(fwhm_px), "x0_px": float(x0_px), "y0_px": float(y0_px), "r_px": float(r_px)}
 
 
 @dataclass
@@ -317,8 +324,10 @@ class AOBatchRunner:
             self.psf_tt_mode = "fit" if bool(remove_tt_for_psf) else "none"
         else:
             self.psf_tt_mode = str(psf_tt_mode).lower().strip()
-        if self.psf_tt_mode not in ("fit", "hybrid", "none"):
-            raise ValueError("psf_tt_mode must be one of: 'fit', 'hybrid', 'none'")
+        if self.psf_tt_mode == "hybrid":
+            raise ValueError("psf_tt_mode='hybrid' has been removed; use 'fit' or 'none'")
+        if self.psf_tt_mode not in ("fit", "none"):
+            raise ValueError("psf_tt_mode must be one of: 'fit', 'none'")
 
         # Which WFS indices (relative to sensors[1:]) to use for TT estimation in hybrid mode.
         # If None, prefer NGS WFS (infinite range), otherwise fall back to all WFS.
@@ -516,7 +525,7 @@ class AOBatchRunner:
                 extname_chunks="PSF",
             )
 
-# Accumulators
+        # Accumulators
         dx_m = float(params.get("telescope_diameter")) / float(patch_M)
         sf = StructureFunctionAccumulator(self.pupil, dx_m=dx_m, lags_px=structure_lags_px)
 
@@ -810,13 +819,47 @@ class AOBatchRunner:
         zoom = int(params.get("fwhm_zoom", 2))
         fitter = Gaussian2DFitter(roi_half=int(params.get("fwhm_roi_half", 32)))
 
+        # Fit metadata (native PSF pixels; for overlays)
+        gauss_corr = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+        gauss_unc  = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+        moff_corr  = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+        moff_unc   = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+
+        Icorr_moffat = float("nan")
+        Iunc_moffat = float("nan")
+
         if int(n_used) > 0:
             Icorr_zoom = Analysis._zoom2d(psf_long_corr, zoom, cp)
             Iunc_zoom = Analysis._zoom2d(psf_long_unc, zoom, cp)
-            fwhm_px_corr = float(fitter.fit_frame(Icorr_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom)[2][0].get())
-            fwhm_px_unc = float(fitter.fit_frame(Iunc_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom)[2][0].get())
-            Icorr_moffat = fit_moffat2d(Icorr_zoom.get())[1]
-            Iunc_moffat = fit_moffat2d(Iunc_zoom.get())[1]
+
+            # Gaussian (GPU). Note: centers are returned in zoomed pixel coordinates.
+            _p, (xc_z, yc_z), (fwhm_eq_native, _), *_rest = fitter.fit_frame(
+                Icorr_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom
+            )
+            fwhm_px_corr = float(fwhm_eq_native.get())
+            gauss_corr = {
+                "fwhm_px": float(fwhm_px_corr),
+                "x0_px": float(xc_z) / float(zoom),
+                "y0_px": float(yc_z) / float(zoom),
+                "r_px": 0.5 * float(fwhm_px_corr),
+            }
+
+            _p, (xc_z, yc_z), (fwhm_eq_native, _), *_rest = fitter.fit_frame(
+                Iunc_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom
+            )
+            fwhm_px_unc = float(fwhm_eq_native.get())
+            gauss_unc = {
+                "fwhm_px": float(fwhm_px_unc),
+                "x0_px": float(xc_z) / float(zoom),
+                "y0_px": float(yc_z) / float(zoom),
+                "r_px": 0.5 * float(fwhm_px_unc),
+            }
+
+            # Moffat (CPU on zoomed cutout)
+            _mfit, moff_corr = fit_moffat2d(Icorr_zoom.get(), zoom=float(zoom))
+            _mfit, moff_unc = fit_moffat2d(Iunc_zoom.get(), zoom=float(zoom))
+            Icorr_moffat = float(moff_corr.get("fwhm_px", float("nan")))
+            Iunc_moffat = float(moff_unc.get("fwhm_px", float("nan")))
         else:
             fwhm_px_corr = float("nan")
             fwhm_px_unc = float("nan")
@@ -828,7 +871,6 @@ class AOBatchRunner:
                 fwhm_px_corr_tt = float(fitter.fit_frame(Icorr_tt_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom)[2][0].get())
             else:
                 fwhm_px_corr_tt = float("nan")
-
         out: Dict[str, object] = {
             "plate_rad_per_pix": plate_rad,
             "psf_long_corrected": psf_long_corr,
@@ -837,6 +879,11 @@ class AOBatchRunner:
             "fwhm_rad_uncorrected": fwhm_px_unc * plate_rad,
             "fwhm_rad_corrected_moffat": Icorr_moffat * plate_rad,
             "fwhm_rad_uncorrected_moffat": Iunc_moffat * plate_rad,
+            # Fit metadata for overlays (native PSF pixels)
+            "gauss_corrected": gauss_corr,
+            "gauss_uncorrected": gauss_unc,
+            "moffat_corrected": moff_corr,
+            "moffat_uncorrected": moff_unc,
             "psf_tt_mode": self.psf_tt_mode,
             "n_frames_requested": int(n_frames),
             "n_frames_done": int(n_done),

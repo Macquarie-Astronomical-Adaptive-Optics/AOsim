@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
+import pyqtgraph as pg
 from PySide6.QtCore import Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -115,9 +116,6 @@ class LongRun_tab(QWidget):
         self.chk_record_psfs.setChecked(True)
         grid.addWidget(self.chk_record_psfs, row, 0, 1, 2)
 
-        self.chk_record_ttremoved = QCheckBox("Record TT-removed corrected PSFs")
-        self.chk_record_ttremoved.setChecked(False)
-        grid.addWidget(self.chk_record_ttremoved, row, 2, 1, 2)
         row += 1
 
         self.chk_save_tt = QCheckBox("Save TT time series")
@@ -181,14 +179,12 @@ class LongRun_tab(QWidget):
 
         self.canvas_corr = PGCanvas(show_colorbar=False)
         self.canvas_unc = PGCanvas(show_colorbar=False)
-        self.canvas_tt = PGCanvas(show_colorbar=False)
 
         right_layout.addWidget(QLabel("Long exposure PSF (corrected)"))
         right_layout.addWidget(self.canvas_corr)
         right_layout.addWidget(QLabel("Long exposure PSF (uncorrected)"))
         right_layout.addWidget(self.canvas_unc)
-        right_layout.addWidget(QLabel("Long exposure PSF (corrected, TT-removed)"))
-        right_layout.addWidget(self.canvas_tt)
+
 
         root.addWidget(left, 0)
         root.addWidget(right, 1)
@@ -261,7 +257,6 @@ class LongRun_tab(QWidget):
             "chunk_frames": int(self.spin_chunk.value()),
             "psf_roi": int(self.spin_roi.value()),
             "record_psfs": bool(self.chk_record_psfs.isChecked()),
-            "record_psfs_ttremoved": bool(self.chk_record_ttremoved.isChecked()),
             "save_tt_series": bool(self.chk_save_tt.isChecked()),
             "reset_before": bool(self.chk_reset_before.isChecked()),
             "out_dir": out_dir,
@@ -325,6 +320,18 @@ class LongRun_tab(QWidget):
         fwhm_u = float(res.get("fwhm_arcsec_uncorrected", 0.0))
         fwhm_cmof = float(res.get("fwhm_arcsec_corrected_moffat", 0.0))
         fwhm_umof = float(res.get("fwhm_arcsec_uncorrected_moffat", 0.0))
+        gauss_corr = res.get("gauss_corrected")
+        gauss_unc = res.get("gauss_uncorrected")
+        moff_corr = res.get("moffat_corrected")
+        moff_unc = res.get("moffat_uncorrected")
+        def _fmt_fit(label: str, fwhm_arcsec: float, d: Dict[str, Any]) -> str:
+            try:
+                x0 = float(d.get("x0_px", float("nan")))
+                y0 = float(d.get("y0_px", float("nan")))
+                r = float(d.get("r_px", float("nan")))
+            except Exception:
+                x0 = y0 = r = float("nan")
+            return f"{label}: {fwhm_arcsec:.3f} arcsec (x0={x0:.2f}, y0={y0:.2f}, r={r:.2f} px)"
         used = int(res.get("n_frames_used", done))
         discard_frames = int(res.get("discard_first_frames", 0))
         discard_s = float(res.get("discard_first_s", 0.0))
@@ -332,14 +339,12 @@ class LongRun_tab(QWidget):
         lines = [
             f"Frames: {done}/{total}",
             f"Used for fit: {used} (discarded {discard_frames} frames = {discard_s:.1f} s)",
-            f"Gaussian FWHM corrected: {fwhm_c:.3f} arcsec",
-            f"Gaussian FWHM uncorrected: {fwhm_u:.3f} arcsec",
-            f"Moffat FWHM corrected: {fwhm_cmof:.3f} arcsec",
-            f"Moffat FWHM uncorrected: {fwhm_umof:.3f} arcsec",
+            _fmt_fit("Gaussian FWHM corrected", fwhm_c, gauss_corr),
+            _fmt_fit("Gaussian FWHM uncorrected", fwhm_u, gauss_unc),
+            _fmt_fit("Moffat FWHM corrected", fwhm_cmof, moff_corr),
+            _fmt_fit("Moffat FWHM uncorrected", fwhm_umof, moff_unc),
             f"Uncorrected r0: {r0_est:.3f} m",
         ]
-        if "fwhm_arcsec_corrected_ttremoved" in res:
-            lines.append(f"FWHM corrected (TT-removed): {float(res['fwhm_arcsec_corrected_ttremoved']):.3f} arcsec")
         if "r0_effective_m" in res:
             lines.append(f"Effective r0: {float(res['r0_effective_m']):.4f} m")
         elif "r0_est_m" in res:
@@ -361,13 +366,37 @@ class LongRun_tab(QWidget):
 
         img_corr = res.get("psf_long_corrected")
         img_unc = res.get("psf_long_uncorrected")
+
+        def _apply_overlays(canvas: PGCanvas, img: np.ndarray, g: Dict[str, Any], m: Dict[str, Any]):
+            if img is None:
+                return
+            # Defaults if fit failed
+            xg = float(g.get("x0_px", img.shape[1] * 0.5))
+            yg = float(g.get("y0_px", img.shape[0] * 0.5))
+            rg = float(g.get("r_px", 0.5 * float(g.get("fwhm_px", 0.0))))
+            xm = float(m.get("x0_px", img.shape[1] * 0.5))
+            ym = float(m.get("y0_px", img.shape[0] * 0.5))
+            rm = float(m.get("r_px", 0.5 * float(m.get("fwhm_px", 0.0))))
+
+            pen_g = pg.mkPen((255, 0, 0), width=2)
+            pen_m = pg.mkPen((255, 0, 222), width=2)
+
+            canvas.set_circle_overlay("fwhm_gauss", xg, yg, rg, pen=pen_g)
+            canvas.set_circle_overlay("fwhm_moffat", xm, ym, rm, pen=pen_m)
+
+            legend_html = (
+                '<div style="background-color:rgba(0,0,0,180); padding:4px; border-radius:4px;">'
+                '<span style="color:rgb(255,0,0);">●</span> Gaussian FWHM<br>'
+                '<span style="color:rgb(0,255,0);">●</span> Moffat FWHM'
+                '</div>'
+            )
+            canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 0.0), offset=(8.0, 8.0))
+
         _show(self.canvas_corr, img_corr)
-        # self.canvas_corr.set_circle_overlay("fwhm gaussian", img_corr.shape[0]/2, img_corr.shape[1]/2, fwhm_c)
-        # self.canvas_corr.set_circle_overlay("fwhm moffat", img_corr.shape[0]/2, img_corr.shape[1]/2, fwhm_cmof)
+        _apply_overlays(self.canvas_corr, np.asarray(img_corr) if img_corr is not None else None, gauss_corr, moff_corr)
 
         _show(self.canvas_unc, img_unc)
-        # self.canvas_unc.set_circle_overlay("fwhm gaussian", img_unc.shape[0]/2, img_unc.shape[1]/2, fwhm_u)
-        # self.canvas_unc.set_circle_overlay("fwhm moffat", img_unc.shape[0]/2, img_unc.shape[1]/2, fwhm_umof)
+        _apply_overlays(self.canvas_unc, np.asarray(img_unc) if img_unc is not None else None, gauss_unc, moff_unc)
 
     @Slot(str)
     def _on_long_run_failed(self, err: str):

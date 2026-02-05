@@ -933,6 +933,38 @@ class PGCanvas(QWidget):
         if self._emit_grab:
             self.grab.emit(self.view.grab())
 
+    def set_text_overlay(
+        self,
+        name: str,
+        html: str,
+        anchor: Tuple[float, float] = (0.0, 0.0),
+        offset: Tuple[float, float] = (8.0, 8.0),
+        z: int = 200,
+    ):
+        """Draw/update an anchored HTML text overlay in view coordinates."""
+        from pyqtgraph import TextItem
+
+        if name not in self._overlays:
+            item = TextItem(html=html, anchor=anchor)
+            item.setZValue(z)
+            self.vb.addItem(item, ignoreBounds=True)
+            self._overlays[name] = OverlaySpec(item=item, kind="text", z=z)
+        else:
+            item = self._overlays[name].item
+            item.setHtml(html)
+            item.setAnchor(anchor)
+            item.setZValue(z)
+
+        # Place near top-left of current view
+        vr = self.vb.viewRange()
+        x = float(vr[0][0]) + float(offset[0])
+        y = float(vr[1][1]) + float(offset[1])
+        item.setPos(x, y)
+
+        if self._emit_grab:
+            self.grab.emit(self.view.grab())
+
+
     def set_ellipse_overlay(
         self,
         name: str,

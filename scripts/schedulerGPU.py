@@ -1054,12 +1054,15 @@ class SimWorker(QObject):
                 "cancelled": bool(res.get("cancelled", False)),
                 "fwhm_rad_corrected": float(res.get("fwhm_rad_corrected", 0.0)),
                 "fwhm_rad_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)),
-                "fwhm_rad_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)),
-                "fwhm_rad_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)),
                 "fwhm_arcsec_corrected": float(res.get("fwhm_rad_corrected", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
+                # Fit metadata for overlays (native PSF pixels)
+                "gauss_corrected": res.get("gauss_corrected"),
+                "gauss_uncorrected": res.get("gauss_uncorrected"),
+                "moffat_corrected": res.get("moffat_corrected"),
+                "moffat_uncorrected": res.get("moffat_uncorrected"),
             }
             if "fwhm_rad_corrected_ttremoved" in res:
                 summary["fwhm_rad_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"])
