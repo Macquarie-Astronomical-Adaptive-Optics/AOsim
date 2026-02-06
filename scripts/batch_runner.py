@@ -114,7 +114,7 @@ def _phase_to_psf_batch(
 import numpy as np
 from astropy.modeling import models, fitting
 
-def fit_moffat2d(psf: np.ndarray, fit_box: int = 128, bkg: float | None = None, zoom: float = 2):
+def fit_moffat2d(psf: np.ndarray, fit_box: int = 1024, bkg: float | None = None, zoom: float = 2):
     """
     Fit astropy.modeling.models.Moffat2D to the PSF core.
 
@@ -184,7 +184,20 @@ def fit_moffat2d(psf: np.ndarray, fit_box: int = 128, bkg: float | None = None, 
     x0_px = x0_full / float(zoom)
     y0_px = y0_full / float(zoom)
     r_px = 0.5 * float(fwhm_px)
-    return mfit, {"fwhm_px": float(fwhm_px), "x0_px": float(x0_px), "y0_px": float(y0_px), "r_px": float(r_px)}
+    gamma_full = float(getattr(mfit.gamma, "value", mfit.gamma))
+    alpha = float(getattr(mfit.alpha, "value", mfit.alpha))
+    amp = float(getattr(mfit.amplitude, "value", mfit.amplitude))
+    gamma_px = gamma_full / float(zoom)
+    return mfit, {
+        "fwhm_px": float(fwhm_px),
+        "x0_px": float(x0_px),
+        "y0_px": float(y0_px),
+        "r_px": float(r_px),
+        "amp": amp,
+        "bkg": float(bkg),
+        "gamma_px": float(gamma_px),
+        "alpha": float(alpha),
+    }
 
 
 @dataclass
@@ -842,6 +855,9 @@ class AOBatchRunner:
                 "x0_px": float(xc_z) / float(zoom),
                 "y0_px": float(yc_z) / float(zoom),
                 "r_px": 0.5 * float(fwhm_px_corr),
+                "amp": float(_p[0].get()),
+                "sigma_px": float(_p[3].get()) / float(zoom),
+                "bkg": float(_p[4].get()),
             }
 
             _p, (xc_z, yc_z), (fwhm_eq_native, _), *_rest = fitter.fit_frame(
@@ -853,6 +869,9 @@ class AOBatchRunner:
                 "x0_px": float(xc_z) / float(zoom),
                 "y0_px": float(yc_z) / float(zoom),
                 "r_px": 0.5 * float(fwhm_px_unc),
+                "amp": float(_p[0].get()),
+                "sigma_px": float(_p[3].get()) / float(zoom),
+                "bkg": float(_p[4].get()),
             }
 
             # Moffat (CPU on zoomed cutout)

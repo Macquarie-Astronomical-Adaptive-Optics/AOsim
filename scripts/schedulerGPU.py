@@ -1058,6 +1058,7 @@ class SimWorker(QObject):
                 "fwhm_arcsec_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "plate_rad_per_pix": float(res.get("plate_rad_per_pix", 0.0) or 0.0),
                 # Fit metadata for overlays (native PSF pixels)
                 "gauss_corrected": res.get("gauss_corrected"),
                 "gauss_uncorrected": res.get("gauss_uncorrected"),

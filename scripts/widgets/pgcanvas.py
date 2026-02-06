@@ -933,15 +933,65 @@ class PGCanvas(QWidget):
         if self._emit_grab:
             self.grab.emit(self.view.grab())
 
+    def set_curve_overlay(
+        self,
+        name: str,
+        x: np.ndarray,
+        y: np.ndarray,
+        pen=None,
+        z: int = 120,
+    ):
+        """Draw/update a polyline curve in image/data coordinates.
+
+        Useful for embedding 1D cross-sections as "marginal" overlays around an image.
+        """
+        if pen is None:
+            pen = pg.mkPen(255, 255, 255, width=1)
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+
+        if name not in self._overlays:
+            item = pg.PlotCurveItem(x=x, y=y, pen=pen)
+            item.setZValue(z)
+            self.vb.addItem(item)
+            self._overlays[name] = OverlaySpec(item=item, kind="curve", z=z)
+        else:
+            item = self._overlays[name].item
+            try:
+                item.setData(x=x, y=y)
+            except Exception:
+                # If a wrong type was stored under this name, drop and recreate.
+                self.remove_overlay(name)
+                item = pg.PlotCurveItem(x=x, y=y, pen=pen)
+                item.setZValue(z)
+                self.vb.addItem(item)
+                self._overlays[name] = OverlaySpec(item=item, kind="curve", z=z)
+
+            try:
+                item.setPen(pen)
+            except Exception:
+                pass
+            item.setZValue(z)
+
+        if self._emit_grab:
+            self.grab.emit(self.view.grab())
+
     def set_text_overlay(
         self,
         name: str,
         html: str,
         anchor: Tuple[float, float] = (0.0, 0.0),
         offset: Tuple[float, float] = (8.0, 8.0),
+        relative_to: str = "image",
         z: int = 200,
     ):
-        """Draw/update an anchored HTML text overlay in view coordinates."""
+        """Draw/update an anchored HTML text overlay.
+
+        If `relative_to="image"` (default), the item is positioned relative to the
+        current ImageItem bounds (so zooming/panning the ViewBox won't cause the
+        legend to fly off into the corner on the next update).
+        """
         from pyqtgraph import TextItem
 
         if name not in self._overlays:
@@ -955,15 +1005,31 @@ class PGCanvas(QWidget):
             item.setAnchor(anchor)
             item.setZValue(z)
 
-        # Place near top-left of current view
-        vr = self.vb.viewRange()
-        x = float(vr[0][0]) + float(offset[0])
-        y = float(vr[1][1]) + float(offset[1])
+        # Keep legend size constant in screen space.
+        try:
+            item.setFlag(QtGui.QGraphicsItem.ItemIgnoresTransformations, True)
+        except Exception:
+            pass
+
+        # Position relative to the image (preferred), otherwise fall back to view range.
+        x = y = None
+        if str(relative_to).lower() == "image":
+            try:
+                br = self.image_item.boundingRect()
+                if br.width() > 0 and br.height() > 0:
+                    x = float(br.left()) + float(offset[0])
+                    y = float(br.top()) + float(offset[1])
+            except Exception:
+                x = y = None
+
+        if x is None or y is None:
+            vr = self.vb.viewRange()
+            x = float(vr[0][0]) + float(offset[0])
+            y = float(vr[1][1]) + float(offset[1])
         item.setPos(x, y)
 
         if self._emit_grab:
             self.grab.emit(self.view.grab())
-
 
     def set_ellipse_overlay(
         self,

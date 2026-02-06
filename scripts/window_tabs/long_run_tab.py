@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QGroupBox,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -160,8 +161,7 @@ class LongRun_tab(QWidget):
         self.lbl_results.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lbl_results.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left_layout.addWidget(self.lbl_results)
-        
-        left_layout.addWidget(self.lbl_results)
+
 
         # Open folder button
         self.btn_open_dir = QPushButton("Open output folder")
@@ -171,19 +171,18 @@ class LongRun_tab(QWidget):
 
         left_layout.addStretch(1)
 
-        # Right: PSF canvases
+        # Right: PSF canvases + marginal cross-sections
         right = QFrame()
         right.setFrameShape(QFrame.Box)
         right.setLineWidth(1)
-        right_layout = QVBoxLayout(right)
+        right_layout = QHBoxLayout(right)
 
-        self.canvas_corr = PGCanvas(show_colorbar=False)
-        self.canvas_unc = PGCanvas(show_colorbar=False)
+        self._psf_corr = self._make_psf_panel("Long exposure PSF (corrected)")
+        self._psf_unc = self._make_psf_panel("Long exposure PSF (uncorrected)")
 
-        right_layout.addWidget(QLabel("Long exposure PSF (corrected)"))
-        right_layout.addWidget(self.canvas_corr)
-        right_layout.addWidget(QLabel("Long exposure PSF (uncorrected)"))
-        right_layout.addWidget(self.canvas_unc)
+        right_layout.addWidget(self._psf_corr["widget"])
+        right_layout.addSpacing(8)
+        right_layout.addWidget(self._psf_unc["widget"])
 
 
         root.addWidget(left, 0)
@@ -203,8 +202,294 @@ class LongRun_tab(QWidget):
 
         self._last_out_dir: Optional[str] = None
 
-        # Initialize labels
-        self._update_frames_label()
+    # ---- PSF panel helpers ----
+    def _make_psf_panel(self, title: str) -> Dict[str, Any]:
+        """PSF panel.
+
+        Instead of separate marginal PlotWidgets, we draw the X/Y profiles as
+        curve overlays *in the same ViewBox as the PSF image*, but shifted into
+        a reserved margin region to the bottom and right of the image.
+        """
+        box = QGroupBox(title)
+        outer = QVBoxLayout(box)
+        # Leave space for the groupbox title.
+        outer.setContentsMargins(8, 14, 8, 8)
+        canvas = PGCanvas(show_colorbar=False)
+
+        canvas.setMinimumHeight(360)
+        outer.addWidget(canvas)
+        return {"widget": box, "canvas": canvas}
+
+    def _update_profiles(
+        self,
+        panel: Dict[str, Any],
+        img: Optional[np.ndarray],
+        gfit: Dict[str, Any],
+        mfit: Dict[str, Any],
+        plate_rad_per_pix: float,
+    ):
+        """Draw X/Y cross-sections as overlays on the PSF canvas.
+
+        The trick is to reserve a margin region to the bottom (for X profile)
+        and right (for Y profile) in the **same ViewBox** as the image.
+        Then we map each pixel's intensity into that margin.
+
+        This makes each profile sample correspond 1:1 to a pixel coordinate
+        in the displayed image.
+        """
+        if img is None:
+            return
+
+        a = np.asarray(img, dtype=float)
+        if a.ndim != 2 or a.size == 0:
+            return
+
+        canvas: PGCanvas = panel["canvas"]
+        H, W = a.shape
+
+        def _finite_center(d: Dict[str, Any]) -> tuple[float, float] | None:
+            try:
+                x0 = float(d.get("x0_px", float("nan")))
+                y0 = float(d.get("y0_px", float("nan")))
+            except Exception:
+                return None
+            if not np.isfinite(x0) or not np.isfinite(y0):
+                return None
+            return (float(np.clip(x0, 0.0, W - 1.0)), float(np.clip(y0, 0.0, H - 1.0)))
+
+        c_g = _finite_center(gfit)
+        c_m = _finite_center(mfit)
+        if c_g is None and c_m is None:
+            yy, xx = np.unravel_index(int(np.argmax(a)), a.shape)
+            c_g = (float(xx), float(yy))
+
+        # One data slice only (like classic astronomy tools): take it through a
+        # single reference center, then overlay both models evaluated along that
+        # same cut.
+        c_ref = c_g if c_g is not None else c_m
+
+        # --- reserve margins for the profiles (in image pixel units) ---
+        mx = int(max(40, min(0.35 * W, 0.6 * W)))
+        my = int(max(40, min(0.35 * H, 0.6 * H)))
+        pad = 4.0
+        x_im_max = float(W - 0.5)
+        y_im_max = float(H - 0.5)
+        x_base = x_im_max + pad
+        y_base = y_im_max + pad
+
+        # Expand the ViewBox so the margin region is visible.
+        try:
+            canvas.vb.setRange(
+                xRange=(-0.5, x_base + float(mx)),
+                yRange=(-0.5, y_base + float(my)),
+                padding=0.0,
+            )
+        except Exception:
+            pass
+
+        # Sub-pixel slice via linear interpolation (so it matches the fitted centers)
+        def _row_at(y0: float) -> np.ndarray:
+            y_f = int(np.floor(y0))
+            y_c = min(y_f + 1, H - 1)
+            ty = y0 - float(y_f)
+            return (1.0 - ty) * a[y_f, :] + ty * a[y_c, :]
+
+        def _col_at(x0: float) -> np.ndarray:
+            x_f = int(np.floor(x0))
+            x_c = min(x_f + 1, W - 1)
+            tx = x0 - float(x_f)
+            return (1.0 - tx) * a[:, x_f] + tx * a[:, x_c]
+
+        eps = 1e-12
+
+        # Bundle curves (log10 intensity) so we can normalize all to the same display scale.
+        curves_x: Dict[str, np.ndarray] = {}
+        curves_y: Dict[str, np.ndarray] = {}
+
+        # Data slice: ONE cut only (classic astronomy tool behavior).
+        # We take it through the reference center (Gaussian if available, else Moffat, else peak)
+        # and then evaluate *both* models along that same cut.
+        if c_ref is None:
+            return
+        x0r, y0r = c_ref
+        curves_x["data"] = np.log10(np.maximum(_row_at(y0r), 0.0) + eps)
+        curves_y["data"] = np.log10(np.maximum(_col_at(x0r), 0.0) + eps)
+
+        # Gaussian model (evaluated along the data cut)
+        try:
+            A = float(gfit.get("amp", np.nan))
+            s = float(gfit.get("sigma_px", np.nan))
+            b0 = float(gfit.get("bkg", 0.0))
+            if c_g is not None and np.isfinite(A) and np.isfinite(s) and s > 0:
+                x0g, y0g = c_g
+                dx = np.arange(W, dtype=float) - x0g
+                dy = np.arange(H, dtype=float) - y0g
+                # Cross-section through y=y0r (row) and x=x0r (col)
+                dy0 = float(y0r) - y0g
+                dx0 = float(x0r) - x0g
+                g_row = A * np.exp(-0.5 * ((dx * dx) + (dy0 * dy0)) / (s * s)) + b0
+                g_col = A * np.exp(-0.5 * ((dy * dy) + (dx0 * dx0)) / (s * s)) + b0
+                curves_x["g_model"] = np.log10(np.maximum(g_row, 0.0) + eps)
+                curves_y["g_model"] = np.log10(np.maximum(g_col, 0.0) + eps)
+        except Exception:
+            pass
+
+        # Moffat model (evaluated along the data cut)
+        try:
+            A = float(mfit.get("amp", np.nan))
+            gamma = float(mfit.get("gamma_px", np.nan))
+            alpha = float(mfit.get("alpha", np.nan))
+            b0 = float(mfit.get("bkg", 0.0))
+            if c_m is not None and np.isfinite(A) and np.isfinite(gamma) and np.isfinite(alpha) and gamma > 0 and alpha > 0:
+                x0m, y0m = c_m
+                dx = np.arange(W, dtype=float) - x0m
+                dy = np.arange(H, dtype=float) - y0m
+                dy0 = float(y0r) - y0m
+                dx0 = float(x0r) - x0m
+                m_row = A * (1.0 + ((dx * dx) + (dy0 * dy0)) / (gamma * gamma)) ** (-alpha) + b0
+                m_col = A * (1.0 + ((dy * dy) + (dx0 * dx0)) / (gamma * gamma)) ** (-alpha) + b0
+                curves_x["m_model"] = np.log10(np.maximum(m_row, 0.0) + eps)
+                curves_y["m_model"] = np.log10(np.maximum(m_col, 0.0) + eps)
+        except Exception:
+            pass
+
+        def _finite_minmax(vals: list[np.ndarray]) -> tuple[float, float] | None:
+            mins = []
+            maxs = []
+            for v in vals:
+                v = np.asarray(v, dtype=float)
+                if v.size == 0:
+                    continue
+                mn = float(np.nanmin(v))
+                mx_ = float(np.nanmax(v))
+                if np.isfinite(mn) and np.isfinite(mx_):
+                    mins.append(mn)
+                    maxs.append(mx_)
+            if not mins or not maxs:
+                return None
+            mn = min(mins)
+            mx_ = max(maxs)
+            if not np.isfinite(mn) or not np.isfinite(mx_) or abs(mx_ - mn) < 1e-12:
+                return None
+            return (mn, mx_)
+
+        mmx = _finite_minmax(list(curves_x.values()))
+        mmy = _finite_minmax(list(curves_y.values()))
+        if mmx is None or mmy is None:
+            return
+        zx0, zx1 = mmx
+        zy0, zy1 = mmy
+
+        x_pix = np.arange(W, dtype=float)
+        y_pix = np.arange(H, dtype=float)
+
+        def _map_h(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            n = (np.asarray(z, dtype=float) - zx0) / (zx1 - zx0)
+            n = np.clip(n, 0.0, 1.0)
+            yy = y_base + (1.0 - n) * float(my)
+            return x_pix, yy
+
+        def _map_v(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            n = (np.asarray(z, dtype=float) - zy0) / (zy1 - zy0)
+            n = np.clip(n, 0.0, 1.0)
+            xx = x_base + (1.0 - n) * float(mx)
+            return xx, y_pix
+
+        # Pens
+        pen_data = pg.mkPen((200, 200, 200), width=1)
+        pen_g_model = pg.mkPen((255, 0, 0), width=2)
+        pen_m_model = pg.mkPen((255, 0, 222), width=2)
+        # FWHM markers (match circle overlays)
+        pen_g_fwhm = pg.mkPen((255, 0, 0), width=1, style=Qt.DashLine)
+        pen_m_fwhm = pg.mkPen((255, 0, 222), width=1, style=Qt.DashLine)
+
+        # Remove legacy per-fit data cuts (from earlier versions)
+        for legacy in ("prof_x_g_data", "prof_y_g_data", "prof_x_m_data", "prof_y_m_data"):
+            canvas.remove_overlay(legacy)
+
+        # Draw/update curves
+        if "data" in curves_x:
+            x, y = _map_h(curves_x["data"])
+            canvas.set_curve_overlay("prof_x_data", x, y, pen=pen_data)
+        else:
+            canvas.remove_overlay("prof_x_data")
+        if "data" in curves_y:
+            x, y = _map_v(curves_y["data"])
+            canvas.set_curve_overlay("prof_y_data", x, y, pen=pen_data)
+        else:
+            canvas.remove_overlay("prof_y_data")
+
+        if "g_model" in curves_x:
+            x, y = _map_h(curves_x["g_model"])
+            canvas.set_curve_overlay("prof_x_g_model", x, y, pen=pen_g_model)
+        else:
+            canvas.remove_overlay("prof_x_g_model")
+        if "g_model" in curves_y:
+            x, y = _map_v(curves_y["g_model"])
+            canvas.set_curve_overlay("prof_y_g_model", x, y, pen=pen_g_model)
+        else:
+            canvas.remove_overlay("prof_y_g_model")
+
+        if "m_model" in curves_x:
+            x, y = _map_h(curves_x["m_model"])
+            canvas.set_curve_overlay("prof_x_m_model", x, y, pen=pen_m_model)
+        else:
+            canvas.remove_overlay("prof_x_m_model")
+        if "m_model" in curves_y:
+            x, y = _map_v(curves_y["m_model"])
+            canvas.set_curve_overlay("prof_y_m_model", x, y, pen=pen_m_model)
+        else:
+            canvas.remove_overlay("prof_y_m_model")
+
+        # ---- FWHM boundary markers on the profiles (match the circle overlays) ----
+        def _radius_px(d: Dict[str, Any]) -> Optional[float]:
+            try:
+                r = float(d.get("r_px", float("nan")))
+            except Exception:
+                r = float("nan")
+            if np.isfinite(r) and r > 0:
+                return r
+            try:
+                f = float(d.get("fwhm_px", float("nan")))
+            except Exception:
+                f = float("nan")
+            if np.isfinite(f) and f > 0:
+                return 0.5 * f
+            return None
+
+        def _set_bounds(prefix: str, center: Optional[tuple[float, float]], r_px: Optional[float], pen):
+            # bottom margin (X-profile): vertical lines at x = x0 ± r
+            # right margin (Y-profile): horizontal lines at y = y0 ± r
+            names = (
+                f"prof_x_{prefix}_fwhm_p",
+                f"prof_x_{prefix}_fwhm_m",
+                f"prof_y_{prefix}_fwhm_p",
+                f"prof_y_{prefix}_fwhm_m",
+            )
+            if center is None or r_px is None or (not np.isfinite(r_px)) or r_px <= 0:
+                for n in names:
+                    canvas.remove_overlay(n)
+                return
+
+            x0, y0 = center
+            rp = float(r_px)
+
+            # Clip to image extent to avoid drawing off-canvas
+            x_p = float(np.clip(x0 + rp, -0.5, W - 0.5))
+            x_m = float(np.clip(x0 - rp, -0.5, W - 0.5))
+            y_p = float(np.clip(y0 + rp, -0.5, H - 0.5))
+            y_m = float(np.clip(y0 - rp, -0.5, H - 0.5))
+
+            # X-profile bounds: vertical lines spanning the bottom margin region
+            canvas.set_curve_overlay(names[0], np.array([x_p, x_p]), np.array([y_base, y_base + float(my)]), pen=pen)
+            canvas.set_curve_overlay(names[1], np.array([x_m, x_m]), np.array([y_base, y_base + float(my)]), pen=pen)
+
+            # Y-profile bounds: horizontal lines spanning the right margin region
+            canvas.set_curve_overlay(names[2], np.array([x_base, x_base + float(mx)]), np.array([y_p, y_p]), pen=pen)
+            canvas.set_curve_overlay(names[3], np.array([x_base, x_base + float(mx)]), np.array([y_m, y_m]), pen=pen)
+
+        _set_bounds("g", c_g, _radius_px(gfit), pen_g_fwhm)
+        _set_bounds("m", c_m, _radius_px(mfit), pen_m_fwhm)
 
     def showEvent(self, event):
         # Avoid per-tick GUI work in other tabs while this tab is visible.
@@ -320,10 +605,10 @@ class LongRun_tab(QWidget):
         fwhm_u = float(res.get("fwhm_arcsec_uncorrected", 0.0))
         fwhm_cmof = float(res.get("fwhm_arcsec_corrected_moffat", 0.0))
         fwhm_umof = float(res.get("fwhm_arcsec_uncorrected_moffat", 0.0))
-        gauss_corr = res.get("gauss_corrected")
-        gauss_unc = res.get("gauss_uncorrected")
-        moff_corr = res.get("moffat_corrected")
-        moff_unc = res.get("moffat_uncorrected")
+        gauss_corr = res.get("gauss_corrected") or {}
+        gauss_unc = res.get("gauss_uncorrected") or {}
+        moff_corr = res.get("moffat_corrected") or {}
+        moff_unc = res.get("moffat_uncorrected") or {}
         def _fmt_fit(label: str, fwhm_arcsec: float, d: Dict[str, Any]) -> str:
             try:
                 x0 = float(d.get("x0_px", float("nan")))
@@ -352,30 +637,39 @@ class LongRun_tab(QWidget):
 
         self.lbl_results.setText("\n".join(lines))
 
+        plate = float(res.get("plate_rad_per_pix", 0.0) or 0.0)
+
         # Display images (log scale for visibility)
-        def _show(canvas: PGCanvas, img: Optional[np.ndarray]):
+        def _show(panel: Dict[str, Any], img: Optional[np.ndarray]):
             if img is None:
                 return
             a = np.asarray(img)
             if a.ndim != 2:
                 return
-            # avoid log(0)
             a = np.maximum(a, 0)
-            a = np.log10(a + 1e-12)
-            canvas.queue_image(a)
-
-        img_corr = res.get("psf_long_corrected")
-        img_unc = res.get("psf_long_uncorrected")
+            # Render immediately so we can safely expand the ViewBox for profile margins.
+            panel["canvas"].set_image(np.log10(a + 1e-12))
 
         def _apply_overlays(canvas: PGCanvas, img: np.ndarray, g: Dict[str, Any], m: Dict[str, Any]):
             if img is None:
                 return
-            # Defaults if fit failed
-            xg = float(g.get("x0_px", img.shape[1] * 0.5))
-            yg = float(g.get("y0_px", img.shape[0] * 0.5))
+
+            # Use each fit's own center; fall back to the peak if a fit failed.
+            yy, xx = np.unravel_index(int(np.argmax(img)), img.shape)
+            xpk, ypk = float(xx), float(yy)
+
+            xg = float(g.get("x0_px", xpk))
+            yg = float(g.get("y0_px", ypk))
+            if not np.isfinite(xg) or not np.isfinite(yg):
+                xg, yg = xpk, ypk
+
+            xm = float(m.get("x0_px", xpk))
+            ym = float(m.get("y0_px", ypk))
+            if not np.isfinite(xm) or not np.isfinite(ym):
+                xm, ym = xpk, ypk
+
+            # Radii from fits
             rg = float(g.get("r_px", 0.5 * float(g.get("fwhm_px", 0.0))))
-            xm = float(m.get("x0_px", img.shape[1] * 0.5))
-            ym = float(m.get("y0_px", img.shape[0] * 0.5))
             rm = float(m.get("r_px", 0.5 * float(m.get("fwhm_px", 0.0))))
 
             pen_g = pg.mkPen((255, 0, 0), width=2)
@@ -387,16 +681,26 @@ class LongRun_tab(QWidget):
             legend_html = (
                 '<div style="background-color:rgba(0,0,0,180); padding:4px; border-radius:4px;">'
                 '<span style="color:rgb(255,0,0);">●</span> Gaussian FWHM<br>'
-                '<span style="color:rgb(0,255,0);">●</span> Moffat FWHM'
+                '<span style="color:rgb(255,0,222);">●</span> Moffat FWHM'
                 '</div>'
             )
             canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 0.0), offset=(8.0, 8.0))
 
-        _show(self.canvas_corr, img_corr)
-        _apply_overlays(self.canvas_corr, np.asarray(img_corr) if img_corr is not None else None, gauss_corr, moff_corr)
+        img_corr = res.get("psf_long_corrected")
+        img_unc = res.get("psf_long_uncorrected")
 
-        _show(self.canvas_unc, img_unc)
-        _apply_overlays(self.canvas_unc, np.asarray(img_unc) if img_unc is not None else None, gauss_unc, moff_unc)
+        img_corr_a = np.asarray(img_corr) if img_corr is not None else None
+        img_unc_a = np.asarray(img_unc) if img_unc is not None else None
+
+        if img_corr_a is not None and img_corr_a.ndim == 2:
+            _show(self._psf_corr, img_corr_a)
+            _apply_overlays(self._psf_corr["canvas"], img_corr_a, gauss_corr, moff_corr)
+            self._update_profiles(self._psf_corr, img_corr_a, gauss_corr, moff_corr, plate)
+
+        if img_unc_a is not None and img_unc_a.ndim == 2:
+            _show(self._psf_unc, img_unc_a)
+            _apply_overlays(self._psf_unc["canvas"], img_unc_a, gauss_unc, moff_unc)
+            self._update_profiles(self._psf_unc, img_unc_a, gauss_unc, moff_unc, plate)
 
     @Slot(str)
     def _on_long_run_failed(self, err: str):
