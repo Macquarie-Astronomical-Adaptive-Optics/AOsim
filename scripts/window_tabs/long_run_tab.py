@@ -7,6 +7,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDoubleSpinBox,
     QFrame,
@@ -18,6 +19,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -113,6 +116,32 @@ class LongRun_tab(QWidget):
         grid.addWidget(self.btn_tt_mode, row, 3)
         row += 1
 
+        # Off-axis evaluation points (arcsec): semicolon-separated "dx,dy" pairs.
+        grid.addWidget(QLabel("Off-axis points (arcsec)"), row, 0)
+        self.edit_offaxis = QLineEdit()
+        self.edit_offaxis.setPlaceholderText("dx,dy; dx,dy; ...  (leave blank for on-axis only)")
+        grid.addWidget(self.edit_offaxis, row, 1, 1, 3)
+        row += 1
+
+        self.chk_eval_unc_offaxis = QCheckBox("Compute off-axis uncorrected PSFs (slower)")
+        self.chk_eval_unc_offaxis.setChecked(True)
+        grid.addWidget(self.chk_eval_unc_offaxis, row, 0, 1, 2)
+
+        self.chk_write_offaxis_fits = QCheckBox("Write off-axis long-exposure FITS")
+        self.chk_write_offaxis_fits.setChecked(True)
+        grid.addWidget(self.chk_write_offaxis_fits, row, 2, 1, 2)
+        row += 1
+
+        self.chk_write_unc_offaxis_fits = QCheckBox("Also write uncorrected off-axis FITS")
+        self.chk_write_unc_offaxis_fits.setChecked(False)
+        grid.addWidget(self.chk_write_unc_offaxis_fits, row, 0, 1, 2)
+
+        hint2 = QLabel("(needs off-axis uncorrected enabled)")
+        hint2.setAlignment(Qt.AlignLeft)
+        hint2.setStyleSheet("color: #666;")
+        grid.addWidget(hint2, row, 2, 1, 2)
+        row += 1
+
         self.chk_record_psfs = QCheckBox("Record per-frame PSFs")
         self.chk_record_psfs.setChecked(True)
         grid.addWidget(self.chk_record_psfs, row, 0, 1, 2)
@@ -161,6 +190,28 @@ class LongRun_tab(QWidget):
         self.lbl_results.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lbl_results.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left_layout.addWidget(self.lbl_results)
+
+        # Off-axis results table (shown only if off-axis evaluation was run)
+        self.grp_offaxis = QGroupBox("Off-axis FWHM (long-exposure)")
+        self.grp_offaxis.setVisible(False)
+        off_lay = QVBoxLayout(self.grp_offaxis)
+        self.lbl_offaxis_stats = QLabel("")
+        self.lbl_offaxis_stats.setWordWrap(True)
+        self.lbl_offaxis_stats.setTextFormat(Qt.PlainText)
+        off_lay.addWidget(self.lbl_offaxis_stats)
+
+        self.tbl_offaxis = QTableWidget()
+        self.tbl_offaxis.setColumnCount(7)
+        self.tbl_offaxis.setHorizontalHeaderLabels(
+            ["#", "dx (arcsec)", "dy (arcsec)", "Gauss corr (as)", "Moffat corr (as)", "Gauss unc (as)", "Moffat unc (as)"]
+        )
+        # PySide6 enums live on QAbstractItemView (not on QTableWidget)
+        self.tbl_offaxis.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_offaxis.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_offaxis.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        off_lay.addWidget(self.tbl_offaxis)
+
+        left_layout.addWidget(self.grp_offaxis)
 
 
         # Open folder button
@@ -549,6 +600,41 @@ class LongRun_tab(QWidget):
             "progress_every": int(self.spin_chunk.value()),
         }
 
+        # ---- Off-axis evaluation config ----
+        eval_pts = None
+        try:
+            txt = self.edit_offaxis.text().strip() if hasattr(self, "edit_offaxis") else ""
+        except Exception:
+            txt = ""
+        if txt:
+            import re as _re
+            eval_pts = []
+            for chunk in _re.split(r"[;\n]+", txt):
+                c = chunk.strip()
+                if not c:
+                    continue
+                c = c.strip().strip("()[]{}")
+                parts = [p for p in _re.split(r"[\s,]+", c) if p]
+                if len(parts) < 2:
+                    continue
+                try:
+                    dx = float(parts[0])
+                    dy = float(parts[1])
+                except Exception:
+                    continue
+                eval_pts.append((dx, dy))
+            if len(eval_pts) == 0:
+                eval_pts = None
+
+        if eval_pts is not None:
+            cfg["eval_offaxis_arcsec"] = eval_pts
+            cfg["write_eval_fits"] = bool(self.chk_write_offaxis_fits.isChecked()) if hasattr(self, "chk_write_offaxis_fits") else True
+
+            eval_unc = bool(self.chk_eval_unc_offaxis.isChecked()) if hasattr(self, "chk_eval_unc_offaxis") else True
+            cfg["eval_accumulate_uncorrected"] = eval_unc
+            cfg["write_eval_uncorrected_fits"] = bool(self.chk_write_unc_offaxis_fits.isChecked()) and eval_unc if hasattr(self, "chk_write_unc_offaxis_fits") else eval_unc
+
+
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.btn_open_dir.setEnabled(False)
@@ -635,7 +721,97 @@ class LongRun_tab(QWidget):
         elif "r0_est_m" in res:
             lines.append(f"Estimated r0: {float(res['r0_est_m']):.4f} m")
 
+        # Off-axis summary (if present)
+        off_metrics = res.get("offaxis_metrics") or []
+        off_stats = res.get("offaxis_stats") or {}
+
+        def _fmt_stats_line(label: str, key: str) -> Optional[str]:
+            try:
+                s = dict(off_stats.get(key) or {})
+                n = int(s.get("n", 0))
+                if n <= 0:
+                    return None
+                mean = float(s.get("mean", float("nan")))
+                std = float(s.get("std", float("nan")))
+                mn = float(s.get("min", float("nan")))
+                mx = float(s.get("max", float("nan")))
+                return f"{label}: mean={mean:.3f}±{std:.3f} as  (min={mn:.3f}, max={mx:.3f}, n={n})"
+            except Exception:
+                return None
+
+        if len(off_metrics) > 0:
+            lines.append("")
+            lines.append(f"Off-axis points: {len(off_metrics)}")
+            for _lbl, _key in [
+                ("Off-axis Gaussian corrected", "gauss_corrected_arcsec"),
+                ("Off-axis Moffat corrected", "moffat_corrected_arcsec"),
+                ("Off-axis Gaussian uncorrected", "gauss_uncorrected_arcsec"),
+                ("Off-axis Moffat uncorrected", "moffat_uncorrected_arcsec"),
+            ]:
+                line = _fmt_stats_line(_lbl, _key)
+                if line is not None:
+                    lines.append(line)
+
         self.lbl_results.setText("\n".join(lines))
+
+        # Populate off-axis table
+        if hasattr(self, "grp_offaxis") and hasattr(self, "tbl_offaxis"):
+            if len(off_metrics) > 0:
+                self.grp_offaxis.setVisible(True)
+                self.tbl_offaxis.setRowCount(len(off_metrics))
+                # Determine whether uncorrected columns have data
+                unc_n = 0
+                try:
+                    unc_n = int((off_stats.get("gauss_uncorrected_arcsec") or {}).get("n", 0))
+                except Exception:
+                    unc_n = 0
+                show_unc = bool(unc_n > 0)
+
+                # Show/hide uncorrected columns
+                self.tbl_offaxis.setColumnHidden(5, not show_unc)
+                self.tbl_offaxis.setColumnHidden(6, not show_unc)
+
+                for i, m in enumerate(off_metrics):
+                    dx = float(m.get("dx_arcsec", 0.0))
+                    dy = float(m.get("dy_arcsec", 0.0))
+                    gc = float(m.get("fwhm_arcsec_corrected", float("nan")))
+                    mc = float(m.get("fwhm_arcsec_corrected_moffat", float("nan")))
+                    gu = float(m.get("fwhm_arcsec_uncorrected", float("nan")))
+                    mu = float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan")))
+
+                    def _it(v):
+                        item = QTableWidgetItem(v)
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        return item
+
+                    self.tbl_offaxis.setItem(i, 0, _it(str(i)))
+                    self.tbl_offaxis.setItem(i, 1, _it(f"{dx:.3f}"))
+                    self.tbl_offaxis.setItem(i, 2, _it(f"{dy:.3f}"))
+                    self.tbl_offaxis.setItem(i, 3, _it(f"{gc:.3f}"))
+                    self.tbl_offaxis.setItem(i, 4, _it(f"{mc:.3f}"))
+                    self.tbl_offaxis.setItem(i, 5, _it("" if not np.isfinite(gu) else f"{gu:.3f}"))
+                    self.tbl_offaxis.setItem(i, 6, _it("" if not np.isfinite(mu) else f"{mu:.3f}"))
+
+                # Stats label
+                stats_lines = []
+                for _lbl, _key in [
+                    ("Gaussian corrected", "gauss_corrected_arcsec"),
+                    ("Moffat corrected", "moffat_corrected_arcsec"),
+                ]:
+                    line = _fmt_stats_line(_lbl, _key)
+                    if line:
+                        stats_lines.append(line)
+                if show_unc:
+                    for _lbl, _key in [
+                        ("Gaussian uncorrected", "gauss_uncorrected_arcsec"),
+                        ("Moffat uncorrected", "moffat_uncorrected_arcsec"),
+                    ]:
+                        line = _fmt_stats_line(_lbl, _key)
+                        if line:
+                            stats_lines.append(line)
+                self.lbl_offaxis_stats.setText("\n".join(stats_lines))
+            else:
+                self.grp_offaxis.setVisible(False)
 
         plate = float(res.get("plate_rad_per_pix", 0.0) or 0.0)
 
@@ -684,23 +860,397 @@ class LongRun_tab(QWidget):
                 '<span style="color:rgb(255,0,222);">●</span> Moffat FWHM'
                 '</div>'
             )
-            canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 0.0), offset=(8.0, 8.0))
+            canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 1.0), offset=(8.0, -8.0))
+
+
+        def _build_mosaic(imgs, gap: int = 24, pad: int = 12):
+            """Build a mosaic that reserves per-tile margins for X/Y profiles.
+
+            Each tile becomes a *block* of size:
+            (tile_h + my + pad) x (tile_w + mx + pad)
+
+            The PSF lives in the top-left tile_w x tile_h region. The extra bottom
+            and right regions are left as NaN so we can draw the profile overlays
+            there without overlapping neighboring tiles.
+            """
+            imgs = [np.asarray(im) for im in imgs if im is not None]
+            if len(imgs) == 0:
+                return None, [], 0, 0, 0, 0, 0, 0, 0, 0, 0
+            h, w = imgs[0].shape
+            n = len(imgs)
+            cols = int(np.ceil(np.sqrt(n)))
+            rows = int(np.ceil(n / max(cols, 1)))
+
+            # Profile margins per tile (tuned to avoid overlap/visual clutter).
+            mx = int(max(56, min(0.50 * w, 0.95 * w)))
+            my = int(max(56, min(0.50 * h, 0.95 * h)))
+
+            block_w = int(w + mx + pad)
+            block_h = int(h + my + pad)
+
+            H = rows * block_h + max(0, rows - 1) * gap
+            W = cols * block_w + max(0, cols - 1) * gap
+            mosaic = np.full((H, W), np.nan, dtype=np.float32)
+            offsets = []
+
+            for i, im in enumerate(imgs):
+                r = i // cols
+                c = i % cols
+                y0 = r * (block_h + gap)
+                x0 = c * (block_w + gap)
+
+                tile = np.log10(np.maximum(im.astype(np.float32, copy=False), 0.0) + 1e-12)
+                mosaic[y0 : y0 + h, x0 : x0 + w] = tile
+                offsets.append((x0, y0))
+
+            return mosaic, offsets, rows, cols, h, w, mx, my, pad, block_h, block_w
+
+        def _show_mosaic(panel, imgs, gfits, mfits, labels, prefix: str):
+            canvas = panel["canvas"]
+
+            # Clear previous overlays (tiles + profiles)
+            for i in range(512):
+                canvas.remove_overlay(f"{prefix}_g_{i}")
+                canvas.remove_overlay(f"{prefix}_m_{i}")
+                canvas.remove_overlay(f"{prefix}_t_{i}")
+
+                for name in (
+                    "prof_x_data",
+                    "prof_y_data",
+                    "prof_x_g_model",
+                    "prof_y_g_model",
+                    "prof_x_m_model",
+                    "prof_y_m_model",
+                    "prof_x_g_fwhm_p",
+                    "prof_x_g_fwhm_m",
+                    "prof_y_g_fwhm_p",
+                    "prof_y_g_fwhm_m",
+                    "prof_x_m_fwhm_p",
+                    "prof_x_m_fwhm_m",
+                    "prof_y_m_fwhm_p",
+                    "prof_y_m_fwhm_m",
+                ):
+                    canvas.remove_overlay(f"{prefix}_{name}_{i}")
+
+            # Remove single-image overlays (in case we were showing on-axis only previously)
+            for name in (
+                "fwhm_gauss",
+                "fwhm_moffat",
+                "legend",
+                "prof_x_data",
+                "prof_y_data",
+                "prof_x_g_model",
+                "prof_y_g_model",
+                "prof_x_m_model",
+                "prof_y_m_model",
+                "prof_x_g_fwhm_p",
+                "prof_x_g_fwhm_m",
+                "prof_y_g_fwhm_p",
+                "prof_y_g_fwhm_m",
+                "prof_x_m_fwhm_p",
+                "prof_x_m_fwhm_m",
+                "prof_y_m_fwhm_p",
+                "prof_y_m_fwhm_m",
+            ):
+                canvas.remove_overlay(name)
+
+            mosaic, offsets, rows, cols, h, w, mx, my, pad, block_h, block_w = _build_mosaic(imgs)
+            if mosaic is None:
+                return
+
+            canvas.set_image(mosaic)
+
+            # Legend
+            legend_html = (
+                "<div style='background-color:rgba(0,0,0,140); padding:6px;'>"
+                "<span style='color:yellow;'>●</span> Gaussian FWHM&nbsp;&nbsp;"
+                "<span style='color:magenta;'>●</span> Moffat FWHM<br>"
+                "<span style='color:rgb(200,200,200);'>—</span> Data slice"
+                "</div>"
+            )
+            canvas.set_text_overlay("legend", legend_html, anchor=(0, -10), offset=(8, 8), relative_to="image")
+
+            pen_g = pg.mkPen((255, 0 ,0), width=2)
+            pen_m = pg.mkPen((255, 0, 255), width=2)
+
+            # Profile pens
+            pen_data = pg.mkPen((200, 200, 200), width=1)
+            pen_g_model = pg.mkPen((255, 0 ,0), width=2)
+            pen_m_model = pg.mkPen((255, 0, 255), width=2)
+            pen_g_fwhm = pg.mkPen((255, 0 ,0), width=1, style=Qt.DashLine)
+            pen_m_fwhm = pg.mkPen((255, 0, 255), width=1, style=Qt.DashLine)
+
+            eps = 1e-12
+
+            def _finite_center(d: Dict[str, Any], W: int, H: int) -> Optional[tuple[float, float]]:
+                try:
+                    x0 = float(d.get("x0_px", float("nan")))
+                    y0 = float(d.get("y0_px", float("nan")))
+                except Exception:
+                    return None
+                if not np.isfinite(x0) or not np.isfinite(y0):
+                    return None
+                return (float(np.clip(x0, 0.0, W - 1.0)), float(np.clip(y0, 0.0, H - 1.0)))
+
+            def _radius_px(d: Dict[str, Any]) -> Optional[float]:
+                try:
+                    r = float(d.get("r_px", float("nan")))
+                except Exception:
+                    r = float("nan")
+                if np.isfinite(r) and r > 0:
+                    return r
+                try:
+                    f = float(d.get("fwhm_px", float("nan")))
+                except Exception:
+                    f = float("nan")
+                if np.isfinite(f) and f > 0:
+                    return 0.5 * f
+                return None
+
+            def _tile_profiles(i: int, im: np.ndarray, g: Dict[str, Any], m: Dict[str, Any], x0: int, y0: int):
+                a = np.asarray(im, dtype=float)
+                if a.ndim != 2 or a.size == 0:
+                    return
+                Ht, Wt = a.shape
+
+                c_g = _finite_center(g, Wt, Ht)
+                c_m = _finite_center(m, Wt, Ht)
+                if c_g is None and c_m is None:
+                    yy, xx = np.unravel_index(int(np.argmax(a)), a.shape)
+                    c_ref = (float(xx), float(yy))
+                else:
+                    c_ref = c_g if c_g is not None else c_m
+
+                x0r, y0r = c_ref
+
+                # Sub-pixel slice (linear interpolation)
+                def _row_at(yv: float) -> np.ndarray:
+                    yf = int(np.floor(yv))
+                    yc = min(yf + 1, Ht - 1)
+                    ty = yv - float(yf)
+                    return (1.0 - ty) * a[yf, :] + ty * a[yc, :]
+
+                def _col_at(xv: float) -> np.ndarray:
+                    xf = int(np.floor(xv))
+                    xc = min(xf + 1, Wt - 1)
+                    tx = xv - float(xf)
+                    return (1.0 - tx) * a[:, xf] + tx * a[:, xc]
+
+                curves_x: Dict[str, np.ndarray] = {}
+                curves_y: Dict[str, np.ndarray] = {}
+
+                curves_x["data"] = np.log10(np.maximum(_row_at(y0r), 0.0) + eps)
+                curves_y["data"] = np.log10(np.maximum(_col_at(x0r), 0.0) + eps)
+
+                # Gaussian model along the same cut
+                try:
+                    A = float(g.get("amp", np.nan))
+                    s = float(g.get("sigma_px", np.nan))
+                    b0 = float(g.get("bkg", 0.0))
+                    if c_g is not None and np.isfinite(A) and np.isfinite(s) and s > 0:
+                        x0g, y0g = c_g
+                        dx = np.arange(Wt, dtype=float) - x0g
+                        dy = np.arange(Ht, dtype=float) - y0g
+                        dy0 = float(y0r) - y0g
+                        dx0 = float(x0r) - x0g
+                        g_row = A * np.exp(-0.5 * ((dx * dx) + (dy0 * dy0)) / (s * s)) + b0
+                        g_col = A * np.exp(-0.5 * ((dy * dy) + (dx0 * dx0)) / (s * s)) + b0
+                        curves_x["g_model"] = np.log10(np.maximum(g_row, 0.0) + eps)
+                        curves_y["g_model"] = np.log10(np.maximum(g_col, 0.0) + eps)
+                except Exception:
+                    pass
+
+                # Moffat model along the same cut
+                try:
+                    A = float(m.get("amp", np.nan))
+                    gamma = float(m.get("gamma_px", np.nan))
+                    alpha = float(m.get("alpha", np.nan))
+                    b0 = float(m.get("bkg", 0.0))
+                    if c_m is not None and np.isfinite(A) and np.isfinite(gamma) and np.isfinite(alpha) and gamma > 0 and alpha > 0:
+                        x0m, y0m = c_m
+                        dx = np.arange(Wt, dtype=float) - x0m
+                        dy = np.arange(Ht, dtype=float) - y0m
+                        dy0 = float(y0r) - y0m
+                        dx0 = float(x0r) - x0m
+                        m_row = A * (1.0 + ((dx * dx) + (dy0 * dy0)) / (gamma * gamma)) ** (-alpha) + b0
+                        m_col = A * (1.0 + ((dy * dy) + (dx0 * dx0)) / (gamma * gamma)) ** (-alpha) + b0
+                        curves_x["m_model"] = np.log10(np.maximum(m_row, 0.0) + eps)
+                        curves_y["m_model"] = np.log10(np.maximum(m_col, 0.0) + eps)
+                except Exception:
+                    pass
+
+                def _finite_minmax(vals: list[np.ndarray]) -> Optional[tuple[float, float]]:
+                    mins = []
+                    maxs = []
+                    for v in vals:
+                        v = np.asarray(v, dtype=float)
+                        if v.size == 0:
+                            continue
+                        mn = float(np.nanmin(v))
+                        mxv = float(np.nanmax(v))
+                        if np.isfinite(mn) and np.isfinite(mxv):
+                            mins.append(mn)
+                            maxs.append(mxv)
+                    if not mins or not maxs:
+                        return None
+                    mn = min(mins)
+                    mxv = max(maxs)
+                    if not np.isfinite(mn) or not np.isfinite(mxv) or abs(mxv - mn) < 1e-12:
+                        return None
+                    return (mn, mxv)
+
+                mmx = _finite_minmax(list(curves_x.values()))
+                mmy = _finite_minmax(list(curves_y.values()))
+                if mmx is None or mmy is None:
+                    return
+                zx0, zx1 = mmx
+                zy0, zy1 = mmy
+
+                x_pix = (x0 + np.arange(Wt, dtype=float))
+                y_pix = (y0 + np.arange(Ht, dtype=float))
+
+                x_im_max = float(x0 + (Wt - 0.5))
+                y_im_max = float(y0 + (Ht - 0.5))
+                x_base = x_im_max + float(pad)
+                y_base = y_im_max + float(pad)
+
+                def _map_h(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                    nrm = (np.asarray(z, dtype=float) - zx0) / (zx1 - zx0)
+                    nrm = np.clip(nrm, 0.0, 1.0)
+                    yy = y_base + (1.0 - nrm) * float(my)
+                    return x_pix, yy
+
+                def _map_v(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                    nrm = (np.asarray(z, dtype=float) - zy0) / (zy1 - zy0)
+                    nrm = np.clip(nrm, 0.0, 1.0)
+                    xx = x_base + (1.0 - nrm) * float(mx)
+                    return xx, y_pix
+
+                # Curves
+                x, y = _map_h(curves_x["data"])
+                canvas.set_curve_overlay(f"{prefix}_prof_x_data_{i}", x, y, pen=pen_data)
+                x, y = _map_v(curves_y["data"])
+                canvas.set_curve_overlay(f"{prefix}_prof_y_data_{i}", x, y, pen=pen_data)
+
+                if "g_model" in curves_x:
+                    x, y = _map_h(curves_x["g_model"])
+                    canvas.set_curve_overlay(f"{prefix}_prof_x_g_model_{i}", x, y, pen=pen_g_model)
+                if "g_model" in curves_y:
+                    x, y = _map_v(curves_y["g_model"])
+                    canvas.set_curve_overlay(f"{prefix}_prof_y_g_model_{i}", x, y, pen=pen_g_model)
+
+                if "m_model" in curves_x:
+                    x, y = _map_h(curves_x["m_model"])
+                    canvas.set_curve_overlay(f"{prefix}_prof_x_m_model_{i}", x, y, pen=pen_m_model)
+                if "m_model" in curves_y:
+                    x, y = _map_v(curves_y["m_model"])
+                    canvas.set_curve_overlay(f"{prefix}_prof_y_m_model_{i}", x, y, pen=pen_m_model)
+
+                # FWHM boundary markers
+                def _bounds(prefix2: str, center: Optional[tuple[float, float]], r_px: Optional[float], pen):
+                    names = (
+                        f"{prefix}_prof_x_{prefix2}_fwhm_p_{i}",
+                        f"{prefix}_prof_x_{prefix2}_fwhm_m_{i}",
+                        f"{prefix}_prof_y_{prefix2}_fwhm_p_{i}",
+                        f"{prefix}_prof_y_{prefix2}_fwhm_m_{i}",
+                    )
+                    if center is None or r_px is None or (not np.isfinite(r_px)) or r_px <= 0:
+                        for n in names:
+                            canvas.remove_overlay(n)
+                        return
+
+                    cx, cy = center
+                    rp = float(r_px)
+
+                    x_p = float(np.clip(cx + rp, 0.0, Wt - 1.0)) + float(x0)
+                    x_m = float(np.clip(cx - rp, 0.0, Wt - 1.0)) + float(x0)
+                    y_p = float(np.clip(cy + rp, 0.0, Ht - 1.0)) + float(y0)
+                    y_m = float(np.clip(cy - rp, 0.0, Ht - 1.0)) + float(y0)
+
+                    # X-profile bounds: vertical lines spanning the bottom margin region
+                    canvas.set_curve_overlay(names[0], np.array([x_p, x_p]), np.array([y_base, y_base + float(my)]), pen=pen)
+                    canvas.set_curve_overlay(names[1], np.array([x_m, x_m]), np.array([y_base, y_base + float(my)]), pen=pen)
+
+                    # Y-profile bounds: horizontal lines spanning the right margin region
+                    canvas.set_curve_overlay(names[2], np.array([x_base, x_base + float(mx)]), np.array([y_p, y_p]), pen=pen)
+                    canvas.set_curve_overlay(names[3], np.array([x_base, x_base + float(mx)]), np.array([y_m, y_m]), pen=pen)
+
+                _bounds("g", c_g, _radius_px(g), pen_g_fwhm)
+                _bounds("m", c_m, _radius_px(m), pen_m_fwhm)
+
+            for i, (x0, y0) in enumerate(offsets):
+                im = np.asarray(imgs[i])
+                yy, xx = np.unravel_index(int(np.nanargmax(im)), im.shape)
+                xpk, ypk = float(xx), float(yy)
+
+                g = gfits[i] if i < len(gfits) else None
+                m = mfits[i] if i < len(mfits) else None
+                if not isinstance(g, dict):
+                    g = {}
+                if not isinstance(m, dict):
+                    m = {}
+
+                gx = float(g.get("x0_px", xpk))
+                gy = float(g.get("y0_px", ypk))
+                gr = float(g.get("r_px", 0.5 * float(g.get("fwhm_px", 0.0) or 0.0)))
+                if not np.isfinite(gr) or gr <= 0:
+                    gr = 0.0
+
+                mx0 = float(m.get("x0_px", xpk))
+                my0 = float(m.get("y0_px", ypk))
+                mr = float(m.get("r_px", 0.5 * float(m.get("fwhm_px", 0.0) or 0.0)))
+                if not np.isfinite(mr) or mr <= 0:
+                    mr = 0.0
+
+                if gr > 0:
+                    canvas.set_circle_overlay(f"{prefix}_g_{i}", x0 + gx, y0 + gy, gr, pen=pen_g)
+                if mr > 0:
+                    canvas.set_circle_overlay(f"{prefix}_m_{i}", x0 + mx0, y0 + my0, mr, pen=pen_m)
+
+                if labels and i < len(labels):
+                    lbl = labels[i]
+                    html = f"<div style='background-color:rgba(0,0,0,140); padding:3px;'><span style='color:white;'>{lbl}</span></div>"
+                    if hasattr(canvas, "set_text_overlay_at"):
+                        canvas.set_text_overlay_at(f"{prefix}_t_{i}", html, x0 + 6, y0 + 6, anchor=(0, 0))
+
+                # Cross-section profiles for each tile (data + both fit models)
+                _tile_profiles(i, im, g, m, x0, y0)
 
         img_corr = res.get("psf_long_corrected")
         img_unc = res.get("psf_long_uncorrected")
-
         img_corr_a = np.asarray(img_corr) if img_corr is not None else None
         img_unc_a = np.asarray(img_unc) if img_unc is not None else None
 
+        # Off-axis arrays (optional)
+        off_corr = res.get("psf_long_corrected_offaxis")
+        off_unc = res.get("psf_long_uncorrected_offaxis")
+        off_corr_a = np.asarray(off_corr) if off_corr is not None else None
+        off_unc_a = np.asarray(off_unc) if off_unc is not None else None
+
         if img_corr_a is not None and img_corr_a.ndim == 2:
-            _show(self._psf_corr, img_corr_a)
-            _apply_overlays(self._psf_corr["canvas"], img_corr_a, gauss_corr, moff_corr)
-            self._update_profiles(self._psf_corr, img_corr_a, gauss_corr, moff_corr, plate)
+            if off_corr_a is not None and off_corr_a.ndim == 3 and (len(off_metrics) > 0):
+                # Mosaic: on-axis + off-axis
+                imgs = [img_corr_a] + [off_corr_a[i] for i in range(off_corr_a.shape[0])]
+                gfits = [gauss_corr] + [m.get("gauss_corrected") for m in off_metrics]
+                mfits = [moff_corr] + [m.get("moffat_corrected") for m in off_metrics]
+                labels = ["on-axis"] + [f"{m.get('dx_arcsec',0.0):+.2f},{m.get('dy_arcsec',0.0):+.2f} as\nG {m.get('fwhm_arcsec_corrected',float('nan')):.3f}  M {m.get('fwhm_arcsec_corrected_moffat',float('nan')):.3f}" for m in off_metrics]
+                _show_mosaic(self._psf_corr, imgs, gfits, mfits, labels, prefix="corr")
+            else:
+                _show(self._psf_corr, img_corr_a)
+                _apply_overlays(self._psf_corr["canvas"], img_corr_a, gauss_corr, moff_corr)
+                self._update_profiles(self._psf_corr, img_corr_a, gauss_corr, moff_corr, plate)
 
         if img_unc_a is not None and img_unc_a.ndim == 2:
-            _show(self._psf_unc, img_unc_a)
-            _apply_overlays(self._psf_unc["canvas"], img_unc_a, gauss_unc, moff_unc)
-            self._update_profiles(self._psf_unc, img_unc_a, gauss_unc, moff_unc, plate)
+            if off_unc_a is not None and off_unc_a.ndim == 3 and (len(off_metrics) > 0):
+                imgs = [img_unc_a] + [off_unc_a[i] for i in range(off_unc_a.shape[0])]
+                gfits = [gauss_unc] + [m.get("gauss_uncorrected") for m in off_metrics]
+                mfits = [moff_unc] + [m.get("moffat_uncorrected") for m in off_metrics]
+                labels = ["on-axis"] + [f"{m.get('dx_arcsec',0.0):+.2f},{m.get('dy_arcsec',0.0):+.2f} as\nG {m.get('fwhm_arcsec_uncorrected',float('nan')):.3f}  M {m.get('fwhm_arcsec_uncorrected_moffat',float('nan')):.3f}" for m in off_metrics]
+                _show_mosaic(self._psf_unc, imgs, gfits, mfits, labels, prefix="unc")
+            else:
+                _show(self._psf_unc, img_unc_a)
+                _apply_overlays(self._psf_unc["canvas"], img_unc_a, gauss_unc, moff_unc)
+                self._update_profiles(self._psf_unc, img_unc_a, gauss_unc, moff_unc, plate)
 
     @Slot(str)
     def _on_long_run_failed(self, err: str):

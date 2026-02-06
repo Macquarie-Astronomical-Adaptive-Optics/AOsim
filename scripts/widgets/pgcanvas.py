@@ -1031,6 +1031,45 @@ class PGCanvas(QWidget):
         if self._emit_grab:
             self.grab.emit(self.view.grab())
 
+
+    def set_text_overlay_at(
+        self,
+        name: str,
+        html: str,
+        x: float,
+        y: float,
+        anchor: Tuple[float, float] = (0.0, 0.0),
+        z: int = 200,
+        ignores_transform: bool = True,
+    ):
+        """Draw/update an HTML text overlay at an explicit (x,y) in image/data coords.
+
+        Useful for labeling tiles in a mosaic image where each tile needs its own caption.
+        """
+        from pyqtgraph import TextItem
+
+        if name not in self._overlays:
+            item = TextItem(html=html, anchor=anchor)
+            item.setZValue(z)
+            self.vb.addItem(item, ignoreBounds=True)
+            self._overlays[name] = OverlaySpec(item=item, kind="text", z=z)
+        else:
+            item = self._overlays[name].item
+            item.setHtml(html)
+            item.setAnchor(anchor)
+            item.setZValue(z)
+
+        if ignores_transform:
+            try:
+                item.setFlag(QtGui.QGraphicsItem.ItemIgnoresTransformations, True)
+            except Exception:
+                pass
+
+        item.setPos(float(x), float(y))
+
+        if self._emit_grab:
+            self.grab.emit(self.view.grab())
+
     def set_ellipse_overlay(
         self,
         name: str,

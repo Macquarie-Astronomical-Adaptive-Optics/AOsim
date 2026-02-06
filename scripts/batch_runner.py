@@ -34,6 +34,67 @@ def strip_tt_from_slopes(sl_yx: cp.ndarray) -> cp.ndarray:
     return sl_yx - cp.mean(sl_yx, axis=0, keepdims=True)
 
 
+class TTPlaneRemover:
+    """Fast masked least-squares plane (tip/tilt + piston) remover.
+
+    Precomputes a pseudo-inverse for the fixed pupil mask so we can remove TT
+    from many phase maps with a single GEMM per batch (much faster than calling
+    cp.linalg.lstsq per frame / per field point).
+    """
+
+    def __init__(self, pupil: cp.ndarray):
+        m = (pupil > 0)
+        if m.ndim != 2 or m.shape[0] != m.shape[1]:
+            raise ValueError("pupil must be a square 2D array")
+        self.mask = m
+        N = int(m.shape[0])
+
+        yy, xx = cp.indices((N, N), dtype=cp.float32)
+        xx = xx - (N - 1) * 0.5
+        yy = yy - (N - 1) * 0.5
+        self.xx = xx
+        self.yy = yy
+        self.m_float = m.astype(cp.float32, copy=False)
+
+        xm = xx[m].ravel()
+        ym = yy[m].ravel()
+        ones = cp.ones_like(xm)
+
+        X = cp.stack([xm, ym, ones], axis=1)  # (K,3)
+        X64 = X.astype(cp.float64, copy=False)
+        pinv = cp.linalg.inv(X64.T @ X64) @ X64.T  # (3,K)
+        self.pinv = pinv.astype(cp.float32, copy=False)
+
+    def remove_inplace(self, phi: cp.ndarray) -> cp.ndarray:
+        """Remove best-fit plane from phi.
+
+        phi can be (N,N) or (B,N,N). If (N,N), the operation is in-place and the
+        same 2D array is returned.
+        """
+        if phi.ndim == 2:
+            phi_b = phi[None, :, :]
+            squeeze = True
+        elif phi.ndim == 3:
+            phi_b = phi
+            squeeze = False
+        else:
+            raise ValueError("phi must be 2D or 3D")
+
+        # z: (B,K) values under the pupil mask
+        z = phi_b[:, self.mask]
+        beta = z @ self.pinv.T  # (B,3)
+
+        bx = beta[:, 0][:, None, None]
+        by = beta[:, 1][:, None, None]
+        bc = beta[:, 2][:, None, None]
+
+        plane = (bx * self.xx[None, :, :] + by * self.yy[None, :, :] + bc) * self.m_float[None, :, :]
+        phi_b -= plane
+
+        return phi if squeeze else phi_b
+
+
+
 def _phase_to_psf_batch(
     phase_batch: cp.ndarray,
     pupil: cp.ndarray,
@@ -346,26 +407,43 @@ class AOBatchRunner:
         # If None, prefer NGS WFS (infinite range), otherwise fall back to all WFS.
         self.tt_wfs_indices = None if tt_wfs_indices is None else [int(i) for i in tt_wfs_indices]
 
-        # Build the fixed sampler for all sensors (science + WFS).
-        # NOTE: build_patch_sampler expects patch side length in *world pixels* (same convention as schedulerGPU).
+        # --- Dynamic pointing support ---
+        # If any sensor provides a field_angle_fn, we must update thetas each frame and
+        # cannot use the fast fixed sampler.
+        self._dynamic_thetas = any(getattr(s, "field_angle_fn", None) is not None for s in (self.sensors or []))
+
+        # Initial thetas (t=0). If dynamic, call update_field_angle once to seed.
         thetas = []
         for s in self.sensors:
-            fa = getattr(s, "field_angle", None)
-            if fa is None:
-                fa = (float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0)))
+            if getattr(s, "field_angle_fn", None) is not None and hasattr(s, "update_field_angle"):
+                fa = s.update_field_angle(0.0, 0)
+            else:
+                fa = getattr(s, "field_angle", None)
+                if fa is None:
+                    fa = (float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0)))
             thetas.append((float(fa[0]), float(fa[1])))
+
         ranges = [float(getattr(s, "gs_range_m", float("inf"))) for s in self.sensors]
-        patch_M = int(getattr(self.sensors[0], "grid_size"))
+        self._ranges_gpu = cp.asarray(ranges, dtype=cp.float32)
+
+        # Patch size (assume simulation and sensors are consistent; fall back sensibly).
+        patch_M = int(getattr(self.sim, "N", getattr(self.sensors[0], "grid_size", self.pupil.shape[0])))
+        self.patch_M = patch_M
+        # Fast TT remover (only used when psf_tt_mode == 'fit')
+        self._tt_remover = TTPlaneRemover(self.pupil) if self.psf_tt_mode == "fit" else None
+        self._thetas_gpu = cp.asarray(thetas, dtype=cp.float32)
         size_pixels = float(patch_M)
 
-        self.sampler = self.sim.build_patch_sampler(
-            thetas_xy_rad=thetas,
-            ranges_m=ranges,
-            size_pixels=size_pixels,
-            M=patch_M,
-            angle_deg=0.0,
-            autopan_init=True,
-        )
+        self.sampler = None
+        if (not self._dynamic_thetas) and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+            self.sampler = self.sim.build_patch_sampler(
+                thetas_xy_rad=thetas,
+                ranges_m=ranges,
+                size_pixels=size_pixels,
+                M=patch_M,
+                angle_deg=0.0,
+                autopan_init=True,
+            )
 
         # WFS list (exclude science) and packed slope-vector layout.
         if len(self.sensors) < 2:
@@ -407,12 +485,23 @@ class AOBatchRunner:
         # Group WFS by identical geometry so we can measure in batches where possible.
         groups = {}
         for i, s in enumerate(self.wfs_list):
-            key = (
-                type(s),
-                int(getattr(s, "grid_size", -1)),
-                int(getattr(s, "n_sub", -1)),
-                int(self._n_active[i]),
-            )
+            # Use the sensor's own batching key when available (captures LGS elongation
+            # and other geometry-specific settings).
+            if hasattr(s, "batch_geometry_key"):
+                try:
+                    key = s.batch_geometry_key()
+                except Exception:
+                    key = None
+            else:
+                key = None
+
+            if key is None:
+                key = (
+                    type(s),
+                    int(getattr(s, "grid_size", -1)),
+                    int(getattr(s, "n_sub", -1)),
+                    int(self._n_active[i]),
+                )
             groups.setdefault(key, []).append(i)
 
         self._wfs_groups = []
@@ -467,9 +556,19 @@ class AOBatchRunner:
         should_stop: Optional[Callable[[], bool]] = None,
         progress_every: int = 512,
         dt_s : float = 0.001,
+        # Evaluate long-exposure PSFs (and FWHM) at additional *fixed* field points
+        # for the full duration of the run (post-discard window). Angles are in
+        # arcseconds on-sky: [(dx_arcsec, dy_arcsec), ...].
+        eval_offaxis_arcsec: Optional[Sequence[Tuple[float, float]]] = None,
+        # Write long-exposure off-axis PSFs to FITS (one file per field point).
+        write_eval_fits: bool = True,
+        # Also write uncorrected off-axis long-exposure PSFs.
+        write_eval_uncorrected_fits: bool = True,
+        # If False, skip computing/accumulating uncorrected off-axis PSFs (speed).
+        eval_accumulate_uncorrected: bool = True,
     ) -> Dict[str, object]:
         n_frames = int(n_frames)
-        patch_M = int(self.sensors[0].grid_size)
+        patch_M = int(getattr(self, "patch_M", getattr(self.sensors[0], "grid_size", self.pupil.shape[0])))
         if fft_pad is None:
             fft_pad = patch_M // 2
 
@@ -492,6 +591,109 @@ class AOBatchRunner:
         # Convert 500 nm-reference phase screens -> science wavelength phase.
         # This matches the WFS scaling convention used elsewhere.
         phase_scale = float(500e-9 / max(lam_sci, 1e-30))
+        # --- Optional: off-axis long-exposure evaluation for fixed field points ---
+        ARCSEC2RAD = np.pi / (180.0 * 3600.0)
+        eval_points_arcsec: List[Tuple[float, float]] = []
+        if eval_offaxis_arcsec is not None:
+            for p in eval_offaxis_arcsec:
+                if p is None:
+                    continue
+                if len(p) != 2:
+                    raise ValueError("eval_offaxis_arcsec items must be (dx_arcsec, dy_arcsec)")
+                eval_points_arcsec.append((float(p[0]), float(p[1])))
+
+        n_eval = int(len(eval_points_arcsec))
+        eval_thetas_gpu = None
+        eval_ranges_gpu = None
+
+        # Accumulate normalized PSFs per eval direction for frames >= discard_first_frames.
+        sum_psf_corr_eval = None
+        sum_psf_unc_eval = None
+        if n_eval > 0:
+            eval_xy_rad = np.asarray(eval_points_arcsec, dtype=np.float32) * np.float32(ARCSEC2RAD)
+            eval_thetas_gpu = cp.asarray(eval_xy_rad)
+            eval_ranges_gpu = cp.full((n_eval,), cp.inf, dtype=cp.float32)
+            sum_psf_corr_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float64)
+            if eval_accumulate_uncorrected:
+                sum_psf_unc_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float64)
+        # --- Off-axis evaluation (fixed field points) performance path ---
+        # We only need *long-exposure* off-axis PSFs, so we:
+        #   1) sample off-axis phases using the fixed-geometry sampler when possible
+        #   2) buffer phases and run batched FFTs at chunk boundaries
+        # This avoids small per-frame FFT batches (which are launch/overhead bound).
+        eval_sampler = None
+        eval_chunk_frames = 0
+        eval_buf_cor = None
+        eval_buf_unc = None
+        eval_buf_t = 0  # number of post-discard time frames currently buffered
+
+        def _flush_eval_buf(n_time: int):
+            return  # replaced below when n_eval > 0
+
+        if n_eval > 0:
+            # Prefer fixed-geometry sampler (no per-frame X/Y grid construction).
+            if (not getattr(self, "_dynamic_thetas", False)) and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+                try:
+                    eval_sampler = self.sim.build_patch_sampler(
+                        thetas_xy_rad=eval_thetas_gpu,
+                        ranges_m=eval_ranges_gpu,
+                        size_pixels=float(patch_M),
+                        M=int(patch_M),
+                        angle_deg=0.0,
+                        autopan_init=True,
+                    )
+                except Exception:
+                    eval_sampler = None
+
+            # Bound the eval phase-buffer memory (avoid OOM on large M / many field points).
+            bytes_per_phase = int(patch_M) * int(patch_M) * 4  # float32
+            mult = 1 + (1 if eval_accumulate_uncorrected else 0)
+            target_bytes = 256 * 1024 * 1024  # ~256MB for eval buffers
+            max_frames = target_bytes // max(1, int(mult) * int(n_eval) * int(bytes_per_phase))
+            # If memory is tight, this may drop below 8; correctness is unchanged.
+            eval_chunk_frames = int(min(int(chunk_frames), int(max(1, max_frames))))
+
+            # Flat buffers: (eval_chunk_frames * n_eval, M, M)
+            eval_buf_cor = cp.empty((eval_chunk_frames * n_eval, patch_M, patch_M), dtype=cp.float32)
+            if eval_accumulate_uncorrected:
+                eval_buf_unc = cp.empty((eval_chunk_frames * n_eval, patch_M, patch_M), dtype=cp.float32)
+
+            def _flush_eval_buf(n_time: int):
+                if n_time <= 0:
+                    return
+                Btot = int(n_time) * int(n_eval)
+
+                cor_view = eval_buf_cor[:Btot]
+                if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                    self._tt_remover.remove_inplace(cor_view)
+
+                Icorr = _phase_to_psf_batch(
+                    cor_view,
+                    self.pupil,
+                    fft_pad=fft_pad,
+                    roi=psf_roi,
+                    phase_scale=phase_scale,
+                )
+                Icorr = Icorr.reshape(int(n_time), int(n_eval), int(psf_roi), int(psf_roi))
+                cp.add(sum_psf_corr_eval, cp.sum(Icorr, axis=0).astype(cp.float64, copy=False), out=sum_psf_corr_eval)
+
+                if eval_accumulate_uncorrected and (sum_psf_unc_eval is not None) and (eval_buf_unc is not None):
+                    unc_view = eval_buf_unc[:Btot]
+                    if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                        self._tt_remover.remove_inplace(unc_view)
+
+                    Iunc = _phase_to_psf_batch(
+                        unc_view,
+                        self.pupil,
+                        fft_pad=fft_pad,
+                        roi=psf_roi,
+                        phase_scale=phase_scale,
+                    )
+                    Iunc = Iunc.reshape(int(n_time), int(n_eval), int(psf_roi), int(psf_roi))
+                    cp.add(sum_psf_unc_eval, cp.sum(Iunc, axis=0).astype(cp.float64, copy=False), out=sum_psf_unc_eval)
+
+
+
 
         os.makedirs(out_dir, exist_ok=True)
         rec_corr = None
@@ -576,19 +778,82 @@ class AOBatchRunner:
             # 1) Advance turbulence
             self.sim.advance(self.dt_s)
 
+            # 1b) Update dynamic field angles (if any) before sampling.
+            if getattr(self, "_dynamic_thetas", False):
+                t_s = float(t + 1) * float(self.dt_s)
+                tick = int(t + 1)
+                thetas_dyn = []
+                for s in self.sensors:
+                    if getattr(s, "field_angle_fn", None) is not None and hasattr(s, "update_field_angle"):
+                        fa = s.update_field_angle(t_s, tick)
+                    else:
+                        fa = getattr(s, "field_angle", None)
+                        if fa is None:
+                            fa = (float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0)))
+                    thetas_dyn.append((float(fa[0]), float(fa[1])))
+                self._thetas_gpu = cp.asarray(thetas_dyn, dtype=cp.float32)
+
             # 2) Sample all sensor phase patches (radians @ 500nm reference)
-            phases_atm = self.sim.sample_patches_from_sampler(
-                self.sampler,
-                remove_piston=True,
-                return_gpu=True,
-            )  # (n_sensors, M, M)
+            if self.sampler is not None:
+                phases_atm = self.sim.sample_patches_from_sampler(
+                    self.sampler,
+                    remove_piston=True,
+                    return_gpu=True,
+                )  # (n_sensors, M, M)
+            else:
+                phases_atm = self.sim.sample_patches_batched(
+                    thetas_xy_rad=self._thetas_gpu,
+                    ranges_m=self._ranges_gpu,
+                    size_pixels=float(patch_M),
+                    M=int(patch_M),
+                    angle_deg=0.0,
+                    remove_piston=True,
+                    return_gpu=True,
+                    return_per_layer=False,
+                )
             # 3) Science residual phase (DM from previous tick is conjugate to ground)
             phi_unc = phases_atm[0]
             phi_cor = phi_unc - self.dm_phi
 
-            if self.psf_tt_mode == "fit":
-                phi_unc = remove_tt(phi_unc, self.pupil)
-                phi_cor = remove_tt(phi_cor, self.pupil)
+            if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                self._tt_remover.remove_inplace(phi_unc)
+                self._tt_remover.remove_inplace(phi_cor)
+
+            # Off-axis evaluation (fixed field points): buffer phases and process with batched FFTs.
+            if n_eval > 0 and t >= discard_first_frames and (eval_buf_cor is not None):
+                # Sample off-axis phase patches (radians @ 500nm reference)
+                if eval_sampler is not None:
+                    eval_phi_unc = self.sim.sample_patches_from_sampler(
+                        eval_sampler,
+                        remove_piston=True,
+                        return_gpu=True,
+                    )  # (n_eval,M,M)
+                else:
+                    eval_phi_unc = self.sim.sample_patches_batched(
+                        thetas_xy_rad=eval_thetas_gpu,
+                        ranges_m=eval_ranges_gpu,
+                        size_pixels=float(patch_M),
+                        M=int(patch_M),
+                        angle_deg=0.0,
+                        remove_piston=True,
+                        return_gpu=True,
+                        return_per_layer=False,
+                    )
+
+                j0 = int(eval_buf_t) * int(n_eval)
+                j1 = j0 + int(n_eval)
+
+                # Uncorrected (optional)
+                if eval_accumulate_uncorrected and (eval_buf_unc is not None):
+                    cp.copyto(eval_buf_unc[j0:j1], eval_phi_unc)
+
+                # Corrected: subtract current DM (DM is on-axis; apply to all eval points)
+                cp.subtract(eval_phi_unc, self.dm_phi[None, :, :], out=eval_buf_cor[j0:j1])
+
+                eval_buf_t += 1
+                if eval_buf_t == eval_chunk_frames:
+                    _flush_eval_buf(eval_buf_t)
+                    eval_buf_t = 0
 
             # 4) Measure slopes on WFS phases (batched by geometry) and pack a slope-error vector.
             # Reuse buffers to avoid per-frame allocations.
@@ -658,8 +923,8 @@ class AOBatchRunner:
             self.dm_phi = -self.R.coeffs_to_onaxis_phase(self.dm_cmd)
             self.dm_phi = (self.dm_phi - cp.mean(self.dm_phi)) * self.pupil
 
-            if self.psf_tt_mode == "fit":
-                self.dm_phi = remove_tt(self.dm_phi, self.pupil)
+            if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                self._tt_remover.remove_inplace(self.dm_phi)
 
             # 6) Record structure function stats (cheap; no FFT)
             # (Apply discard window only to final statistics.)
@@ -779,6 +1044,12 @@ class AOBatchRunner:
                 # (FITS recorders are finalized after long-exposure PSFs are computed)
 
 
+
+        # Flush any remaining off-axis evaluation phases (post-discard).
+        if n_eval > 0 and (eval_buf_cor is not None) and eval_buf_t > 0:
+            _flush_eval_buf(eval_buf_t)
+            eval_buf_t = 0
+
         if self.psf_tt_mode == "hybrid" and tt_series is not None:
             np.save(os.path.join(out_dir, "tt_yx_from_wfs.npy"), cp.asnumpy(tt_series[:n_done]))
 
@@ -786,6 +1057,14 @@ class AOBatchRunner:
         denom_used = float(max(int(n_used), 1))
         psf_long_corr = (sum_psf_corr / denom_used).astype(cp.float32)
         psf_long_unc = (sum_psf_unc / denom_used).astype(cp.float32)
+
+        # Optional: off-axis long-exposure PSFs
+        psf_long_corr_eval = None
+        psf_long_unc_eval = None
+        if n_eval > 0 and sum_psf_corr_eval is not None:
+            psf_long_corr_eval = (sum_psf_corr_eval / denom_used).astype(cp.float32)
+            if sum_psf_unc_eval is not None:
+                psf_long_unc_eval = (sum_psf_unc_eval / denom_used).astype(cp.float32)
 
         psf_long_corr_tt = None
         if self.psf_tt_mode == "hybrid":
@@ -807,6 +1086,44 @@ class AOBatchRunner:
             with open(os.path.join(out_dir, "psf_long_corrected_ttremoved.fits"), "wb") as f:
                 write_primary_empty(f, {"DT": float(dt_s), "LAMSCI": float(lam_sci), "ROI": int(psf_roi), "USED": int(n_used), "TTREM": True})
                 append_image_hdu(f, cp.asnumpy(psf_long_corr_tt), extname="LONGEXP", extver=1)
+
+
+        # Off-axis long-exposure PSFs: one FITS file per field point (corrected
+        # and optionally uncorrected).
+        eval_long_corr_fits: List[str] = []
+        eval_long_unc_fits: List[str] = []
+        if write_eval_fits and psf_long_corr_eval is not None and int(n_used) > 0:
+            def _tag(x: float) -> str:
+                # Safe token for filenames: -1.25 -> m1p25, 0.0 -> 0p00, 10 -> 10p00
+                s = f"{x:+.3f}"
+                s = s.replace("+", "")
+                s = s.replace("-", "m")
+                s = s.replace(".", "p")
+                return s
+
+            for k, (dx_as, dy_as) in enumerate(eval_points_arcsec):
+                hdr0 = {
+                    "DT": float(dt_s),
+                    "LAMSCI": float(lam_sci),
+                    "ROI": int(psf_roi),
+                    "USED": int(n_used),
+                    "DXAS": float(dx_as),
+                    "DYAS": float(dy_as),
+                }
+                fbase = f"psf_long_corrected_offaxis_{k:03d}_dx{_tag(dx_as)}_dy{_tag(dy_as)}.fits"
+                fpath = os.path.join(out_dir, fbase)
+                with open(fpath, "wb") as f:
+                    write_primary_empty(f, hdr0)
+                    append_image_hdu(f, cp.asnumpy(psf_long_corr_eval[k]), extname="LONGEXP", extver=1)
+                eval_long_corr_fits.append(fpath)
+
+                if write_eval_uncorrected_fits and psf_long_unc_eval is not None:
+                    fbase = f"psf_long_uncorrected_offaxis_{k:03d}_dx{_tag(dx_as)}_dy{_tag(dy_as)}.fits"
+                    fpath_u = os.path.join(out_dir, fbase)
+                    with open(fpath_u, "wb") as f:
+                        write_primary_empty(f, hdr0)
+                        append_image_hdu(f, cp.asnumpy(psf_long_unc_eval[k]), extname="LONGEXP", extver=1)
+                    eval_long_unc_fits.append(fpath_u)
 
         # Append LONGEXP extensions into the per-frame PSF FITS files
         if record_psfs and rec_corr is not None and rec_unc is not None:
@@ -883,6 +1200,103 @@ class AOBatchRunner:
             fwhm_px_corr = float("nan")
             fwhm_px_unc = float("nan")
 
+        # Off-axis FWHM evaluation (full-duration long-exposure, post-discard)
+        offaxis_metrics: List[Dict[str, Any]] = []
+        if n_eval > 0 and int(n_used) > 0 and psf_long_corr_eval is not None:
+            for k, (dx_as, dy_as) in enumerate(eval_points_arcsec):
+                # Corrected
+                Icor_k = psf_long_corr_eval[k]
+                Icor_k_zoom = Analysis._zoom2d(Icor_k, zoom, cp)
+                _p_c, (xc_z, yc_z), (fwhm_eq_native, _), *_rest = fitter.fit_frame(
+                    Icor_k_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom
+                )
+                fwhm_px_c = float(fwhm_eq_native.get())
+                gauss_c = {
+                    "fwhm_px": float(fwhm_px_c),
+                    "x0_px": float(xc_z) / float(zoom),
+                    "y0_px": float(yc_z) / float(zoom),
+                    "r_px": 0.5 * float(fwhm_px_c),
+                    "amp": float(_p_c[0].get()),
+                    "sigma_px": float(_p_c[3].get()) / float(zoom),
+                    "bkg": float(_p_c[4].get()),
+                }
+                _mfit, moff_c = fit_moffat2d(Icor_k_zoom.get(), zoom=float(zoom))
+                fwhm_px_c_m = float(moff_c.get("fwhm_px", float("nan")))
+
+                # Uncorrected (optional; computed if we also accumulated it)
+                fwhm_px_u = float("nan")
+                fwhm_px_u_m = float("nan")
+                gauss_u: Optional[Dict[str, Any]] = None
+                moff_u: Optional[Dict[str, Any]] = None
+                if psf_long_unc_eval is not None:
+                    Iunc_k = psf_long_unc_eval[k]
+                    Iunc_k_zoom = Analysis._zoom2d(Iunc_k, zoom, cp)
+                    _p_u, (xc_z_u, yc_z_u), (fwhm_eq_native_u, _), *_rest = fitter.fit_frame(
+                        Iunc_k_zoom, search_r=24, loss="soft_l1", max_iter=25, zoom=zoom
+                    )
+                    fwhm_px_u = float(fwhm_eq_native_u.get())
+                    gauss_u = {
+                        "fwhm_px": float(fwhm_px_u),
+                        "x0_px": float(xc_z_u) / float(zoom),
+                        "y0_px": float(yc_z_u) / float(zoom),
+                        "r_px": 0.5 * float(fwhm_px_u),
+                        "amp": float(_p_u[0].get()),
+                        "sigma_px": float(_p_u[3].get()) / float(zoom),
+                        "bkg": float(_p_u[4].get()),
+                    }
+                    _mfit, moff_u = fit_moffat2d(Iunc_k_zoom.get(), zoom=float(zoom))
+                    fwhm_px_u_m = float(moff_u.get("fwhm_px", float("nan")))
+
+                # Convert to arcsec for convenience
+                fwhm_as_c = fwhm_px_c * plate_rad * (180.0 / np.pi) * 3600.0
+                fwhm_as_c_m = fwhm_px_c_m * plate_rad * (180.0 / np.pi) * 3600.0
+                fwhm_as_u = fwhm_px_u * plate_rad * (180.0 / np.pi) * 3600.0
+                fwhm_as_u_m = fwhm_px_u_m * plate_rad * (180.0 / np.pi) * 3600.0
+
+                offaxis_metrics.append(
+                    {
+                        "dx_arcsec": float(dx_as),
+                        "dy_arcsec": float(dy_as),
+                        "fwhm_arcsec_corrected": float(fwhm_as_c),
+                        "fwhm_arcsec_corrected_moffat": float(fwhm_as_c_m),
+                        "fwhm_arcsec_uncorrected": float(fwhm_as_u),
+                        "fwhm_arcsec_uncorrected_moffat": float(fwhm_as_u_m),
+                        "fwhm_px_corrected": float(fwhm_px_c),
+                        "fwhm_px_corrected_moffat": float(fwhm_px_c_m),
+                        "fwhm_px_uncorrected": float(fwhm_px_u),
+                        "fwhm_px_uncorrected_moffat": float(fwhm_px_u_m),
+                        # Fit metadata for overlays (native PSF pixels)
+                        "gauss_corrected": gauss_c,
+                        "moffat_corrected": moff_c,
+                        "gauss_uncorrected": gauss_u,
+                        "moffat_uncorrected": moff_u,
+                    }
+                )
+
+        # Off-axis summary stats (Gaussian/Moffat, corrected/uncorrected)
+        offaxis_stats: Dict[str, Any] = {}
+        if len(offaxis_metrics) > 0:
+            def _stats(values: list[float]) -> Dict[str, float]:
+                v = np.asarray(values, dtype=float)
+                v = v[np.isfinite(v)]
+                if v.size == 0:
+                    return {"n": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan"), "median": float("nan")}
+                return {
+                    "n": int(v.size),
+                    "mean": float(np.mean(v)),
+                    "std": float(np.std(v, ddof=0)),
+                    "min": float(np.min(v)),
+                    "max": float(np.max(v)),
+                    "median": float(np.median(v)),
+                }
+
+            offaxis_stats["gauss_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["moffat_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_moffat", float("nan")) for m in offaxis_metrics])
+
+            # Uncorrected only if present (not skipped)
+            offaxis_stats["gauss_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["moffat_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_moffat", float("nan")) for m in offaxis_metrics])
+
         fwhm_px_corr_tt = None
         if psf_long_corr_tt is not None:
             if int(n_used) > 0:
@@ -938,4 +1352,16 @@ class AOBatchRunner:
             if rec_corr_tt is not None:
                 out["psf_corrected_ttremoved_memmap"] = os.path.join(out_dir, "psf_corrected_ttremoved.fits")
                 out["psf_corrected_ttremoved_fits"] = os.path.join(out_dir, "psf_corrected_ttremoved.fits")
+        # Off-axis evaluation outputs
+        if n_eval > 0:
+            out["eval_offaxis_arcsec"] = list(eval_points_arcsec)
+            out["eval_accumulate_uncorrected"] = bool(eval_accumulate_uncorrected)
+            out["offaxis_metrics"] = offaxis_metrics
+            out["offaxis_stats"] = offaxis_stats
+            out["psf_long_corrected_offaxis"] = psf_long_corr_eval
+            out["psf_long_corrected_offaxis_fits"] = eval_long_corr_fits
+            if psf_long_unc_eval is not None:
+                out["psf_long_uncorrected_offaxis"] = psf_long_unc_eval
+                out["psf_long_uncorrected_offaxis_fits"] = eval_long_unc_fits
+
         return out

@@ -56,6 +56,10 @@ class Poke_tab(QWidget):
 
         self.tab_pages = []
         for key, sensor in self.wfsensors.items():
+            # The "science" channel is a dedicated imager (not a WFS) and does not
+            # support the WFS sensor editor UI.
+            if key.lower() == "science" or bool(getattr(sensor, "is_science_sensor", False)):
+                continue
             tab = SensorTabWidget(dict(self.params), key, sensor)
             tab.sensor_changed.connect(self.update_sensor)
 
@@ -82,7 +86,13 @@ class Poke_tab(QWidget):
             self.wfsensors[key] = sensor
 
         # Science channel
-        add("science", ut.WFSensor_tools.ShackHartmann(n_sub=1, wavelength=2.150e-06))
+        add(
+            "science",
+            ut.WFSensor_tools.ScienceImager(
+                wavelength=float(self.params.get("science_lambda", 2.150e-06)),
+                grid_size=int(self.params.get("grid_size", 512)),
+            ),
+        )
 
         # LGS constellation (units consistent with original code)
         add(

@@ -499,6 +499,50 @@ class SimWorker(QObject):
         return out
 
 
+    def _ensure_wfs_vec_structures(self):
+        """Ensure slices + geometry groups exist for packed-slope measurement.
+
+        This enables batching for sensors that share the same geometry, even when the
+        full WFS set is heterogeneous.
+        """
+        wfs_list = list(self._sensor_list[1:])
+        if not wfs_list:
+            self._wfs_groups_vec = None
+            self._wfs_slices = None
+            self._wfs_n_active = None
+            self._slopes_total_len = 0
+            return
+
+        # --- slices into the packed slope vector ---
+        self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
+        lens = [2 * n for n in self._wfs_n_active]
+        offs = [0]
+        for ln in lens:
+            offs.append(offs[-1] + int(ln))
+        self._wfs_slices = [(offs[i], offs[i + 1]) for i in range(len(wfs_list))]
+        self._slopes_total_len = int(offs[-1])
+
+        # --- group sensors by geometry for batched measure() ---
+        groups = {}
+        for i, s0 in enumerate(wfs_list):
+            if hasattr(s0, "batch_geometry_key"):
+                key = s0.batch_geometry_key()
+            else:
+                key = (
+                    type(s0).__name__,
+                    int(getattr(s0, "grid_size", -1)),
+                    int(getattr(s0, "n_sub", -1)),
+                    int(len(getattr(s0, "sub_aps_idx"))),
+                )
+            groups.setdefault(key, []).append(i)
+
+        self._wfs_groups_vec = []
+        for key, idxs in groups.items():
+            tmpl = wfs_list[idxs[0]]
+            phase_buf = cp.empty((len(idxs), self.patch_M, self.patch_M), dtype=cp.float32)
+            self._wfs_groups_vec.append({"key": key, "idxs": idxs, "template": tmpl, "phase_buf": phase_buf})
+
+
     def _measure_wfs_slopes_vec_into(self, phases_wfs_stack, out_vec):
         """Measure slopes per WFS and pack into a 1D vector (handles heterogeneous WFS shapes).
 
@@ -508,40 +552,45 @@ class SimWorker(QObject):
         if phases_wfs_stack is None or out_vec is None:
             return None
 
-        # Ensure slices are available
-        if self._wfs_slices is None or self._wfs_n_active is None:
-            wfs_list = list(self._sensor_list[1:])
-            self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
-            lens = [2 * n for n in self._wfs_n_active]
-            offs = [0]
-            for ln in lens:
-                offs.append(offs[-1] + int(ln))
-            self._wfs_slices = [(offs[i], offs[i+1]) for i in range(len(wfs_list))]
-            self._slopes_total_len = int(offs[-1])
+        # Ensure slices + groups exist
+        if (getattr(self, "_wfs_slices", None) is None) or (getattr(self, "_wfs_groups_vec", None) is None):
+            self._ensure_wfs_vec_structures()
 
         acc_list = self._wfs_measure_accepts or [{} for _ in range(len(self._sensor_list) - 1)]
 
-        for i, (s0, acc) in enumerate(zip(self._sensor_list[1:], acc_list)):
-            ph = phases_wfs_stack[i]
-            kwargs = {"phase_map": ph, "return_image": False}
+        groups = getattr(self, "_wfs_groups_vec", None) or []
+        if not groups:
+            return out_vec
+
+        # Group-wise batching
+        for grp in groups:
+            idxs = grp["idxs"]
+            tmpl = grp["template"]
+            phase_buf = grp["phase_buf"]
+
+            # gather phases for this geometry into a contiguous buffer
+            for j, i in enumerate(idxs):
+                phase_buf[j] = phases_wfs_stack[i]
+
+            # use template's signature support flags
+            acc = acc_list[idxs[0]] if (idxs and idxs[0] < len(acc_list)) else {}
+            kwargs = {"phase_map": phase_buf, "return_image": False}
             if acc.get("assume_radians", False):
                 kwargs["assume_radians"] = True
             if acc.get("method", False):
                 kwargs["method"] = self.sensor_method
-            _, sl, _ = s0.measure(**kwargs)
-            sl0 = sl[0].astype(cp.float32, copy=False)
-            na = int(sl0.shape[0])
-            sx = sl0[:, 1]
-            sy = sl0[:, 0]
-            a, b = self._wfs_slices[i]
-            b = a + 2 * na
-            # clip defensively and pack in [sx..., sy...] ordering
-            b = min(int(b), int(out_vec.size))
-            mid = min(int(a + na), int(b))
-            if mid > a:
-                out_vec[a:mid] = sx[: (mid - a)]
-            if b > mid:
-                out_vec[mid:b] = sy[: (b - mid)]
+
+            _, sl, _ = tmpl.measure(**kwargs)
+            sl = sl.astype(cp.float32, copy=False)
+            if sl.ndim == 2:
+                sl = sl[None, :, :]
+            na = int(sl.shape[1])
+
+            # pack per-sensor in [sx..., sy...] ordering
+            for j, i in enumerate(idxs):
+                a, _ = self._wfs_slices[i]
+                out_vec[a : a + na] = sl[j, :, 1]
+                out_vec[a + na : a + 2 * na] = sl[j, :, 0]
 
         return out_vec
 
@@ -620,9 +669,13 @@ class SimWorker(QObject):
                 self._pupil_mask_patch = self._build_circular_pupil(self.patch_M)
 
 
+        # --- dynamic pointing: disable fixed-geometry sampling fast path when angles change over time ---
+        self._dynamic_thetas = any(getattr(s, "field_angle_fn", None) is not None for s in (self._sensor_list or []))
+
+
         # --- fast patch sampler for fixed sensor geometry (reduces per-frame cost) ---
         self._patch_sampler = None
-        if hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+        if (not self._dynamic_thetas) and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
             try:
                 self._patch_sampler = self.sim.build_patch_sampler(
                     thetas_xy_rad=self.thetas_gpu,
@@ -637,6 +690,8 @@ class SimWorker(QObject):
             except Exception as e:
                 self.status_log.emit(f"Fast patch sampler unavailable (falling back): {e}")
                 self._patch_sampler = None
+        elif self._dynamic_thetas:
+            self.status_log.emit("Dynamic field angle functions detected; fast patch sampler disabled.")
 
         # Cache measure() signature support per WFS to avoid per-frame try/except overhead
         self._wfs_measure_accepts = []
@@ -873,13 +928,61 @@ class SimWorker(QObject):
         self._sensor_list = list(self.sensors.values())
         self._sensor_keys = list(self.sensors.keys())
 
-        self.thetas_gpu = cp.asarray([s.field_angle for s in self._sensor_list], dtype=cp.float32)
+        # --- dynamic pointing support ---
+        self._dynamic_thetas = any(getattr(s, "field_angle_fn", None) is not None for s in (self._sensor_list or []))
+        thetas = []
+        for s in (self._sensor_list or []):
+            if getattr(s, "field_angle_fn", None) is not None and hasattr(s, "update_field_angle"):
+                thetas.append(s.update_field_angle(0.0, int(self._tick_count)))
+            else:
+                thetas.append(getattr(s, "field_angle", (float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0)))))
+
+        self.thetas_gpu = cp.asarray(thetas, dtype=cp.float32)
         S = int(self.thetas_gpu.shape[0])
 
-        r = cp.asarray([float(getattr(s, "gs_range_m", cp.inf)) for s in self._sensor_list], dtype=cp.float32)
+        r = cp.asarray([float(getattr(s, "gs_range_m", cp.inf)) for s in (self._sensor_list or [])], dtype=cp.float32)
         if r.size != S:
             r = cp.full((S,), cp.inf, dtype=cp.float32)
         self.ranges_gpu = r
+
+        # Sensor-dependent caches/buffers (safe defaults; rebuilt lazily on next tick)
+        self._patch_sampler = None
+        self._wfs_measure_accepts = None
+        self._wfs_groups_vec = None
+        self._wfs_slices = None
+        self._wfs_n_active = None
+        self._slopes_total_len = 0
+
+        if self.sim is not None:
+            # If fast sampler is enabled and the geometry is fixed, rebuild the sampler.
+            if (not self._dynamic_thetas) and self.fast_sampler and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+                try:
+                    self._patch_sampler = self.sim.build_patch_sampler(
+                        thetas_xy_rad=self.thetas_gpu,
+                        ranges_m=self.ranges_gpu,
+                        size_pixels=self.patch_size_px,
+                        M=self.patch_M,
+                        angle_deg=0.0,
+                        margin=2.0,
+                        autopan_init=True,
+                    )
+                    self.status_log.emit("Fast patch sampler rebuilt after sensor_update.")
+                except Exception as e:
+                    self.status_log.emit(f"Fast patch sampler rebuild failed (falling back): {e}")
+                    self._patch_sampler = None
+
+            # Cache measure() signature support per WFS (used by batching)
+            self._wfs_measure_accepts = []
+            for s0 in (self._sensor_list or [])[1:]:
+                try:
+                    ps = inspect.signature(s0.measure).parameters
+                    self._wfs_measure_accepts.append({
+                        "assume_radians": "assume_radians" in ps,
+                        "method": "method" in ps,
+                        "return_image": "return_image" in ps,
+                    })
+                except Exception:
+                    self._wfs_measure_accepts.append({"assume_radians": False, "method": False, "return_image": False})
 
         self._invalidate_frame_cache()
 
@@ -985,6 +1088,14 @@ class SimWorker(QObject):
 
             psf_tt_mode = str(cfg.get("psf_tt_mode", "hybrid")).lower().strip()
 
+            # Optional: off-axis evaluation points (arcsec) for long-exposure PSF/FWHM
+            eval_offaxis_arcsec = cfg.get("eval_offaxis_arcsec", None)
+            write_eval_fits = bool(cfg.get("write_eval_fits", True))
+            write_eval_uncorrected_fits = bool(cfg.get("write_eval_uncorrected_fits", True))
+            eval_accumulate_uncorrected = bool(cfg.get("eval_accumulate_uncorrected", True))
+            if not eval_accumulate_uncorrected:
+                write_eval_uncorrected_fits = False
+
             reset_before = bool(cfg.get("reset_before", True))
             base_out = str(cfg.get("out_dir", str(Path.cwd() / "output" / "batch_runs")))
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1031,6 +1142,10 @@ class SimWorker(QObject):
                 out_dir=str(out_dir),
                 psf_roi=psf_roi,
                 chunk_frames=chunk_frames,
+                eval_offaxis_arcsec=eval_offaxis_arcsec,
+                write_eval_fits=write_eval_fits,
+                write_eval_uncorrected_fits=write_eval_uncorrected_fits,
+                eval_accumulate_uncorrected=eval_accumulate_uncorrected,
                 progress_cb=_prog,
                 should_stop=_stop,
                 progress_every=int(cfg.get("progress_every", max(256, chunk_frames))),
@@ -1065,6 +1180,18 @@ class SimWorker(QObject):
                 "moffat_corrected": res.get("moffat_corrected"),
                 "moffat_uncorrected": res.get("moffat_uncorrected"),
             }
+
+            # Off-axis evaluation (optional)
+            if "offaxis_metrics" in res:
+                summary["eval_offaxis_arcsec"] = res.get("eval_offaxis_arcsec")
+                summary["eval_accumulate_uncorrected"] = bool(res.get("eval_accumulate_uncorrected", True))
+                summary["offaxis_metrics"] = res.get("offaxis_metrics")
+                summary["offaxis_stats"] = res.get("offaxis_stats")
+                # file paths (if written)
+                if "psf_long_corrected_offaxis_fits" in res:
+                    summary["psf_long_corrected_offaxis_fits"] = res.get("psf_long_corrected_offaxis_fits")
+                if "psf_long_uncorrected_offaxis_fits" in res:
+                    summary["psf_long_uncorrected_offaxis_fits"] = res.get("psf_long_uncorrected_offaxis_fits")
             if "fwhm_rad_corrected_ttremoved" in res:
                 summary["fwhm_rad_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"])
                 summary["fwhm_arcsec_corrected_ttremoved"] = float(res["fwhm_rad_corrected_ttremoved"]) * (180.0 * 3600.0) / math.pi
@@ -1082,6 +1209,11 @@ class SimWorker(QObject):
             ui_res = dict(summary)
             ui_res["psf_long_corrected"] = _to_np(res.get("psf_long_corrected"))
             ui_res["psf_long_uncorrected"] = _to_np(res.get("psf_long_uncorrected"))
+
+            if "psf_long_corrected_offaxis" in res:
+                ui_res["psf_long_corrected_offaxis"] = _to_np(res.get("psf_long_corrected_offaxis"))
+            if "psf_long_uncorrected_offaxis" in res:
+                ui_res["psf_long_uncorrected_offaxis"] = _to_np(res.get("psf_long_uncorrected_offaxis"))
             if "psf_long_corrected_ttremoved" in res:
                 ui_res["psf_long_corrected_ttremoved"] = _to_np(res.get("psf_long_corrected_ttremoved"))
 
@@ -1523,6 +1655,17 @@ class SimWorker(QObject):
 
         self._ensure_cache()
         self._advance(1)
+
+        # Update dynamic field angles (if any) for this tick before sampling.
+        if getattr(self, "_dynamic_thetas", False):
+            t_s = float(self._tick_count) * float(getattr(self, "dt_s", 0.0))
+            thetas = []
+            for s in (self._sensor_list or []):
+                if getattr(s, "field_angle_fn", None) is not None and hasattr(s, "update_field_angle"):
+                    thetas.append(s.update_field_angle(t_s, int(self._tick_count)))
+                else:
+                    thetas.append(getattr(s, "field_angle", (float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0)))))
+            self.thetas_gpu = cp.asarray(thetas, dtype=cp.float32)
 
         tc = self._tick_count
         need_visible_sensor = ((tc % self._sensor_period) == 0)

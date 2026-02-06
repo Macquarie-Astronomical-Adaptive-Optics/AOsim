@@ -5,6 +5,8 @@ from pathlib import Path
 import json
 import threading
 import math
+import hashlib
+from typing import Callable, Optional, Tuple
 
 # -----------------------------
 # Config / parameter management
@@ -888,6 +890,10 @@ class WFSensor_tools:
             lgs_rad_bins=16,
             lgs_elong_scale=2.0,             
             lgs_half_max=24,                   # cap kernel half-length (pixels)
+
+            # --- dynamic pointing ---
+            # If provided, called as: field_angle_fn(t_s, tick, sensor=self) -> (theta_x_rad, theta_y_rad)
+            field_angle_fn=None,
         ):
             if n_sub is None:
                 n_sub = params.get("sub_apertures")
@@ -913,9 +919,12 @@ class WFSensor_tools:
             self.grid_size = int(grid_size)
             self.pupil = pupil
 
-            # store angles in radians internally 
+            # store angles in radians internally
             self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
             self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
+
+            # Optional dynamic pointing function.
+            self.field_angle_fn = field_angle_fn
             self.field_angle = (self.dx, self.dy)
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
             
@@ -951,6 +960,77 @@ class WFSensor_tools:
 
             self._build_subap_geometry()
 
+        # ------------------------
+        # pointings + batching API
+        # ------------------------
+        def update_field_angle(self, t_s: float, tick: int = 0):
+            """Update the current field angle from field_angle_fn (if provided).
+
+            field_angle_fn is expected to return (theta_x_rad, theta_y_rad) in **radians**.
+            This method mutates self.dx/self.dy/self.field_angle/self.sen_angle.
+            """
+            fn = getattr(self, "field_angle_fn", None)
+            if fn is None:
+                return self.field_angle
+
+            try:
+                th = fn(float(t_s), int(tick), self)
+            except TypeError:
+                # Back-compat: allow callables that only accept (t_s) or (t_s, tick)
+                try:
+                    th = fn(float(t_s), int(tick))
+                except TypeError:
+                    th = fn(float(t_s))
+
+            thx = float(th[0])
+            thy = float(th[1])
+            self.dx = thx
+            self.dy = thy
+            self.field_angle = (thx, thy)
+            self.sen_angle = float(np.sqrt(thx * thx + thy * thy))
+            return self.field_angle
+
+        def batch_geometry_key(self):
+            """Return an immutable key that identifies the *measurement* geometry.
+
+            Notes:
+            - Excludes field angle and gs_range_m; those affect sampling, not the SHWFS measurement geometry.
+            - Includes LGS elongation parameters because they can affect the spot shape/centroiding.
+            """
+            # subap layout can differ if pupil differs; include a stable signature of active indices
+            try:
+                idx = getattr(self, "sub_aps_idx", None)
+                if idx is None:
+                    idx_sig = 0
+                else:
+                    # idx is small (~n_active) so a tuple is OK
+                    # convert to python ints for hash stability
+                    if hasattr(idx, "get"):
+                        idx = idx.get()
+                    idx_sig = hash(tuple(int(x) for x in np.asarray(idx).reshape(-1)))
+            except Exception:
+                idx_sig = 0
+
+            return (
+                "ShackHartmann",
+                int(getattr(self, "grid_size", -1)),
+                int(getattr(self, "n_sub", -1)),
+                int(len(getattr(self, "sub_aps_idx", []))),
+                # LGS elongation-related
+                float(getattr(self, "lgs_thickness_m", 0.0)),
+                bool(getattr(self, "lgs_remove_tt", True)),
+                tuple(float(x) for x in getattr(self, "lgs_launch_offset_px", (0.0, 0.0))),
+                int(getattr(self, "lgs_dir_bins", 0)),
+                int(getattr(self, "lgs_rad_bins", 0)),
+                float(getattr(self, "lgs_elong_scale", 0.0)),
+                int(getattr(self, "lgs_half_max", 0)),
+                # optics
+                float(getattr(self, "lenslet_f_m", 0.0)),
+                float(getattr(self, "pixel_pitch_m", 0.0)),
+                # active layout signature
+                int(idx_sig),
+            )
+
         def recompute(
             self,
             n_sub=None,
@@ -967,6 +1047,7 @@ class WFSensor_tools:
             lgs_rad_bins=None,
             lgs_elong_scale=None,
             lgs_half_max=None,
+            field_angle_fn=None,
             **kwargs
         ):
             if n_sub is not None:
@@ -982,6 +1063,9 @@ class WFSensor_tools:
                 self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
             if dy is not None:
                 self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
+
+            if field_angle_fn is not None:
+                self.field_angle_fn = field_angle_fn
             self.field_angle = (self.dx, self.dy)
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
 
@@ -1012,7 +1096,6 @@ class WFSensor_tools:
             self._lgs_kernel_cache = {}
 
             self._build_subap_geometry()
-
         def _device_id(self):
             try:
                 return int(cp.cuda.runtime.getDevice())
@@ -1702,6 +1785,183 @@ class WFSensor_tools:
 
 
             return centroids, slopes, sensor_image
+
+
+
+    class ScienceImager:
+        """Dedicated science-channel sensor for generating science images (PSFs).
+
+        This class focuses on producing science images and does **not** implement
+        SHWFS centroid/slope logic.
+
+        Compatibility surface used elsewhere in the codebase:
+        - .wavelength, .grid_size, .pupil
+        - .field_angle = (theta_x, theta_y) in radians
+        - .gs_range_m (typically inf)
+        - .update_field_angle(t_s, tick)
+        - .batch_geometry_key()
+        - .measure(...) -> (None, None, (I0, I1, ...)) intensities
+        """
+
+        def __init__(
+            self,
+            wavelength=None,
+            dx=None,
+            dy=None,
+            pupil=None,
+            grid_size=None,
+            gs_range_m=np.inf,
+            field_angle_fn=None,
+        ):
+            if wavelength is None:
+                wavelength = params.get("science_lambda", params.get("wfs_lambda"))
+            if grid_size is None:
+                grid_size = params.get("grid_size")
+            if pupil is None:
+                pupil = Pupil_tools.generate_pupil(grid_size=grid_size)
+
+            if dx is None:
+                dx = 0.0
+            if dy is None:
+                dy = 0.0
+
+            self.wavelength = float(wavelength)
+            self.grid_size = int(grid_size)
+            self.pupil = pupil
+
+            self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+
+            # store angles in radians internally
+            self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
+            self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
+            self.field_angle_fn = field_angle_fn
+            self.field_angle = (self.dx, self.dy)
+            self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
+
+            # marker used by GUI to avoid treating this like a SHWFS
+            self.is_science_sensor = True
+
+        def update_field_angle(self, t_s: float, tick: int = 0):
+            """Update the current field angle from field_angle_fn (if provided).
+
+            field_angle_fn is expected to return (theta_x_rad, theta_y_rad) in **radians**.
+            """
+            fn = getattr(self, "field_angle_fn", None)
+            if fn is None:
+                return self.field_angle
+            try:
+                th = fn(float(t_s), int(tick), self)
+            except TypeError:
+                try:
+                    th = fn(float(t_s), int(tick))
+                except TypeError:
+                    th = fn(float(t_s))
+            thx = float(th[0])
+            thy = float(th[1])
+            self.dx = thx
+            self.dy = thy
+            self.field_angle = (thx, thy)
+            self.sen_angle = float(np.sqrt(thx * thx + thy * thy))
+            return self.field_angle
+
+        def batch_geometry_key(self):
+            # science image geometry does not participate in WFS batching
+            return (
+                "ScienceImager",
+                int(getattr(self, "grid_size", -1)),
+                float(getattr(self, "wavelength", 0.0)),
+            )
+
+        def recompute(
+            self,
+            wavelength=None,
+            dx=None,
+            dy=None,
+            pupil=None,
+            grid_size=None,
+            gs_range_m=None,
+            field_angle_fn=None,
+            **kwargs,
+        ):
+            if wavelength is not None:
+                self.wavelength = float(wavelength)
+            if grid_size is not None:
+                self.grid_size = int(grid_size)
+            if pupil is not None:
+                self.pupil = pupil
+            if gs_range_m is not None:
+                self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            if dx is not None:
+                self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
+            if dy is not None:
+                self.dy = float(dy) * WFSensor_tools.ARCSEC2RAD
+            if field_angle_fn is not None:
+                self.field_angle_fn = field_angle_fn
+
+            self.field_angle = (self.dx, self.dy)
+            self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
+
+        def measure(
+            self,
+            phase_map,
+            pupil=None,
+            pad=None,
+            assume_radians: bool = True,
+            return_image: bool = True,
+            fft_pad: int = 0,
+            normalize: bool = True,
+            return_log: bool = False,
+            **kwargs,
+        ):
+            """Generate science PSF intensity images.
+
+            phase_map:
+              - (M,M) or (B,M,M). Convention matches ShackHartmann: phase is treated as
+                radians at 500 nm reference by default and scaled to this sensor's wavelength.
+
+            Returns:
+              (None, None, (I0, I1, ...)) where each Ii is (M',M') float32 (or log10 if return_log).
+            """
+            if pupil is None:
+                pupil = self.pupil
+            pupil = cp.asarray(pupil).astype(cp.float32, copy=False)
+
+            ph = cp.asarray(phase_map).astype(cp.float32, copy=False)
+            if ph.ndim == 2:
+                ph = ph[None, :, :]
+            if ph.ndim != 3:
+                raise ValueError(f"ScienceImager.measure expects (M,M) or (B,M,M); got {tuple(ph.shape)}")
+
+            # If caller supplied OPD (meters), convert to radians at *this* wavelength.
+            if not bool(assume_radians):
+                ph = ph * (4.0 * np.pi / float(self.wavelength))
+
+            # Convert 500nm-reference phase to this wavelength (keeps convention consistent with SHWFS code).
+            ph = ph * (float(500e-9) / float(self.wavelength))
+
+            if pad is None:
+                pad = int(fft_pad) if (fft_pad and int(fft_pad) > 0) else 0
+            pad = int(pad)
+
+            if pad > 0:
+                ph = cp.pad(ph, ((0, 0), (pad, pad), (pad, pad)), mode="constant", constant_values=0.0)
+                pup = cp.pad(pupil, ((pad, pad), (pad, pad)), mode="constant", constant_values=0.0)
+            else:
+                pup = pupil
+
+            E = pup[None, :, :] * cp.exp(1j * ph)
+            F = cp.fft.fftshift(cp.fft.fft2(E, axes=(-2, -1)), axes=(-2, -1))
+            I = (F.real * F.real + F.imag * F.imag).astype(cp.float32)
+
+            if normalize:
+                denom = cp.sum(I, axis=(-2, -1), keepdims=True)
+                I = I / cp.maximum(denom, cp.float32(1e-20))
+
+            if return_log:
+                I = cp.log10(I + cp.float32(1e-12))
+
+            imgs = tuple(I[i] for i in range(int(I.shape[0])))
+            return None, None, imgs
 
 
 
