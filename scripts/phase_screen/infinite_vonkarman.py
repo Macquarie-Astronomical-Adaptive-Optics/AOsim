@@ -111,15 +111,18 @@ class InfiniteVonKarmanScreen2D:
 
         # Scale B for this layer's r0:
         # cov ∝ r0^{-5/3} => amplitude ∝ r0^{-5/6}
-        amp = (self.r0 ** (-5.0/6.0))
-        self.A_pre  = self.A_pre_ref
+        # IMPORTANT (memory): do *not* store per-layer scaled copies of B.
+        # B scales linearly with phase amplitude, so we keep the shared reference
+        # operators (built for r0_ref=1) and apply the per-layer scalar amplitude
+        # at generation time. This saves 2 * N^2 float arrays per layer.
+        amp = self.dtype(self.r0 ** (-5.0 / 6.0))
+        self._amp = amp
+        self.A_pre = self.A_pre_ref
         self.A_post = self.A_post_ref
-        self.B_pre  = (self.B_pre_ref  * self.dtype(amp)).astype(self.dtype)
-        self.B_post = (self.B_post_ref * self.dtype(amp)).astype(self.dtype)
 
         # Initial window (seeded) – generate for r0_ref=1 then scale by r0^{-5/6}
         self.scrn = _ft_phase_screen_vk_cp(self.N, self.dx, r0=1.0, L0=self.L0, seed=self.seed + 1337, dtype=self.dtype)
-        self.scrn *= self.dtype(amp)
+        self.scrn *= self._amp
         self.scrn -= cp.mean(self.scrn)
         
         self.warmup()
@@ -205,16 +208,15 @@ class InfiniteVonKarmanScreen2D:
         self._load_or_build_AB_cached()
 
         # rescale B for current r0
-        amp = (self.r0 ** (-5.0 / 6.0))
-        self.A_pre  = self.A_pre_ref
+        amp = self.dtype(self.r0 ** (-5.0 / 6.0))
+        self._amp = amp
+        self.A_pre = self.A_pre_ref
         self.A_post = self.A_post_ref
-        self.B_pre  = (self.B_pre_ref  * self.dtype(amp)).astype(self.dtype)
-        self.B_post = (self.B_post_ref * self.dtype(amp)).astype(self.dtype)
 
         # You can keep the current scrn (recommended: avoids a visible “jump”)
         # but its statistics are now for the old L0. If you want to fully apply new L0,
         # either warmup after changing L0 or reseed:
-        self.scrn = _ft_phase_screen_vk_cp(self.N, self.dx, r0=1.0, L0=self.L0, seed=self.seed + 1337, dtype=self.dtype) * self.dtype(amp)
+        self.scrn = _ft_phase_screen_vk_cp(self.N, self.dx, r0=1.0, L0=self.L0, seed=self.seed + 1337, dtype=self.dtype) * self._amp
         self.scrn -= cp.mean(self.scrn)
 
 
@@ -231,8 +233,7 @@ class InfiniteVonKarmanScreen2D:
         s = amp_new / amp_old
 
         self.scrn *= self.dtype(s)
-        self.B_pre *= self.dtype(s)
-        self.B_post *= self.dtype(s)
+        self._amp = self.dtype(float(self._amp) * float(s))
         self.r0 = r0_new
 
 
@@ -247,15 +248,15 @@ class InfiniteVonKarmanScreen2D:
 
         if edge == "top":
             stencil = self.scrn[:nc, :].reshape(-1)
-            A, B = self.A_pre, self.B_pre
+            A, B = self.A_pre, self.B_pre_ref
         elif edge == "bottom":
             stencil = self.scrn[-nc:, :].reshape(-1)
-            A, B = self.A_post, self.B_post
+            A, B = self.A_post, self.B_post_ref
         else:
             raise ValueError("edge must be 'top' or 'bottom'")
 
         b = self._rng.standard_normal((self.N,), dtype=self.dtype)
-        return (A @ stencil + B @ b).astype(self.dtype)
+        return (A @ stencil + (self._amp * (B @ b))).astype(self.dtype)
 
     def _new_col(self, edge: str) -> cp.ndarray:
         """
@@ -268,15 +269,15 @@ class InfiniteVonKarmanScreen2D:
 
         if edge == "left":
             stencil = scrT[:nc, :].reshape(-1)
-            A, B = self.A_pre, self.B_pre
+            A, B = self.A_pre, self.B_pre_ref
         elif edge == "right":
             stencil = scrT[-nc:, :].reshape(-1)
-            A, B = self.A_post, self.B_post
+            A, B = self.A_post, self.B_post_ref
         else:
             raise ValueError("edge must be 'left' or 'right'")
 
         b = self._rng.standard_normal((self.N,), dtype=self.dtype)
-        return (A @ stencil + B @ b).astype(self.dtype)
+        return (A @ stencil + (self._amp * (B @ b))).astype(self.dtype)
 
     def _shift_down_1px(self):
         new = self._new_row("top")                      # new enters at top
@@ -360,10 +361,11 @@ class InfiniteVonKarmanScreen2D:
         self._frac_y = 0.0
 
         # re-seed initial window (using r0_ref=1 then scale)
-        amp = (self.r0 ** (-5.0/6.0))
+        amp = self.dtype(self.r0 ** (-5.0 / 6.0))
+        self._amp = amp
         self.scrn = _ft_phase_screen_vk_cp(self.N, self.dx, r0=1.0, L0=self.L0,
                                         seed=self.seed + 1337, dtype=self.dtype)
-        self.scrn *= self.dtype(amp)
+        self.scrn *= self._amp
         self.scrn -= cp.mean(self.scrn)
 
         # optional: if you warmup at init, do the same here

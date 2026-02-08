@@ -132,7 +132,7 @@ class LongRun_tab(QWidget):
         grid.addWidget(self.chk_write_offaxis_fits, row, 2, 1, 2)
         row += 1
 
-        self.chk_write_unc_offaxis_fits = QCheckBox("Also write uncorrected off-axis FITS")
+        self.chk_write_unc_offaxis_fits = QCheckBox("Write uncorrected off-axis FITS")
         self.chk_write_unc_offaxis_fits.setChecked(False)
         grid.addWidget(self.chk_write_unc_offaxis_fits, row, 0, 1, 2)
 
@@ -192,7 +192,7 @@ class LongRun_tab(QWidget):
         left_layout.addWidget(self.lbl_results)
 
         # Off-axis results table (shown only if off-axis evaluation was run)
-        self.grp_offaxis = QGroupBox("Off-axis FWHM (long-exposure)")
+        self.grp_offaxis = QGroupBox("Long-exposure PSFs FWHM")
         self.grp_offaxis.setVisible(False)
         off_lay = QVBoxLayout(self.grp_offaxis)
         self.lbl_offaxis_stats = QLabel("")
@@ -201,9 +201,9 @@ class LongRun_tab(QWidget):
         off_lay.addWidget(self.lbl_offaxis_stats)
 
         self.tbl_offaxis = QTableWidget()
-        self.tbl_offaxis.setColumnCount(7)
+        self.tbl_offaxis.setColumnCount(6)
         self.tbl_offaxis.setHorizontalHeaderLabels(
-            ["#", "dx (arcsec)", "dy (arcsec)", "Gauss corr (as)", "Moffat corr (as)", "Gauss unc (as)", "Moffat unc (as)"]
+            ["dx\n(arcsec)", "dy\n(arcsec)", "Gauss corr\n(as)", "Moffat corr\n(as)", "Gauss unc\n(as)", "Moffat unc\n(as)"]
         )
         # PySide6 enums live on QAbstractItemView (not on QTableWidget)
         self.tbl_offaxis.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -224,8 +224,7 @@ class LongRun_tab(QWidget):
 
         # Right: PSF canvases + marginal cross-sections
         right = QFrame()
-        right.setFrameShape(QFrame.Box)
-        right.setLineWidth(1)
+        right.setFrameShape(QFrame.NoFrame)
         right_layout = QHBoxLayout(right)
 
         self._psf_corr = self._make_psf_panel("Long exposure PSF (corrected)")
@@ -695,14 +694,7 @@ class LongRun_tab(QWidget):
         gauss_unc = res.get("gauss_uncorrected") or {}
         moff_corr = res.get("moffat_corrected") or {}
         moff_unc = res.get("moffat_uncorrected") or {}
-        def _fmt_fit(label: str, fwhm_arcsec: float, d: Dict[str, Any]) -> str:
-            try:
-                x0 = float(d.get("x0_px", float("nan")))
-                y0 = float(d.get("y0_px", float("nan")))
-                r = float(d.get("r_px", float("nan")))
-            except Exception:
-                x0 = y0 = r = float("nan")
-            return f"{label}: {fwhm_arcsec:.3f} arcsec (x0={x0:.2f}, y0={y0:.2f}, r={r:.2f} px)"
+
         used = int(res.get("n_frames_used", done))
         discard_frames = int(res.get("discard_first_frames", 0))
         discard_s = float(res.get("discard_first_s", 0.0))
@@ -710,10 +702,10 @@ class LongRun_tab(QWidget):
         lines = [
             f"Frames: {done}/{total}",
             f"Used for fit: {used} (discarded {discard_frames} frames = {discard_s:.1f} s)",
-            _fmt_fit("Gaussian FWHM corrected", fwhm_c, gauss_corr),
-            _fmt_fit("Gaussian FWHM uncorrected", fwhm_u, gauss_unc),
-            _fmt_fit("Moffat FWHM corrected", fwhm_cmof, moff_corr),
-            _fmt_fit("Moffat FWHM uncorrected", fwhm_umof, moff_unc),
+            # _fmt_fit("Gaussian FWHM corrected", fwhm_c, gauss_corr),
+            # _fmt_fit("Gaussian FWHM uncorrected", fwhm_u, gauss_unc),
+            # _fmt_fit("Moffat FWHM corrected", fwhm_cmof, moff_corr),
+            # _fmt_fit("Moffat FWHM uncorrected", fwhm_umof, moff_unc),
             f"Uncorrected r0: {r0_est:.3f} m",
         ]
         if "r0_effective_m" in res:
@@ -742,58 +734,102 @@ class LongRun_tab(QWidget):
         if len(off_metrics) > 0:
             lines.append("")
             lines.append(f"Off-axis points: {len(off_metrics)}")
-            for _lbl, _key in [
-                ("Off-axis Gaussian corrected", "gauss_corrected_arcsec"),
-                ("Off-axis Moffat corrected", "moffat_corrected_arcsec"),
-                ("Off-axis Gaussian uncorrected", "gauss_uncorrected_arcsec"),
-                ("Off-axis Moffat uncorrected", "moffat_uncorrected_arcsec"),
-            ]:
-                line = _fmt_stats_line(_lbl, _key)
-                if line is not None:
-                    lines.append(line)
+            
 
         self.lbl_results.setText("\n".join(lines))
 
-        # Populate off-axis table
+                # Populate table (include on-axis as first row)
         if hasattr(self, "grp_offaxis") and hasattr(self, "tbl_offaxis"):
-            if len(off_metrics) > 0:
-                self.grp_offaxis.setVisible(True)
-                self.tbl_offaxis.setRowCount(len(off_metrics))
-                # Determine whether uncorrected columns have data
+
+            # Build rows: on-axis first, then off-axis
+            rows = []
+
+            # On-axis metrics from summary
+            rows.append({
+                "dx": 0.0,
+                "dy": 0.0,
+                "gc": fwhm_c,
+                "mc": fwhm_cmof,
+                "gu": fwhm_u,
+                "mu": fwhm_umof,
+                "is_onaxis": True,
+            })
+
+            # Off-axis metrics (if any)
+            for m in off_metrics:
+                rows.append({
+                    "dx": float(m.get("dx_arcsec", 0.0)),
+                    "dy": float(m.get("dy_arcsec", 0.0)),
+                    "gc": float(m.get("fwhm_arcsec_corrected", float("nan"))),
+                    "mc": float(m.get("fwhm_arcsec_corrected_moffat", float("nan"))),
+                    "gu": float(m.get("fwhm_arcsec_uncorrected", float("nan"))),
+                    "mu": float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan"))),
+                    "is_onaxis": False,
+                })
+
+            # Show group whenever we have at least the on-axis row
+            self.grp_offaxis.setVisible(True)
+            self.tbl_offaxis.setRowCount(len(rows))
+
+            # Determine whether uncorrected columns should be shown:
+            # show if either on-axis uncorrected exists or off-axis uncorrected stats exist
+            unc_n = 0
+            try:
+                unc_n = int((off_stats.get("gauss_uncorrected_arcsec") or {}).get("n", 0))
+            except Exception:
                 unc_n = 0
+
+            onaxis_unc_ok = bool(np.isfinite(fwhm_u) or np.isfinite(fwhm_umof))
+            show_unc = bool(onaxis_unc_ok or (unc_n > 0))
+
+            # Show/hide uncorrected columns (4,5)
+            self.tbl_offaxis.setColumnHidden(4, not show_unc)
+            self.tbl_offaxis.setColumnHidden(5, not show_unc)
+
+            def _it(v: str, tooltip: str = ""):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if tooltip:
+                    item.setToolTip(tooltip)
+                return item
+
+            # Fill rows
+            for i, r in enumerate(rows):
+                dx = float(r["dx"])
+                dy = float(r["dy"])
+                gc = float(r["gc"])
+                mc = float(r["mc"])
+                gu = float(r["gu"])
+                mu = float(r["mu"])
+
+                tip = "On-axis (dx=0, dy=0)" if r.get("is_onaxis") else ""
+
+                self.tbl_offaxis.setItem(i, 0, _it(f"{dx:.0f}", tip))
+                self.tbl_offaxis.setItem(i, 1, _it(f"{dy:.0f}", tip))
+                self.tbl_offaxis.setItem(i, 2, _it(f"{gc:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 3, _it(f"{mc:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 4, _it("" if (not show_unc or not np.isfinite(gu)) else f"{gu:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 5, _it("" if (not show_unc or not np.isfinite(mu)) else f"{mu:.3f}", tip))
+
+            # Stats label: include on-axis line + off-axis aggregate stats (if present)
+            stats_lines = []
+
+            def _fmt_stats_line(label: str, key: str) -> Optional[str]:
                 try:
-                    unc_n = int((off_stats.get("gauss_uncorrected_arcsec") or {}).get("n", 0))
+                    s = dict(off_stats.get(key) or {})
+                    n = int(s.get("n", 0))
+                    if n <= 0:
+                        return None
+                    mean = float(s.get("mean", float("nan")))
+                    std = float(s.get("std", float("nan")))
+                    mn = float(s.get("min", float("nan")))
+                    mx = float(s.get("max", float("nan")))
+                    return f"{label} (off-axis): mean={mean:.3f}±{std:.3f} as  (min={mn:.3f}, max={mx:.3f}, n={n})"
                 except Exception:
-                    unc_n = 0
-                show_unc = bool(unc_n > 0)
+                    return None
 
-                # Show/hide uncorrected columns
-                self.tbl_offaxis.setColumnHidden(5, not show_unc)
-                self.tbl_offaxis.setColumnHidden(6, not show_unc)
-
-                for i, m in enumerate(off_metrics):
-                    dx = float(m.get("dx_arcsec", 0.0))
-                    dy = float(m.get("dy_arcsec", 0.0))
-                    gc = float(m.get("fwhm_arcsec_corrected", float("nan")))
-                    mc = float(m.get("fwhm_arcsec_corrected_moffat", float("nan")))
-                    gu = float(m.get("fwhm_arcsec_uncorrected", float("nan")))
-                    mu = float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan")))
-
-                    def _it(v):
-                        item = QTableWidgetItem(v)
-                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        return item
-
-                    self.tbl_offaxis.setItem(i, 0, _it(str(i)))
-                    self.tbl_offaxis.setItem(i, 1, _it(f"{dx:.3f}"))
-                    self.tbl_offaxis.setItem(i, 2, _it(f"{dy:.3f}"))
-                    self.tbl_offaxis.setItem(i, 3, _it(f"{gc:.3f}"))
-                    self.tbl_offaxis.setItem(i, 4, _it(f"{mc:.3f}"))
-                    self.tbl_offaxis.setItem(i, 5, _it("" if not np.isfinite(gu) else f"{gu:.3f}"))
-                    self.tbl_offaxis.setItem(i, 6, _it("" if not np.isfinite(mu) else f"{mu:.3f}"))
-
-                # Stats label
-                stats_lines = []
+            # Only show off-axis aggregates if there are off-axis points
+            if len(off_metrics) > 0:
                 for _lbl, _key in [
                     ("Gaussian corrected", "gauss_corrected_arcsec"),
                     ("Moffat corrected", "moffat_corrected_arcsec"),
@@ -801,6 +837,7 @@ class LongRun_tab(QWidget):
                     line = _fmt_stats_line(_lbl, _key)
                     if line:
                         stats_lines.append(line)
+
                 if show_unc:
                     for _lbl, _key in [
                         ("Gaussian uncorrected", "gauss_uncorrected_arcsec"),
@@ -809,9 +846,9 @@ class LongRun_tab(QWidget):
                         line = _fmt_stats_line(_lbl, _key)
                         if line:
                             stats_lines.append(line)
-                self.lbl_offaxis_stats.setText("\n".join(stats_lines))
-            else:
-                self.grp_offaxis.setVisible(False)
+
+            self.lbl_offaxis_stats.setText("\n".join(stats_lines))
+
 
         plate = float(res.get("plate_rad_per_pix", 0.0) or 0.0)
 

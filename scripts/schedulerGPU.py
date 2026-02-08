@@ -174,6 +174,7 @@ class SimWorker(QObject):
         self._detailed_enabled = True
         self._loop_enabled = False
         self._loop_r0_only = False
+        self.loop_display_hz = loop_display_hz
 
         # profiling / timing
         self._profile_gpu_timings = False
@@ -1895,8 +1896,7 @@ class SimWorker(QObject):
                 r0_eff_corrected, r0_eff_uncorrected = cp.exp(log_r0)
 
                 if not self._loop_r0_only:
-                    # Heavy PSF+fit capped at ~30 Hz; UI can still update faster using cached outputs.
-                    psf_period = max(1, self._hz_to_period(min(30, max(1, int(self.loop_display_hz)))))
+                    psf_period = self._hz_to_period(max(1, int(self.loop_display_hz)))
                     do_psf = ((tc % psf_period) == 0) or (self._loop_t == 0) or (self.long_exposure_psf is None)
                     if do_psf:
                         fft_pad = self.patch_M // 2

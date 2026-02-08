@@ -101,6 +101,7 @@ def _phase_to_psf_batch(
     fft_pad: int,
     roi: Optional[int] = None,
     phase_scale: float = 1.0,
+    norm_inv: Optional[cp.ndarray] = None,
     tt_yx: Optional[cp.ndarray] = None,
     xx: Optional[cp.ndarray] = None,
     yy: Optional[cp.ndarray] = None,
@@ -129,8 +130,6 @@ def _phase_to_psf_batch(
     # Most sensors (including WFS) apply a factor (500e-9 / wavelength) internally.
     # For PSFs we must do the same (using the science wavelength).
     ps = cp.float32(phase_scale)
-    if float(ps) != 1.0:
-        phase_batch = phase_batch * ps
 
     if tt_yx is not None:
         # Remove a linear phase ramp: phi' = phi - (sx*xx + sy*yy)
@@ -145,32 +144,60 @@ def _phase_to_psf_batch(
         if tt_yx.ndim != 2 or tt_yx.shape[0] != phase_batch.shape[0] or tt_yx.shape[1] != 2:
             raise ValueError("tt_yx must have shape (B,2) matching phase_batch")
 
-        # If the phase was scaled (e.g., 500 nm -> science λ), the TT coefficients
-        # must be scaled the same way.
-        if float(ps) != 1.0:
-            tt_yx = tt_yx * ps
-
         sy = tt_yx[:, 0][:, None, None]
         sx = tt_yx[:, 1][:, None, None]
         phase_batch = phase_batch - (sx * xx[None, :, :] + sy * yy[None, :, :])
 
-    E = cp.exp(1j * phase_batch).astype(cp.complex64, copy=False)
+    # Build complex field. Avoid materializing scaled phase when possible.
+    if float(ps) == 1.0:
+        E = cp.exp(1j * phase_batch).astype(cp.complex64, copy=False)
+    else:
+        # fused multiply inside exp
+        E = cp.exp(1j * (phase_batch * ps)).astype(cp.complex64, copy=False)
     E *= P[None, :, :]
 
     F = cp.fft.fft2(E, s=(Nfft, Nfft), axes=(-2, -1))
-    I = (F.real * F.real + F.imag * F.imag).astype(cp.float32, copy=False)
-    I = cp.fft.fftshift(I, axes=(-2, -1))
 
-    # Normalize to unit energy (matches display normalization)
-    denom = cp.sum(I, axis=(-2, -1), keepdims=True)
-    I = I / cp.maximum(denom, cp.float32(1e-20))
+    # Normalization: energy is invariant to phase (|E|^2 = P^2), so
+    # sum(|F|^2) is constant for fixed pupil + FFT size (Parseval).
+    if norm_inv is None:
+        p2 = cp.sum(P * P)
+        norm_inv = cp.float32(1.0) / cp.maximum(cp.float32(Nfft * Nfft) * p2, cp.float32(1e-20))
 
-    if roi is not None:
-        r = int(roi)
-        c = Nfft // 2
-        h = r // 2
-        I = I[:, c - h : c - h + r, c - h : c - h + r]
-    return I
+    if roi is None:
+        I = (F.real * F.real + F.imag * F.imag).astype(cp.float32, copy=False)
+        I = cp.fft.fftshift(I, axes=(-2, -1))
+        I *= norm_inv
+        return I
+
+    # ROI-only intensity without allocating full-size I or doing fftshift.
+    r = int(roi)
+    h = r // 2
+    if r <= 0 or r > Nfft:
+        raise ValueError(f"roi must be in [1, {Nfft}], got {r}")
+
+    def _wrap_segments(N: int, start: int, length: int):
+        start = int(start) % int(N)
+        length = int(length)
+        if start + length <= N:
+            return [(start, start + length, 0, length)]
+        l1 = N - start
+        l2 = length - l1
+        return [(start, N, 0, l1), (0, l2, l1, length)]
+
+    # Shifted ROI around center corresponds to unshifted indices around 0.
+    start = (-h) % int(Nfft)  # == Nfft-h for even Nfft
+    row_segs = _wrap_segments(Nfft, start, r)
+    col_segs = _wrap_segments(Nfft, start, r)
+
+    out = cp.empty((phase_batch.shape[0], r, r), dtype=cp.float32)
+    for rs0, rs1, rd0, rd1 in row_segs:
+        for cs0, cs1, cd0, cd1 in col_segs:
+            blk = F[:, rs0:rs1, cs0:cs1]
+            out[:, rd0:rd1, cd0:cd1] = (blk.real * blk.real + blk.imag * blk.imag).astype(cp.float32, copy=False)
+
+    out *= norm_inv
+    return out
 
 import numpy as np
 from astropy.modeling import models, fitting
@@ -588,6 +615,12 @@ class AOBatchRunner:
         Nfft = patch_M + 2 * int(fft_pad)
         plate_rad = lam_sci * patch_M / (D * Nfft)
 
+        # PSF normalization constant (Parseval): for fixed pupil + FFT size,
+        # sum(|FFT(E)|^2) is invariant to phase when |E| = pupil.
+        P0 = self.pupil.astype(cp.float32, copy=False)
+        p2sum = cp.sum(P0 * P0)
+        psf_norm_inv = cp.float32(1.0) / cp.maximum(cp.float32(Nfft * Nfft) * p2sum, cp.float32(1e-20))
+
         # Convert 500 nm-reference phase screens -> science wavelength phase.
         # This matches the WFS scaling convention used elsewhere.
         phase_scale = float(500e-9 / max(lam_sci, 1e-30))
@@ -645,13 +678,26 @@ class AOBatchRunner:
                 except Exception:
                     eval_sampler = None
 
-            # Bound the eval phase-buffer memory (avoid OOM on large M / many field points).
-            bytes_per_phase = int(patch_M) * int(patch_M) * 4  # float32
-            mult = 1 + (1 if eval_accumulate_uncorrected else 0)
-            target_bytes = 256 * 1024 * 1024  # ~256MB for eval buffers
-            max_frames = target_bytes // max(1, int(mult) * int(n_eval) * int(bytes_per_phase))
-            # If memory is tight, this may drop below 8; correctness is unchanged.
-            eval_chunk_frames = int(min(int(chunk_frames), int(max(1, max_frames))))
+            # Choose an eval batch size that stays within VRAM.
+            # The limiting factor is usually the temporary FFT output for PSFs, which scales as:
+            #   B * (Nfft*Nfft) complex64
+            # where B = n_time * n_eval.
+            # We estimate an upper bound on B from current free VRAM, leaving headroom for
+            # the main on-axis chunk buffers and other simulator state.
+            free_b, _total_b = cp.cuda.runtime.memGetInfo()
+            # main chunk PSF phase buffers are allocated later; reserve space for them now
+            reserve_b = int(2 * int(chunk_frames) * int(patch_M) * int(patch_M) * 4)  # buf_corr + buf_unc
+            # plus a safety headroom (avoid going into shared VRAM on 8GB cards)
+            headroom_b = int(192 * 1024 * 1024)
+            free_eff = max(0, int(free_b) - int(reserve_b) - int(headroom_b))
+
+            # bytes per PSF sample (dominant: complex FFT output) for roi path
+            bytes_per_sample = int(8 * int(Nfft) * int(Nfft) + 12 * int(patch_M) * int(patch_M) + 4 * int(psf_roi) * int(psf_roi))
+            # allow up to 30% of effective free memory for off-axis PSF temporaries
+            budget_b = max(int(64 * 1024 * 1024), int(0.30 * float(free_eff)))
+            max_B = max(1, int(budget_b) // max(1, int(bytes_per_sample)))
+            max_time_fft = max(1, int(max_B) // max(1, int(n_eval)))
+            eval_chunk_frames = int(min(int(chunk_frames), int(max_time_fft)))
 
             # Flat buffers: (eval_chunk_frames * n_eval, M, M)
             eval_buf_cor = cp.empty((eval_chunk_frames * n_eval, patch_M, patch_M), dtype=cp.float32)
@@ -661,36 +707,46 @@ class AOBatchRunner:
             def _flush_eval_buf(n_time: int):
                 if n_time <= 0:
                     return
-                Btot = int(n_time) * int(n_eval)
+                # Process in time-chunks to cap peak FFT workspace.
+                # Slice boundaries are multiples of n_eval so we can reshape cheaply.
+                t0 = 0
+                while t0 < int(n_time):
+                    tstep = int(min(int(n_time) - t0, int(eval_chunk_frames)))
+                    b0 = int(t0) * int(n_eval)
+                    b1 = int(t0 + tstep) * int(n_eval)
 
-                cor_view = eval_buf_cor[:Btot]
-                if self.psf_tt_mode == "fit" and self._tt_remover is not None:
-                    self._tt_remover.remove_inplace(cor_view)
-
-                Icorr = _phase_to_psf_batch(
-                    cor_view,
-                    self.pupil,
-                    fft_pad=fft_pad,
-                    roi=psf_roi,
-                    phase_scale=phase_scale,
-                )
-                Icorr = Icorr.reshape(int(n_time), int(n_eval), int(psf_roi), int(psf_roi))
-                cp.add(sum_psf_corr_eval, cp.sum(Icorr, axis=0).astype(cp.float64, copy=False), out=sum_psf_corr_eval)
-
-                if eval_accumulate_uncorrected and (sum_psf_unc_eval is not None) and (eval_buf_unc is not None):
-                    unc_view = eval_buf_unc[:Btot]
+                    cor_view = eval_buf_cor[b0:b1]
                     if self.psf_tt_mode == "fit" and self._tt_remover is not None:
-                        self._tt_remover.remove_inplace(unc_view)
+                        self._tt_remover.remove_inplace(cor_view)
 
-                    Iunc = _phase_to_psf_batch(
-                        unc_view,
+                    Icorr = _phase_to_psf_batch(
+                        cor_view,
                         self.pupil,
                         fft_pad=fft_pad,
                         roi=psf_roi,
                         phase_scale=phase_scale,
+                        norm_inv=psf_norm_inv,
                     )
-                    Iunc = Iunc.reshape(int(n_time), int(n_eval), int(psf_roi), int(psf_roi))
-                    cp.add(sum_psf_unc_eval, cp.sum(Iunc, axis=0).astype(cp.float64, copy=False), out=sum_psf_unc_eval)
+                    Icorr = Icorr.reshape(int(tstep), int(n_eval), int(psf_roi), int(psf_roi))
+                    cp.add(sum_psf_corr_eval, cp.sum(Icorr, axis=0).astype(cp.float64, copy=False), out=sum_psf_corr_eval)
+
+                    if eval_accumulate_uncorrected and (sum_psf_unc_eval is not None) and (eval_buf_unc is not None):
+                        unc_view = eval_buf_unc[b0:b1]
+                        if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                            self._tt_remover.remove_inplace(unc_view)
+
+                        Iunc = _phase_to_psf_batch(
+                            unc_view,
+                            self.pupil,
+                            fft_pad=fft_pad,
+                            roi=psf_roi,
+                            phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
+                        )
+                        Iunc = Iunc.reshape(int(tstep), int(n_eval), int(psf_roi), int(psf_roi))
+                        cp.add(sum_psf_unc_eval, cp.sum(Iunc, axis=0).astype(cp.float64, copy=False), out=sum_psf_unc_eval)
+
+                    t0 += tstep
 
 
 
@@ -960,6 +1016,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                         )
                         Iunc = _phase_to_psf_batch(
                             buf_unc[:B],
@@ -967,6 +1024,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                         )
                     else:
                         # Stats-only: compute only the used tail of the chunk.
@@ -976,6 +1034,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                         )
                         Iunc = _phase_to_psf_batch(
                             buf_unc[off_used:B],
@@ -983,6 +1042,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                         )
 
                 # Accumulate long-exposure PSFs only for frames >= discard_first_frames.
@@ -1006,6 +1066,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                             tt_yx=buf_tt[:B],
                             xx=self._xx,
                             yy=self._yy,
@@ -1020,6 +1081,7 @@ class AOBatchRunner:
                             fft_pad=fft_pad,
                             roi=psf_roi,
                             phase_scale=phase_scale,
+                            norm_inv=psf_norm_inv,
                             tt_yx=buf_tt[off_used:B],
                             xx=self._xx,
                             yy=self._yy,
