@@ -1174,12 +1174,16 @@ class SimWorker(QObject):
                 "fwhm_arcsec_uncorrected": float(res.get("fwhm_rad_uncorrected", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_corrected_moffat": float(res.get("fwhm_rad_corrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_corrected_moffat_wings": float(res.get("fwhm_rad_corrected_moffat_wings", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_uncorrected_moffat_wings": float(res.get("fwhm_rad_uncorrected_moffat_wings", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "plate_rad_per_pix": float(res.get("plate_rad_per_pix", 0.0) or 0.0),
                 # Fit metadata for overlays (native PSF pixels)
                 "gauss_corrected": res.get("gauss_corrected"),
                 "gauss_uncorrected": res.get("gauss_uncorrected"),
                 "moffat_corrected": res.get("moffat_corrected"),
                 "moffat_uncorrected": res.get("moffat_uncorrected"),
+                "moffat_wings_corrected": res.get("moffat_wings_corrected"),
+                "moffat_wings_uncorrected": res.get("moffat_wings_uncorrected"),
             }
 
             # Off-axis evaluation (optional)
@@ -1512,10 +1516,10 @@ class SimWorker(QObject):
             self.sensor_phase_ready.emit(sidx, self._phase_to_u8_cached(phase0))
 
             if self.emit_psf:
-                pupil = self._pupil_mask_patch
-                psf = self._phase_to_psf_logI(phase0, pupil)
-                self._update_levels(psf_like=psf)
-                self.sensor_psf_ready.emit(sidx, self._logpsf_to_u8_cached(psf))
+                psf = self._sensor_list[0].measure(phase0, fft_pad = self.patch_M)[2][0].get()
+                zoomed = Analysis._zoom2d(psf, 2, cp)
+                cx, cy = zoomed.shape[0]//2, zoomed.shape[1]//2
+                self.sensor_psf_ready.emit(sidx, zoomed[cx-64:cx+64, cy-64:cy+64])
 
     def _compute_all_sensor_psfs_from_cache(self):
         phases_atm, _ = self._sample_frame_once(need_per_layer=False)

@@ -333,7 +333,7 @@ class Turbulence_tab(QWidget):
     @Slot(int, object)
     def on_sensor_psf(self, idx: int, img_np: np.ndarray) -> None:
         # show on whatever canvas you want for that sensor
-        self.science_canvas.queue_image(np.asarray(img_np) / 255.0, cmap="viridis", auto_levels=True)
+        self.science_canvas.queue_image(np.asarray(img_np), cmap="viridis", auto_levels=True)
         if not self.initDone:
             self.initDone = True
 

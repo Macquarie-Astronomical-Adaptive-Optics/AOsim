@@ -288,7 +288,143 @@ def fit_moffat2d(psf: np.ndarray, fit_box: int = 1024, bkg: float | None = None,
     }
 
 
-@dataclass
+def fit_moffat2d_wings(
+    psf: np.ndarray,
+    fit_box: int = 1024,
+    bkg: float | None = None,
+    zoom: float = 2,
+    weight_q: float = 0.5,
+    weight_p: float = 1.0,
+    r0_frac: float = 0.25,
+    w_max: float = 100.0,
+    core_exclude_frac: float = 0.0,
+):
+    """
+    Fit a Moffat2D with weights that emphasize the wings/skirts more than the peak.
+
+    This is a metric option intended to bias the least-squares fit away from the very bright core.
+    The weighting is heuristic but robust:
+
+        w = (1 + r/r0)^p / (I + eps)^q
+
+    where r0 is a fraction of the cutout size and eps prevents blow-ups near zero.
+
+    Parameters
+    ----------
+    psf : (H,W) ndarray
+        Long-exposure PSF image (intensity).
+    fit_box : int
+        Size of the square window (pixels) around the peak to fit.
+    bkg : float or None
+        Background level to subtract before fitting. If None, estimate from border.
+    zoom : float
+        Divide final FWHM by image zoom level.
+    weight_q : float
+        Intensity down-weight exponent for the core (q>0 emphasizes wings).
+    weight_p : float
+        Radial up-weight exponent for the outskirts (p>0 emphasizes wings).
+    r0_frac : float
+        r0 = r0_frac * min(cutout.shape) (in cutout pixels).
+    w_max : float
+        Cap weights to avoid ill-conditioning.
+    core_exclude_frac : float
+        Optionally exclude a small core radius: r < core_exclude_frac*min(shape) ⇒ w=0.
+
+    Returns
+    -------
+    model_fit : astropy Moffat2D model (fitted)
+    info : dict
+        Fit info compatible with fit_moffat2d.
+    """
+    psf = np.asarray(psf, dtype=float)
+
+    # center on peak
+    y0p, x0p = np.unravel_index(np.argmax(psf), psf.shape)
+    half = fit_box // 2
+    y1, y2 = max(0, y0p - half), min(psf.shape[0], y0p + half)
+    x1, x2 = max(0, x0p - half), min(psf.shape[1], x0p + half)
+
+    cut = psf[y1:y2, x1:x2].copy()
+
+    # background estimate from the cutout border if not provided
+    if bkg is None:
+        border = np.concatenate([cut[0, :], cut[-1, :], cut[:, 0], cut[:, -1]])
+        bkg = np.median(border)
+
+    cut -= bkg
+    cut[cut < 0] = 0.0  # keep fitter stable
+
+    yy, xx = np.mgrid[0:cut.shape[0], 0:cut.shape[1]]
+
+    # initial guesses
+    amp0 = float(np.max(cut))
+    x0 = float(np.argmax(np.sum(cut, axis=0)))
+    y0 = float(np.argmax(np.sum(cut, axis=1)))
+    gamma0 = 2.0
+    alpha0 = 2.5
+
+    m0 = models.Moffat2D(amplitude=amp0, x_0=x0, y_0=y0, gamma=gamma0, alpha=alpha0)
+
+    # bounds
+    m0.amplitude.min = 0.0
+    m0.gamma.min = 0.2
+    m0.gamma.max = max(cut.shape)
+    m0.alpha.min = 1.01
+    m0.alpha.max = 20.0
+    m0.x_0.min, m0.x_0.max = 0, cut.shape[1] - 1
+    m0.y_0.min, m0.y_0.max = 0, cut.shape[0] - 1
+
+    # Wing-emphasizing weights
+    if amp0 <= 0 or not np.isfinite(amp0):
+        weights = None
+    else:
+        eps = max(1e-12, 1e-2 * amp0)
+        rr = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
+        r0w = max(1e-6, float(r0_frac) * float(min(cut.shape)))
+        w = (1.0 + (rr / r0w)) ** float(weight_p)
+        w *= (1.0 / (cut + eps)) ** float(weight_q)
+        if core_exclude_frac and core_exclude_frac > 0:
+            r_ex = float(core_exclude_frac) * float(min(cut.shape))
+            w[rr < r_ex] = 0.0
+        if w_max and w_max > 0:
+            w = np.minimum(w, float(w_max))
+        # keep finite
+        w[~np.isfinite(w)] = 0.0
+        weights = w
+
+    fitter = fitting.TRFLSQFitter()
+    mfit = fitter(m0, xx, yy, cut, weights=weights, inplace=True)
+
+    fwhm_px = float(mfit.fwhm) / float(zoom)
+
+    x0_full = float(x1) + float(getattr(mfit.x_0, "value", mfit.x_0))
+    y0_full = float(y1) + float(getattr(mfit.y_0, "value", mfit.y_0))
+    x0_px = x0_full / float(zoom)
+    y0_px = y0_full / float(zoom)
+    r_px = 0.5 * float(fwhm_px)
+
+    gamma_full = float(getattr(mfit.gamma, "value", mfit.gamma))
+    alpha = float(getattr(mfit.alpha, "value", mfit.alpha))
+    amp = float(getattr(mfit.amplitude, "value", mfit.amplitude))
+    gamma_px = gamma_full / float(zoom)
+
+    return mfit, {
+        "fwhm_px": float(fwhm_px),
+        "x0_px": float(x0_px),
+        "y0_px": float(y0_px),
+        "r_px": float(r_px),
+        "amp": amp,
+        "bkg": float(bkg),
+        "gamma_px": float(gamma_px),
+        "alpha": float(alpha),
+        # weight params (for transparency/debug)
+        "weight_q": float(weight_q),
+        "weight_p": float(weight_p),
+        "r0_frac": float(r0_frac),
+        "w_max": float(w_max),
+        "core_exclude_frac": float(core_exclude_frac),
+    }
+
 class PsfMemmapRecorder:
     """Chunked PSF recorder.
 
@@ -1216,9 +1352,14 @@ class AOBatchRunner:
         gauss_unc  = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
         moff_corr  = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
         moff_unc   = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+        moffw_corr = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
+        moffw_unc  = {"fwhm_px": float("nan"), "x0_px": float("nan"), "y0_px": float("nan"), "r_px": float("nan")}
 
         Icorr_moffat = float("nan")
         Iunc_moffat = float("nan")
+
+        Icorr_moffat_wings = float("nan")
+        Iunc_moffat_wings = float("nan")
 
         if int(n_used) > 0:
             Icorr_zoom = Analysis._zoom2d(psf_long_corr, zoom, cp)
@@ -1254,11 +1395,15 @@ class AOBatchRunner:
             }
 
             # Moffat (CPU on zoomed cutout)
+            # Moffat (CPU on zoomed cutout)
             _mfit, moff_corr = fit_moffat2d(Icorr_zoom.get(), zoom=float(zoom))
-            _mfit, moff_unc = fit_moffat2d(Iunc_zoom.get(), zoom=float(zoom))
+            _mfit, moff_unc  = fit_moffat2d(Iunc_zoom.get(), zoom=float(zoom))
+            _mfit, moffw_corr = fit_moffat2d_wings(Icorr_zoom.get(), zoom=float(zoom))
+            _mfit, moffw_unc  = fit_moffat2d_wings(Iunc_zoom.get(), zoom=float(zoom))
             Icorr_moffat = float(moff_corr.get("fwhm_px", float("nan")))
-            Iunc_moffat = float(moff_unc.get("fwhm_px", float("nan")))
-        else:
+            Iunc_moffat  = float(moff_unc.get("fwhm_px", float("nan")))
+            Icorr_moffat_wings = float(moffw_corr.get("fwhm_px", float("nan")))
+            Iunc_moffat_wings  = float(moffw_unc.get("fwhm_px", float("nan")))
             fwhm_px_corr = float("nan")
             fwhm_px_unc = float("nan")
 
@@ -1284,12 +1429,17 @@ class AOBatchRunner:
                 }
                 _mfit, moff_c = fit_moffat2d(Icor_k_zoom.get(), zoom=float(zoom))
                 fwhm_px_c_m = float(moff_c.get("fwhm_px", float("nan")))
+                _mfit, moffw_c = fit_moffat2d_wings(Icor_k_zoom.get(), zoom=float(zoom))
+                fwhm_px_c_mw = float(moffw_c.get("fwhm_px", float("nan")))
+
 
                 # Uncorrected (optional; computed if we also accumulated it)
                 fwhm_px_u = float("nan")
                 fwhm_px_u_m = float("nan")
+                fwhm_px_u_mw = float("nan")
                 gauss_u: Optional[Dict[str, Any]] = None
                 moff_u: Optional[Dict[str, Any]] = None
+                moffw_u: Optional[Dict[str, Any]] = None
                 if psf_long_unc_eval is not None:
                     Iunc_k = psf_long_unc_eval[k]
                     Iunc_k_zoom = Analysis._zoom2d(Iunc_k, zoom, cp)
@@ -1308,12 +1458,17 @@ class AOBatchRunner:
                     }
                     _mfit, moff_u = fit_moffat2d(Iunc_k_zoom.get(), zoom=float(zoom))
                     fwhm_px_u_m = float(moff_u.get("fwhm_px", float("nan")))
+                    _mfit, moffw_u = fit_moffat2d_wings(Iunc_k_zoom.get(), zoom=float(zoom))
+                    fwhm_px_u_mw = float(moffw_u.get("fwhm_px", float("nan")))
+
 
                 # Convert to arcsec for convenience
                 fwhm_as_c = fwhm_px_c * plate_rad * (180.0 / np.pi) * 3600.0
                 fwhm_as_c_m = fwhm_px_c_m * plate_rad * (180.0 / np.pi) * 3600.0
                 fwhm_as_u = fwhm_px_u * plate_rad * (180.0 / np.pi) * 3600.0
+                fwhm_as_c_mw = fwhm_px_c_mw * plate_rad * (180.0 / np.pi) * 3600.0
                 fwhm_as_u_m = fwhm_px_u_m * plate_rad * (180.0 / np.pi) * 3600.0
+                fwhm_as_u_mw = fwhm_px_u_mw * plate_rad * (180.0 / np.pi) * 3600.0
 
                 offaxis_metrics.append(
                     {
@@ -1321,17 +1476,23 @@ class AOBatchRunner:
                         "dy_arcsec": float(dy_as),
                         "fwhm_arcsec_corrected": float(fwhm_as_c),
                         "fwhm_arcsec_corrected_moffat": float(fwhm_as_c_m),
+                        "fwhm_arcsec_corrected_moffat_wings": float(fwhm_as_c_mw),
                         "fwhm_arcsec_uncorrected": float(fwhm_as_u),
                         "fwhm_arcsec_uncorrected_moffat": float(fwhm_as_u_m),
+                        "fwhm_arcsec_uncorrected_moffat_wings": float(fwhm_as_u_mw),
                         "fwhm_px_corrected": float(fwhm_px_c),
                         "fwhm_px_corrected_moffat": float(fwhm_px_c_m),
+                        "fwhm_px_corrected_moffat_wings": float(fwhm_px_c_mw),
                         "fwhm_px_uncorrected": float(fwhm_px_u),
                         "fwhm_px_uncorrected_moffat": float(fwhm_px_u_m),
+                        "fwhm_px_uncorrected_moffat_wings": float(fwhm_px_u_mw),
                         # Fit metadata for overlays (native PSF pixels)
                         "gauss_corrected": gauss_c,
                         "moffat_corrected": moff_c,
+                        "moffat_wings_corrected": moffw_c,
                         "gauss_uncorrected": gauss_u,
                         "moffat_uncorrected": moff_u,
+                        "moffat_wings_uncorrected": moffw_u,
                     }
                 )
 
@@ -1354,10 +1515,12 @@ class AOBatchRunner:
 
             offaxis_stats["gauss_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_moffat", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["moffat_wings_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_moffat_wings", float("nan")) for m in offaxis_metrics])
 
             # Uncorrected only if present (not skipped)
             offaxis_stats["gauss_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_moffat", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["moffat_wings_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_moffat_wings", float("nan")) for m in offaxis_metrics])
 
         fwhm_px_corr_tt = None
         if psf_long_corr_tt is not None:
@@ -1374,11 +1537,17 @@ class AOBatchRunner:
             "fwhm_rad_uncorrected": fwhm_px_unc * plate_rad,
             "fwhm_rad_corrected_moffat": Icorr_moffat * plate_rad,
             "fwhm_rad_uncorrected_moffat": Iunc_moffat * plate_rad,
+            "fwhm_rad_corrected_moffat_wings": Icorr_moffat_wings * plate_rad,
+            "fwhm_rad_uncorrected_moffat_wings": Iunc_moffat_wings * plate_rad,
+            "fwhm_arcsec_corrected_moffat_wings": Icorr_moffat_wings * plate_rad * (180.0 / np.pi) * 3600.0,
+            "fwhm_arcsec_uncorrected_moffat_wings": Iunc_moffat_wings * plate_rad * (180.0 / np.pi) * 3600.0,
             # Fit metadata for overlays (native PSF pixels)
             "gauss_corrected": gauss_corr,
             "gauss_uncorrected": gauss_unc,
             "moffat_corrected": moff_corr,
             "moffat_uncorrected": moff_unc,
+            "moffat_wings_corrected": moffw_corr,
+            "moffat_wings_uncorrected": moffw_unc,
             "psf_tt_mode": self.psf_tt_mode,
             "n_frames_requested": int(n_frames),
             "n_frames_done": int(n_done),

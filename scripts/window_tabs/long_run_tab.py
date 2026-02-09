@@ -9,6 +9,8 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
+    QSplitter,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -43,6 +45,9 @@ class LongRun_tab(QWidget):
 
         # ---- UI ----
         root = QHBoxLayout(self)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setChildrenCollapsible(True)
+        root.addWidget(self.splitter)
 
         left = QFrame()
         left.setFrameShape(QFrame.Box)
@@ -72,7 +77,7 @@ class LongRun_tab(QWidget):
         row += 1
 
         grid.addWidget(QLabel("Frames"), row, 0)
-        self.lbl_frames = QLabel("0")
+        self.lbl_frames = QLabel("1000")
         grid.addWidget(self.lbl_frames, row, 1)
 
         grid.addWidget(QLabel("Chunk frames"), row, 2)
@@ -117,7 +122,18 @@ class LongRun_tab(QWidget):
         row += 1
 
         # Off-axis evaluation points (arcsec): semicolon-separated "dx,dy" pairs.
-        grid.addWidget(QLabel("Off-axis points (arcsec)"), row, 0)
+        # Off-axis evaluation points
+        off_hdr = QFrame()
+        off_hdr_l = QHBoxLayout(off_hdr)
+        off_hdr_l.setContentsMargins(0, 0, 0, 0)
+        off_hdr_l.addWidget(QLabel("Off-axis points"))
+        self.cmb_offaxis_coords = QComboBox()
+        self.cmb_offaxis_coords.addItems(["dx,dy (arcsec)", "θ,r (deg, arcsec)"])
+        self.cmb_offaxis_coords.setCurrentIndex(0)
+        self.cmb_offaxis_coords.currentIndexChanged.connect(self._on_offaxis_coord_mode_changed)
+        off_hdr_l.addWidget(self.cmb_offaxis_coords)
+        off_hdr_l.addStretch(1)
+        grid.addWidget(off_hdr, row, 0)
         self.edit_offaxis = QLineEdit()
         self.edit_offaxis.setPlaceholderText("dx,dy; dx,dy; ...  (leave blank for on-axis only)")
         grid.addWidget(self.edit_offaxis, row, 1, 1, 3)
@@ -222,11 +238,34 @@ class LongRun_tab(QWidget):
 
         left_layout.addStretch(1)
 
-        # Right: PSF canvases + marginal cross-sections
+        # Right: PSF canvases + optional controls (always visible)
         right = QFrame()
         right.setFrameShape(QFrame.NoFrame)
-        right_layout = QHBoxLayout(right)
+        right_outer = QVBoxLayout(right)
 
+        topbar = QHBoxLayout()
+        topbar.addStretch(1)
+
+        topbar.addWidget(QLabel("Display"))
+        self.cmb_display_scale = QComboBox()
+        self.cmb_display_scale.addItems(["Log", "Linear"])
+        self.cmb_display_scale.setCurrentText("Log")
+        self.cmb_display_scale.currentIndexChanged.connect(self._on_display_scale_changed)
+        topbar.addWidget(self.cmb_display_scale)
+
+        topbar.addSpacing(12)
+        topbar.addWidget(QLabel("FWHM fit"))
+        self.cmb_fit_model = QComboBox()
+        # Display-only selection; computation is done by the worker and returned in the result dict.
+        self.cmb_fit_model.addItems(["Moffat (wings)", "Moffat", "Gaussian", "Both"])
+        self.cmb_fit_model.setCurrentText("Moffat (wings)")
+        self.cmb_fit_model.currentIndexChanged.connect(self._on_fit_model_changed)
+        topbar.addWidget(self.cmb_fit_model)
+
+
+        right_outer.addLayout(topbar)
+
+        right_layout = QHBoxLayout()
         self._psf_corr = self._make_psf_panel("Long exposure PSF (corrected)")
         self._psf_unc = self._make_psf_panel("Long exposure PSF (uncorrected)")
 
@@ -234,9 +273,22 @@ class LongRun_tab(QWidget):
         right_layout.addSpacing(8)
         right_layout.addWidget(self._psf_unc["widget"])
 
+        right_outer.addLayout(right_layout)
 
-        root.addWidget(left, 0)
-        root.addWidget(right, 1)
+
+        self.splitter.addWidget(left)
+        self.splitter.addWidget(right)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        try:
+            self.splitter.setSizes([360, 1000])
+        except Exception:
+            pass
+        self._splitter_saved_sizes = self.splitter.sizes()
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+
+        self._psf_display_mode = "log"
+        self._last_long_run_result: Optional[dict] = None
 
         # ---- Wiring ----
         self.btn_start.clicked.connect(self._start_clicked)
@@ -251,6 +303,10 @@ class LongRun_tab(QWidget):
         self.scheduler.long_run_failed.connect(self._on_long_run_failed)
 
         self._last_out_dir: Optional[str] = None
+
+        # PSF display mode for the canvases ("log" or "linear")
+        self._psf_display_mode = "log"
+        self._last_long_run_result: Optional[dict] = None
 
     # ---- PSF panel helpers ----
     def _make_psf_panel(self, title: str) -> Dict[str, Any]:
@@ -575,6 +631,73 @@ class LongRun_tab(QWidget):
         if self._last_out_dir:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_out_dir))
 
+
+    def _on_display_scale_changed(self, *_args):
+        """Switch between log/linear PSF display and redraw immediately."""
+        try:
+            txt = str(self.cmb_display_scale.currentText()).strip().lower()
+        except Exception:
+            txt = "log"
+        self._psf_display_mode = "log" if txt.startswith("log") else "linear"
+        if getattr(self, "_last_long_run_result", None) is not None:
+            # Re-render using stored results (no re-run).
+            self._on_long_run_finished(self._last_long_run_result)
+
+
+    def _fit_mode(self) -> str:
+        try:
+            t = str(self.cmb_fit_model.currentText()).strip().lower()
+        except Exception:
+            t = "moffat"
+        if "both" in t:
+            return "both"
+        if "gauss" in t:
+            return "gaussian"
+        if "wings" in t:
+            return "moffat_wings"
+        return "moffat"
+
+    def _offaxis_coord_mode(self) -> str:
+        """Return "cart" (dx,dy) or "polar" (theta,r)."""
+        try:
+            t = str(self.cmb_offaxis_coords.currentText()).lower()
+        except Exception:
+            t = ""
+        return "polar" if ("θ" in t or "theta" in t or "polar" in t) else "cart"
+
+    def _on_fit_model_changed(self, *_args):
+        # Redraw immediately using the last completed result.
+        if self._last_long_run_result is not None:
+            self._on_long_run_finished(self._last_long_run_result)
+
+    def _on_offaxis_coord_mode_changed(self, *_args):
+        # Update input placeholder and redraw the results table/mosaic if available.
+        try:
+            if self._offaxis_coord_mode() == "polar":
+                self.edit_offaxis.setPlaceholderText("θ_deg,r_arcsec; θ_deg,r_arcsec; ...  (leave blank for on-axis only)")
+            else:
+                self.edit_offaxis.setPlaceholderText("dx,dy; dx,dy; ...  (leave blank for on-axis only)")
+        except Exception:
+            pass
+        if self._last_long_run_result is not None:
+            self._on_long_run_finished(self._last_long_run_result)
+
+    def _on_splitter_moved(self, *_args):
+        """Keep the toggle label in sync with manual splitter drags."""
+        try:
+            sizes = list(self.splitter.sizes())
+        except Exception:
+            return
+        if len(sizes) < 2:
+            return
+        if sizes[0] <= 10:
+            if hasattr(self, "btn_toggle_settings"):
+                self.btn_toggle_settings.setText("Show settings")
+        else:
+            self._splitter_saved_sizes = sizes
+            if hasattr(self, "btn_toggle_settings"):
+                self.btn_toggle_settings.setText("Hide settings")
+
     # ---- Actions ----
     def _start_clicked(self):
         dt = float(getattr(self.scheduler, "dt_s", 0.001))
@@ -617,10 +740,21 @@ class LongRun_tab(QWidget):
                 if len(parts) < 2:
                     continue
                 try:
-                    dx = float(parts[0])
-                    dy = float(parts[1])
+                    a0 = float(parts[0])
+                    a1 = float(parts[1])
                 except Exception:
                     continue
+
+                if self._offaxis_coord_mode() == "polar":
+                    # θ in degrees, r in arcsec → convert to (dx,dy) arcsec
+                    th = np.deg2rad(a0)
+                    r_as = a1
+                    dx = float(r_as * np.cos(th))
+                    dy = float(r_as * np.sin(th))
+                else:
+                    dx = float(a0)
+                    dy = float(a1)
+
                 eval_pts.append((dx, dy))
             if len(eval_pts) == 0:
                 eval_pts = None
@@ -669,6 +803,8 @@ class LongRun_tab(QWidget):
     @Slot(object)
     def _on_long_run_finished(self, result: object):
         res = dict(result or {})
+        self._last_long_run_result = res
+        self._last_long_run_result = res
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
 
@@ -686,14 +822,22 @@ class LongRun_tab(QWidget):
         self.lbl_progress.setText("Done" + (" (cancelled)" if cancelled else ""))
 
         # Show summary
+        # On-axis FWHM (arcsec). The scheduler usually provides these, but we also
+        # support fallbacks from radian values if needed.
         fwhm_c = float(res.get("fwhm_arcsec_corrected", 0.0))
         fwhm_u = float(res.get("fwhm_arcsec_uncorrected", 0.0))
         fwhm_cmof = float(res.get("fwhm_arcsec_corrected_moffat", 0.0))
         fwhm_umof = float(res.get("fwhm_arcsec_uncorrected_moffat", 0.0))
+
+        fwhm_cmof_w = float(res.get("fwhm_arcsec_corrected_moffat_wings", float("nan")))
+        fwhm_umof_w = float(res.get("fwhm_arcsec_uncorrected_moffat_wings", float("nan")))
+
         gauss_corr = res.get("gauss_corrected") or {}
         gauss_unc = res.get("gauss_uncorrected") or {}
         moff_corr = res.get("moffat_corrected") or {}
         moff_unc = res.get("moffat_uncorrected") or {}
+        moffw_corr = res.get("moffat_wings_corrected") or {}
+        moffw_unc = res.get("moffat_wings_uncorrected") or {}
 
         used = int(res.get("n_frames_used", done))
         discard_frames = int(res.get("discard_first_frames", 0))
@@ -702,10 +846,6 @@ class LongRun_tab(QWidget):
         lines = [
             f"Frames: {done}/{total}",
             f"Used for fit: {used} (discarded {discard_frames} frames = {discard_s:.1f} s)",
-            # _fmt_fit("Gaussian FWHM corrected", fwhm_c, gauss_corr),
-            # _fmt_fit("Gaussian FWHM uncorrected", fwhm_u, gauss_unc),
-            # _fmt_fit("Moffat FWHM corrected", fwhm_cmof, moff_corr),
-            # _fmt_fit("Moffat FWHM uncorrected", fwhm_umof, moff_unc),
             f"Uncorrected r0: {r0_est:.3f} m",
         ]
         if "r0_effective_m" in res:
@@ -738,32 +878,43 @@ class LongRun_tab(QWidget):
 
         self.lbl_results.setText("\n".join(lines))
 
-                # Populate table (include on-axis as first row)
+        # Populate results table (includes on-axis as first row)
         if hasattr(self, "grp_offaxis") and hasattr(self, "tbl_offaxis"):
+            fit_mode = self._fit_mode()
+            coord_mode = self._offaxis_coord_mode()
+
+            show_g = fit_mode in ("gaussian", "both")
+            show_m = fit_mode in ("moffat", "both", "moffat_wings")
+            use_wings = (fit_mode == "moffat_wings")
+
+            # Choose which Moffat values to display
+            mc_on = fwhm_cmof_w if use_wings else fwhm_cmof
+            mu_on = fwhm_umof_w if use_wings else fwhm_umof
 
             # Build rows: on-axis first, then off-axis
-            rows = []
-
-            # On-axis metrics from summary
+            rows: list[dict[str, Any]] = []
             rows.append({
-                "dx": 0.0,
-                "dy": 0.0,
-                "gc": fwhm_c,
-                "mc": fwhm_cmof,
-                "gu": fwhm_u,
-                "mu": fwhm_umof,
+                "dx": 0.0, "dy": 0.0,
+                "gc": fwhm_c, "gu": fwhm_u,
+                "mc": mc_on, "mu": mu_on,
                 "is_onaxis": True,
             })
 
-            # Off-axis metrics (if any)
             for m in off_metrics:
+                dx = float(m.get("dx_arcsec", 0.0))
+                dy = float(m.get("dy_arcsec", 0.0))
+                gc = float(m.get("fwhm_arcsec_corrected", float("nan")))
+                gu = float(m.get("fwhm_arcsec_uncorrected", float("nan")))
+                if use_wings:
+                    mc = float(m.get("fwhm_arcsec_corrected_moffat_wings", float("nan")))
+                    mu = float(m.get("fwhm_arcsec_uncorrected_moffat_wings", float("nan")))
+                else:
+                    mc = float(m.get("fwhm_arcsec_corrected_moffat", float("nan")))
+                    mu = float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan")))
                 rows.append({
-                    "dx": float(m.get("dx_arcsec", 0.0)),
-                    "dy": float(m.get("dy_arcsec", 0.0)),
-                    "gc": float(m.get("fwhm_arcsec_corrected", float("nan"))),
-                    "mc": float(m.get("fwhm_arcsec_corrected_moffat", float("nan"))),
-                    "gu": float(m.get("fwhm_arcsec_uncorrected", float("nan"))),
-                    "mu": float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan"))),
+                    "dx": dx, "dy": dy,
+                    "gc": gc, "gu": gu,
+                    "mc": mc, "mu": mu,
                     "is_onaxis": False,
                 })
 
@@ -771,20 +922,35 @@ class LongRun_tab(QWidget):
             self.grp_offaxis.setVisible(True)
             self.tbl_offaxis.setRowCount(len(rows))
 
-            # Determine whether uncorrected columns should be shown:
-            # show if either on-axis uncorrected exists or off-axis uncorrected stats exist
-            unc_n = 0
-            try:
-                unc_n = int((off_stats.get("gauss_uncorrected_arcsec") or {}).get("n", 0))
-            except Exception:
-                unc_n = 0
+            # Column headers
+            if coord_mode == "polar":
+                h0, h1 = "θ\n(deg)", "r\n(arcsec)"
+            else:
+                h0, h1 = "dx\n(arcsec)", "dy\n(arcsec)"
+            mlabel = "Moffat(w)" if use_wings else "Moffat"
+            self.tbl_offaxis.setHorizontalHeaderLabels([
+                h0, h1,
+                "Gauss corr\n(as)", f"{mlabel} corr\n(as)",
+                "Gauss unc\n(as)", f"{mlabel} unc\n(as)",
+            ])
 
-            onaxis_unc_ok = bool(np.isfinite(fwhm_u) or np.isfinite(fwhm_umof))
-            show_unc = bool(onaxis_unc_ok or (unc_n > 0))
+            # Determine whether uncorrected columns should be shown for the selected fit(s)
+            def _n_from_stats(key: str) -> int:
+                try:
+                    return int((off_stats.get(key) or {}).get("n", 0))
+                except Exception:
+                    return 0
 
-            # Show/hide uncorrected columns (4,5)
-            self.tbl_offaxis.setColumnHidden(4, not show_unc)
-            self.tbl_offaxis.setColumnHidden(5, not show_unc)
+            want_g_unc = show_g and (np.isfinite(fwhm_u) or (_n_from_stats("gauss_uncorrected_arcsec") > 0))
+            m_unc_key = "moffat_wings_uncorrected_arcsec" if use_wings else "moffat_uncorrected_arcsec"
+            want_m_unc = show_m and (np.isfinite(mu_on) or (_n_from_stats(m_unc_key) > 0))
+            show_unc = bool(want_g_unc or want_m_unc)
+
+            # Show/hide fit columns
+            self.tbl_offaxis.setColumnHidden(2, not show_g)
+            self.tbl_offaxis.setColumnHidden(4, (not show_g) or (not show_unc))
+            self.tbl_offaxis.setColumnHidden(3, not show_m)
+            self.tbl_offaxis.setColumnHidden(5, (not show_m) or (not show_unc))
 
             def _it(v: str, tooltip: str = ""):
                 item = QTableWidgetItem(v)
@@ -793,26 +959,45 @@ class LongRun_tab(QWidget):
                     item.setToolTip(tooltip)
                 return item
 
+            def _coord_strings(dx_as: float, dy_as: float) -> tuple[str, str]:
+                if coord_mode == "polar":
+                    r_as = float(np.hypot(dx_as, dy_as))
+                    th = float(np.degrees(np.arctan2(dy_as, dx_as)))
+                    if not np.isfinite(th):
+                        th = 0.0
+                    # Wrap to [0,360) for nicer display
+                    th = th % 360.0
+                    return (f"{th:.1f}", f"{r_as:.1f}")
+                return (f"{dx_as:.0f}", f"{dy_as:.0f}")
+
             # Fill rows
             for i, r in enumerate(rows):
-                dx = float(r["dx"])
-                dy = float(r["dy"])
-                gc = float(r["gc"])
-                mc = float(r["mc"])
-                gu = float(r["gu"])
-                mu = float(r["mu"])
+                dx = float(r["dx"]); dy = float(r["dy"])
+                gc = float(r["gc"]); gu = float(r["gu"])
+                mc = float(r["mc"]); mu = float(r["mu"])
+                tip = "On-axis" if r.get("is_onaxis") else ""
+                c0, c1 = _coord_strings(dx, dy)
+                self.tbl_offaxis.setItem(i, 0, _it(c0, tip))
+                self.tbl_offaxis.setItem(i, 1, _it(c1, tip))
+                self.tbl_offaxis.setItem(i, 2, _it("" if (not show_g or not np.isfinite(gc)) else f"{gc:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 3, _it("" if (not show_m or not np.isfinite(mc)) else f"{mc:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 4, _it("" if (not show_g or not show_unc or not np.isfinite(gu)) else f"{gu:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 5, _it("" if (not show_m or not show_unc or not np.isfinite(mu)) else f"{mu:.3f}", tip))
 
-                tip = "On-axis (dx=0, dy=0)" if r.get("is_onaxis") else ""
-
-                self.tbl_offaxis.setItem(i, 0, _it(f"{dx:.0f}", tip))
-                self.tbl_offaxis.setItem(i, 1, _it(f"{dy:.0f}", tip))
-                self.tbl_offaxis.setItem(i, 2, _it(f"{gc:.3f}", tip))
-                self.tbl_offaxis.setItem(i, 3, _it(f"{mc:.3f}", tip))
-                self.tbl_offaxis.setItem(i, 4, _it("" if (not show_unc or not np.isfinite(gu)) else f"{gu:.3f}", tip))
-                self.tbl_offaxis.setItem(i, 5, _it("" if (not show_unc or not np.isfinite(mu)) else f"{mu:.3f}", tip))
-
-            # Stats label: include on-axis line + off-axis aggregate stats (if present)
-            stats_lines = []
+            # Stats label: on-axis + off-axis aggregates (for selected fits)
+            stats_lines: list[str] = []
+            on_parts: list[str] = []
+            if show_g:
+                on_parts.append(f"G={fwhm_c:.3f} as")
+            if show_m:
+                on_parts.append(f"{mlabel}={mc_on:.3f} as")
+            if show_unc:
+                if show_g and np.isfinite(fwhm_u):
+                    on_parts.append(f"G_unc={fwhm_u:.3f} as")
+                if show_m and np.isfinite(mu_on):
+                    on_parts.append(f"{mlabel}_unc={mu_on:.3f} as")
+            if on_parts:
+                stats_lines.append("On-axis: " + ", ".join(on_parts))
 
             def _fmt_stats_line(label: str, key: str) -> Optional[str]:
                 try:
@@ -828,31 +1013,45 @@ class LongRun_tab(QWidget):
                 except Exception:
                     return None
 
-            # Only show off-axis aggregates if there are off-axis points
             if len(off_metrics) > 0:
-                for _lbl, _key in [
-                    ("Gaussian corrected", "gauss_corrected_arcsec"),
-                    ("Moffat corrected", "moffat_corrected_arcsec"),
-                ]:
-                    line = _fmt_stats_line(_lbl, _key)
+                if show_g:
+                    line = _fmt_stats_line("Gaussian corrected", "gauss_corrected_arcsec")
                     if line:
                         stats_lines.append(line)
-
+                if show_m:
+                    m_corr_key = "moffat_wings_corrected_arcsec" if use_wings else "moffat_corrected_arcsec"
+                    line = _fmt_stats_line(f"{mlabel} corrected", m_corr_key)
+                    if line:
+                        stats_lines.append(line)
                 if show_unc:
-                    for _lbl, _key in [
-                        ("Gaussian uncorrected", "gauss_uncorrected_arcsec"),
-                        ("Moffat uncorrected", "moffat_uncorrected_arcsec"),
-                    ]:
-                        line = _fmt_stats_line(_lbl, _key)
+                    if show_g:
+                        line = _fmt_stats_line("Gaussian uncorrected", "gauss_uncorrected_arcsec")
+                        if line:
+                            stats_lines.append(line)
+                    if show_m:
+                        m_unc_key = "moffat_wings_uncorrected_arcsec" if use_wings else "moffat_uncorrected_arcsec"
+                        line = _fmt_stats_line(f"{mlabel} uncorrected", m_unc_key)
                         if line:
                             stats_lines.append(line)
 
             self.lbl_offaxis_stats.setText("\n".join(stats_lines))
 
 
+        # What to show (display-only; worker always computes Gaussian + Moffat + Moffat(wings) when available)
+        fit_mode = self._fit_mode()
+        show_g = fit_mode in ("gaussian", "both")
+        show_m = fit_mode in ("moffat", "both", "moffat_wings")
+        use_wings = (fit_mode == "moffat_wings")
+        mlabel = "Moffat(w)" if use_wings else "Moffat"
+
+        # Select which Moffat fit dicts to use for overlays/profiles
+        moff_corr_show = moffw_corr if use_wings else moff_corr
+        moff_unc_show  = moffw_unc if use_wings else moff_unc
+
         plate = float(res.get("plate_rad_per_pix", 0.0) or 0.0)
 
-        # Display images (log scale for visibility)
+        # Display images (log or linear)
+        use_log = (getattr(self, "_psf_display_mode", "log") == "log")
         def _show(panel: Dict[str, Any], img: Optional[np.ndarray]):
             if img is None:
                 return
@@ -861,7 +1060,10 @@ class LongRun_tab(QWidget):
                 return
             a = np.maximum(a, 0)
             # Render immediately so we can safely expand the ViewBox for profile margins.
-            panel["canvas"].set_image(np.log10(a + 1e-12))
+            if use_log:
+                panel["canvas"].set_image(np.log10(a + 1e-12))
+            else:
+                panel["canvas"].set_image(a.astype(np.float32, copy=False))
 
         def _apply_overlays(canvas: PGCanvas, img: np.ndarray, g: Dict[str, Any], m: Dict[str, Any]):
             if img is None:
@@ -888,16 +1090,33 @@ class LongRun_tab(QWidget):
             pen_g = pg.mkPen((255, 0, 0), width=2)
             pen_m = pg.mkPen((255, 0, 222), width=2)
 
-            canvas.set_circle_overlay("fwhm_gauss", xg, yg, rg, pen=pen_g)
-            canvas.set_circle_overlay("fwhm_moffat", xm, ym, rm, pen=pen_m)
 
-            legend_html = (
-                '<div style="background-color:rgba(0,0,0,180); padding:4px; border-radius:4px;">'
-                '<span style="color:rgb(255,0,0);">●</span> Gaussian FWHM<br>'
-                '<span style="color:rgb(255,0,222);">●</span> Moffat FWHM'
-                '</div>'
-            )
-            canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 1.0), offset=(8.0, -8.0))
+            # Only draw what the user selected.
+            if show_g and np.isfinite(rg) and rg > 0:
+                canvas.set_circle_overlay("fwhm_gauss", xg, yg, rg, pen=pen_g)
+            else:
+                canvas.remove_overlay("fwhm_gauss")
+
+            if show_m and np.isfinite(rm) and rm > 0:
+                canvas.set_circle_overlay("fwhm_moffat", xm, ym, rm, pen=pen_m)
+            else:
+                canvas.remove_overlay("fwhm_moffat")
+
+            legend_lines = []
+            if show_g:
+                legend_lines.append('<span style="color:rgb(255,0,0);">●</span> Gaussian FWHM')
+            if show_m:
+                legend_lines.append(f'<span style="color:rgb(255,0,222);">●</span> {mlabel} FWHM')
+
+            if legend_lines:
+                legend_html = (
+                    '<div style="background-color:rgba(0,0,0,180); padding:4px; border-radius:4px;">'
+                    + "<br>".join(legend_lines)
+                    + "</div>"
+                )
+                canvas.set_text_overlay("legend", legend_html, anchor=(0.0, 1.0), offset=(8.0, -8.0))
+            else:
+                canvas.remove_overlay("legend")
 
 
         def _build_mosaic(imgs, gap: int = 24, pad: int = 12):
@@ -936,7 +1155,8 @@ class LongRun_tab(QWidget):
                 y0 = r * (block_h + gap)
                 x0 = c * (block_w + gap)
 
-                tile = np.log10(np.maximum(im.astype(np.float32, copy=False), 0.0) + 1e-12)
+                tile_lin = np.maximum(im.astype(np.float32, copy=False), 0.0)
+                tile = np.log10(tile_lin + 1e-12) if use_log else tile_lin
                 mosaic[y0 : y0 + h, x0 : x0 + w] = tile
                 offsets.append((x0, y0))
 
@@ -997,14 +1217,14 @@ class LongRun_tab(QWidget):
 
             canvas.set_image(mosaic)
 
-            # Legend
-            legend_html = (
-                "<div style='background-color:rgba(0,0,0,140); padding:6px;'>"
-                "<span style='color:yellow;'>●</span> Gaussian FWHM&nbsp;&nbsp;"
-                "<span style='color:magenta;'>●</span> Moffat FWHM<br>"
-                "<span style='color:rgb(200,200,200);'>—</span> Data slice"
-                "</div>"
-            )
+            # Legend (reflect current fit selection)
+            legend_items = []
+            if show_g:
+                legend_items.append("<span style='color:yellow;'>●</span> Gaussian FWHM")
+            if show_m:
+                legend_items.append(f"<span style='color:magenta;'>●</span> {mlabel} FWHM")
+            legend_items.append("<span style='color:rgb(200,200,200);'>—</span> Data slice")
+            legend_html = "<div style='background-color:rgba(0,0,0,140); padding:6px;'>" + "&nbsp;&nbsp;".join(legend_items[:-1]) + "<br>" + legend_items[-1] + "</div>"
             canvas.set_text_overlay("legend", legend_html, anchor=(0, -10), offset=(8, 8), relative_to="image")
 
             pen_g = pg.mkPen((255, 0 ,0), width=2)
@@ -1048,6 +1268,13 @@ class LongRun_tab(QWidget):
                 a = np.asarray(im, dtype=float)
                 if a.ndim != 2 or a.size == 0:
                     return
+
+                # Honor the current fit selection (avoid drawing stale model overlays).
+                if not show_g:
+                    g = {}
+                if not show_m:
+                    m = {}
+
                 Ht, Wt = a.shape
 
                 c_g = _finite_center(g, Wt, Ht)
@@ -1239,11 +1466,15 @@ class LongRun_tab(QWidget):
                 if not np.isfinite(mr) or mr <= 0:
                     mr = 0.0
 
-                if gr > 0:
+                if show_g and gr > 0:
                     canvas.set_circle_overlay(f"{prefix}_g_{i}", x0 + gx, y0 + gy, gr, pen=pen_g)
-                if mr > 0:
-                    canvas.set_circle_overlay(f"{prefix}_m_{i}", x0 + mx0, y0 + my0, mr, pen=pen_m)
+                else:
+                    canvas.remove_overlay(f"{prefix}_g_{i}")
 
+                if show_m and mr > 0:
+                    canvas.set_circle_overlay(f"{prefix}_m_{i}", x0 + mx0, y0 + my0, mr, pen=pen_m)
+                else:
+                    canvas.remove_overlay(f"{prefix}_m_{i}")
                 if labels and i < len(labels):
                     lbl = labels[i]
                     html = f"<div style='background-color:rgba(0,0,0,140); padding:3px;'><span style='color:white;'>{lbl}</span></div>"
@@ -1264,30 +1495,88 @@ class LongRun_tab(QWidget):
         off_corr_a = np.asarray(off_corr) if off_corr is not None else None
         off_unc_a = np.asarray(off_unc) if off_unc is not None else None
 
+        coord_mode_disp = self._offaxis_coord_mode()
+
+        def _coord_lbl(dx_as: float, dy_as: float) -> str:
+            if coord_mode_disp == "polar":
+                r_as = float(np.hypot(dx_as, dy_as))
+                th = float(np.degrees(np.arctan2(dy_as, dx_as)))
+                if not np.isfinite(th):
+                    th = 0.0
+                th = th % 360.0
+                return f"{th:.1f}° , {r_as:.1f} as"
+            return f"{dx_as:+.2f},{dy_as:+.2f} as"
+
+        def _fit_lbl(m: dict, corrected: bool) -> str:
+            parts = []
+            if show_g:
+                k = "fwhm_arcsec_corrected" if corrected else "fwhm_arcsec_uncorrected"
+                try:
+                    v = float(m.get(k, float("nan")))
+                except Exception:
+                    v = float("nan")
+                if np.isfinite(v):
+                    parts.append(f"G {v:.3f}")
+            if show_m:
+                k = ("fwhm_arcsec_corrected_moffat_wings" if corrected else "fwhm_arcsec_uncorrected_moffat_wings") if use_wings else ("fwhm_arcsec_corrected_moffat" if corrected else "fwhm_arcsec_uncorrected_moffat")
+                try:
+                    v = float(m.get(k, float("nan")))
+                except Exception:
+                    v = float("nan")
+                if np.isfinite(v):
+                    mp = "Mw" if use_wings else "M"
+                    parts.append(f"{mp} {v:.3f}")
+            return "  ".join(parts) if parts else ""
+
+
         if img_corr_a is not None and img_corr_a.ndim == 2:
             if off_corr_a is not None and off_corr_a.ndim == 3 and (len(off_metrics) > 0):
                 # Mosaic: on-axis + off-axis
                 imgs = [img_corr_a] + [off_corr_a[i] for i in range(off_corr_a.shape[0])]
-                gfits = [gauss_corr] + [m.get("gauss_corrected") for m in off_metrics]
-                mfits = [moff_corr] + [m.get("moffat_corrected") for m in off_metrics]
-                labels = ["on-axis"] + [f"{m.get('dx_arcsec',0.0):+.2f},{m.get('dy_arcsec',0.0):+.2f} as\nG {m.get('fwhm_arcsec_corrected',float('nan')):.3f}  M {m.get('fwhm_arcsec_corrected_moffat',float('nan')):.3f}" for m in off_metrics]
+                gfits = [gauss_corr if show_g else {}] + [((m.get("gauss_corrected") or {}) if show_g else {}) for m in off_metrics]
+                m_key = "moffat_wings_corrected" if use_wings else "moffat_corrected"
+                mfits = [moff_corr_show if show_m else {}] + [((m.get(m_key) or {}) if show_m else {}) for m in off_metrics]
+
+                on_m = {
+                    "fwhm_arcsec_corrected": fwhm_c,
+                    "fwhm_arcsec_corrected_moffat": fwhm_cmof,
+                    "fwhm_arcsec_corrected_moffat_wings": fwhm_cmof_w,
+                }
+                on_lbl = "on-axis"
+                extra = _fit_lbl(on_m, corrected=True)
+                if extra:
+                    on_lbl = on_lbl + "\n" + extra
+
+                labels = [on_lbl] + [f"{_coord_lbl(float(m.get('dx_arcsec',0.0)), float(m.get('dy_arcsec',0.0)))}\n{_fit_lbl(m, corrected=True)}" for m in off_metrics]
                 _show_mosaic(self._psf_corr, imgs, gfits, mfits, labels, prefix="corr")
             else:
                 _show(self._psf_corr, img_corr_a)
-                _apply_overlays(self._psf_corr["canvas"], img_corr_a, gauss_corr, moff_corr)
-                self._update_profiles(self._psf_corr, img_corr_a, gauss_corr, moff_corr, plate)
+                _apply_overlays(self._psf_corr["canvas"], img_corr_a, (gauss_corr if show_g else {}), (moff_corr_show if show_m else {}))
+                self._update_profiles(self._psf_corr, img_corr_a, (gauss_corr if show_g else {}), (moff_corr_show if show_m else {}), plate)
 
         if img_unc_a is not None and img_unc_a.ndim == 2:
             if off_unc_a is not None and off_unc_a.ndim == 3 and (len(off_metrics) > 0):
                 imgs = [img_unc_a] + [off_unc_a[i] for i in range(off_unc_a.shape[0])]
-                gfits = [gauss_unc] + [m.get("gauss_uncorrected") for m in off_metrics]
-                mfits = [moff_unc] + [m.get("moffat_uncorrected") for m in off_metrics]
-                labels = ["on-axis"] + [f"{m.get('dx_arcsec',0.0):+.2f},{m.get('dy_arcsec',0.0):+.2f} as\nG {m.get('fwhm_arcsec_uncorrected',float('nan')):.3f}  M {m.get('fwhm_arcsec_uncorrected_moffat',float('nan')):.3f}" for m in off_metrics]
+                gfits = [gauss_unc if show_g else {}] + [((m.get("gauss_uncorrected") or {}) if show_g else {}) for m in off_metrics]
+                m_key = "moffat_wings_uncorrected" if use_wings else "moffat_uncorrected"
+                mfits = [moff_unc_show if show_m else {}] + [((m.get(m_key) or {}) if show_m else {}) for m in off_metrics]
+
+                on_m = {
+                    "fwhm_arcsec_uncorrected": fwhm_u,
+                    "fwhm_arcsec_uncorrected_moffat": fwhm_umof,
+                    "fwhm_arcsec_uncorrected_moffat_wings": fwhm_umof_w,
+                }
+                on_lbl = "on-axis"
+                extra = _fit_lbl(on_m, corrected=False)
+                if extra:
+                    on_lbl = on_lbl + "\n" + extra
+
+                labels = [on_lbl] + [f"{_coord_lbl(float(m.get('dx_arcsec',0.0)), float(m.get('dy_arcsec',0.0)))}\n{_fit_lbl(m, corrected=False)}" for m in off_metrics]
                 _show_mosaic(self._psf_unc, imgs, gfits, mfits, labels, prefix="unc")
             else:
                 _show(self._psf_unc, img_unc_a)
-                _apply_overlays(self._psf_unc["canvas"], img_unc_a, gauss_unc, moff_unc)
-                self._update_profiles(self._psf_unc, img_unc_a, gauss_unc, moff_unc, plate)
+                _apply_overlays(self._psf_unc["canvas"], img_unc_a, (gauss_unc if show_g else {}), (moff_unc_show if show_m else {}))
+                self._update_profiles(self._psf_unc, img_unc_a, (gauss_unc if show_g else {}), (moff_unc_show if show_m else {}), plate)
 
     @Slot(str)
     def _on_long_run_failed(self, err: str):
