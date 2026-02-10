@@ -3,6 +3,7 @@ import time
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import deque
 
 import cupy as cp
 import numpy as np
@@ -542,6 +543,7 @@ class AOBatchRunner:
         remove_tt_for_psf: bool = True,
         psf_tt_mode: Optional[str] = None,
         tt_wfs_indices: Optional[Sequence[int]] = None,
+        dm_delay_frames: int = 1,
     ):
         self.sim = sim
         self.sensors = list(sensors)
@@ -569,6 +571,12 @@ class AOBatchRunner:
         # Which WFS indices (relative to sensors[1:]) to use for TT estimation in hybrid mode.
         # If None, prefer NGS WFS (infinite range), otherwise fall back to all WFS.
         self.tt_wfs_indices = None if tt_wfs_indices is None else [int(i) for i in tt_wfs_indices]
+
+        # --- DM servo-lag ---
+        try:
+            self.dm_delay_frames = max(1, int(dm_delay_frames))
+        except Exception:
+            self.dm_delay_frames = 1
 
         # --- Dynamic pointing support ---
         # If any sensor provides a field_angle_fn, we must update thetas each frame and
@@ -691,6 +699,8 @@ class AOBatchRunner:
         # DM state
         self.dm_cmd = cp.zeros((self.R.n_modes,), dtype=cp.float32)
         self.dm_phi = cp.zeros((patch_M, patch_M), dtype=cp.float32)
+        # FIFO pipeline: command computed at tick t becomes active at tick t+dm_delay_frames
+        self._dm_phi_pipeline = deque([cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(self.dm_delay_frames)])
 
         # Centered coordinate grids for fast TT ramp removal (hybrid mode)
         yy0, xx0 = cp.indices((patch_M, patch_M), dtype=cp.float32)
@@ -1112,8 +1122,20 @@ class AOBatchRunner:
             # 5) Reconstruct + controller
             xhat = self.R.solve_coeffs_stack(self._slopes_err_vec)
             self.dm_cmd = (1.0 - self.leak) * self.dm_cmd - self.gain * xhat
-            self.dm_phi = -self.R.coeffs_to_onaxis_phase(self.dm_cmd)
-            self.dm_phi = (self.dm_phi - cp.mean(self.dm_phi)) * self.pupil
+
+            # Newly computed DM surface (not necessarily active immediately when dm_delay_frames>1)
+            dm_phi_new = -self.R.coeffs_to_onaxis_phase(self.dm_cmd)
+            dm_phi_new = (dm_phi_new - cp.mean(dm_phi_new)) * self.pupil
+
+            # DM servo-lag FIFO: command computed at tick t becomes active at tick t+dm_delay_frames.
+            if getattr(self, "_dm_phi_pipeline", None) is None:
+                self._dm_phi_pipeline = deque(
+                    [cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(int(getattr(self, "dm_delay_frames", 1)))]
+                )
+            self._dm_phi_pipeline.append(dm_phi_new)
+            if len(self._dm_phi_pipeline) > int(getattr(self, "dm_delay_frames", 1)):
+                self._dm_phi_pipeline.popleft()
+            self.dm_phi = self._dm_phi_pipeline[0]
 
             if self.psf_tt_mode == "fit" and self._tt_remover is not None:
                 self._tt_remover.remove_inplace(self.dm_phi)

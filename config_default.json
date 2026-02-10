@@ -11,6 +11,8 @@
     "use_gpu": true,
     "data_path": "data/",
     "loop_gain" : 0.25,
-    "loop_leak" : 0.01
+    "loop_leak" : 0.01,
+
+    "dm_delay_frames": 2
 	
 }

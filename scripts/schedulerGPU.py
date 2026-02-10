@@ -8,6 +8,7 @@ import inspect
 import traceback
 import math
 from typing import Any, Dict, List, Optional
+from collections import deque
 
 import cupy as cp
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, Qt
@@ -127,6 +128,17 @@ class SimWorker(QObject):
 
     ):
         super().__init__(parent)
+
+        # ---------------- DM servo lag (frame-delayed actuation) ----------------
+        # dm_delay_frames = number of simulation frames between computing a DM command
+        # and it becoming active. Default=1 matches the previous behaviour
+        # ("new DM command becomes active next tick").
+        try:
+            self._dm_delay_frames = int(params.get("dm_delay_frames", params.get("dm_servo_lag_frames", 1)))
+        except Exception:
+            self._dm_delay_frames = 1
+        self._dm_delay_frames = max(1, int(self._dm_delay_frames))
+        self._dm_phi_pipeline = deque([None] * self._dm_delay_frames)
 
         self.sim_factory = sim_factory
         self.sim_kwargs = dict(sim_kwargs)
@@ -898,6 +910,27 @@ class SimWorker(QObject):
             n = 0
         self._sync_profile_every = max(0, n)
 
+    @Slot(int)
+    def set_dm_delay_frames(self, frames: int):
+        """Set DM servo-lag in integer simulation frames.
+
+        frames=1 matches the legacy behaviour (command computed at tick t becomes
+        active at tick t+1).
+        """
+        try:
+            frames = int(frames)
+        except Exception:
+            frames = 1
+        frames = max(1, frames)
+        if frames == getattr(self, "_dm_delay_frames", 1):
+            return
+
+        self._dm_delay_frames = frames
+        # Preserve current active DM phase (if any) through the pipeline reset.
+        cur = getattr(self, "_dm_phi", None)
+        fill = cur if cur is not None else None
+        self._dm_phi_pipeline = deque([fill] * int(frames))
+
     # ------------------ external API (restored for GUI signals) ------------------
     @Slot(dict)
     def add_layer(self, layer_cfgs):
@@ -1000,6 +1033,12 @@ class SimWorker(QObject):
         self._dm_cmd = None
         self._dm_sigma = None
         self._dm_phi = None
+        # Reset DM servo-lag pipeline
+        try:
+            n = int(getattr(self, "_dm_delay_frames", 1))
+        except Exception:
+            n = 1
+        self._dm_phi_pipeline = deque([None] * max(1, n))
         self._s_ref = None
 
         if self.long_exposure_psf is not None:
@@ -1132,6 +1171,7 @@ class SimWorker(QObject):
                 strip_tt_lgs=True,
                 psf_tt_mode=psf_tt_mode,
                 tt_wfs_indices=None,
+                dm_delay_frames=int(getattr(self, "_dm_delay_frames", 1)),
             )
 
             res = runner.run(
@@ -1872,7 +1912,22 @@ class SimWorker(QObject):
             self._dm_cmd = (1.0 - self._loop_leak) * self._dm_cmd - self._loop_gain * xhat
 
             # DM phase already piston+TT removed in coeffs_to_onaxis_phase (remove_tt_in_output=True)
-            self._dm_phi = -self.R.coeffs_to_onaxis_phase(self._dm_cmd)
+            dm_phi_new = -self.R.coeffs_to_onaxis_phase(self._dm_cmd)
+
+            # --- DM servo-lag pipeline ---
+            # Queue the newly computed DM command and pop the oldest command.
+            # The front of the queue becomes the DM phase used on the next tick.
+            if getattr(self, "_dm_phi_pipeline", None) is None:
+                try:
+                    n = int(getattr(self, "_dm_delay_frames", 1))
+                except Exception:
+                    n = 1
+                self._dm_phi_pipeline = deque([None] * max(1, n))
+            self._dm_phi_pipeline.append(dm_phi_new)
+            if len(self._dm_phi_pipeline) > int(getattr(self, "_dm_delay_frames", 1)):
+                self._dm_phi_pipeline.popleft()
+            # Next-tick active DM phase (may be None during warm-up when delay>1)
+            self._dm_phi = self._dm_phi_pipeline[0]
 
             # ---- loop tab outputs (decoupled from 1 kHz control) ----
             if ((tc % self._loop_disp_period) == 0) or (self._loop_t == 0):

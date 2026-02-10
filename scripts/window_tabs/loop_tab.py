@@ -95,7 +95,7 @@ class Loop_tab(QWidget):
         fwhm_toggle.checkStateChanged.connect(lambda x: self._loop_r0_only(fwhm_toggle.isChecked()))
 
         
-        self.config_table = Config_table(["loop_gain", "loop_leak"], self.params)
+        self.config_table = Config_table(["loop_gain", "loop_leak", "dm_delay_frames"], self.params)
         self.config_table.params_changed.connect(self.update_loop_params)
         right.addWidget(self.config_table)
 
@@ -147,10 +147,17 @@ class Loop_tab(QWidget):
         self.scheduler._loop_gain = params.get("loop_gain")
         self.scheduler._loop_leak = params.get("loop_leak")
 
+        # Optional: DM servo lag (integer frames). Keep default=1 if missing.
+        try:
+            self.scheduler.set_dm_delay_frames(int(params.get("dm_delay_frames", 1)))
+        except Exception:
+            self.scheduler.set_dm_delay_frames(1)
+
         print(
             "Updated loop parameters: "
             "\n  gain:", self.scheduler._loop_gain,
             "\n  leak:", self.scheduler._loop_leak,
+            "\n  dm_delay_frames:", getattr(self.scheduler, "_dm_delay_frames", 1),
         )
 
     @Slot(object, object, float, float, float, float, object)
