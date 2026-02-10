@@ -217,9 +217,9 @@ class LongRun_tab(QWidget):
         off_lay.addWidget(self.lbl_offaxis_stats)
 
         self.tbl_offaxis = QTableWidget()
-        self.tbl_offaxis.setColumnCount(6)
+        self.tbl_offaxis.setColumnCount(8)
         self.tbl_offaxis.setHorizontalHeaderLabels(
-            ["dx\n(arcsec)", "dy\n(arcsec)", "Gauss corr\n(as)", "Moffat corr\n(as)", "Gauss unc\n(as)", "Moffat unc\n(as)"]
+            ["dx\n(arcsec)", "dy\n(arcsec)", "Gauss corr\n(as)", "Moffat corr\n(as)", "Contour corr\n(as)", "Gauss unc\n(as)", "Moffat unc\n(as)", "Contour unc\n(as)"]
         )
         # PySide6 enums live on QAbstractItemView (not on QTableWidget)
         self.tbl_offaxis.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -257,7 +257,7 @@ class LongRun_tab(QWidget):
         topbar.addWidget(QLabel("FWHM fit"))
         self.cmb_fit_model = QComboBox()
         # Display-only selection; computation is done by the worker and returned in the result dict.
-        self.cmb_fit_model.addItems(["Moffat (wings)", "Moffat", "Gaussian", "Both"])
+        self.cmb_fit_model.addItems(["Moffat (wings)", "Moffat", "Gaussian", "Contour", "All"])
         self.cmb_fit_model.setCurrentText("Moffat (wings)")
         self.cmb_fit_model.currentIndexChanged.connect(self._on_fit_model_changed)
         topbar.addWidget(self.cmb_fit_model)
@@ -649,10 +649,12 @@ class LongRun_tab(QWidget):
             t = str(self.cmb_fit_model.currentText()).strip().lower()
         except Exception:
             t = "moffat"
-        if "both" in t:
-            return "both"
+        if "all" in t:
+            return "all"
         if "gauss" in t:
             return "gaussian"
+        if "contour" in t:
+            return "contour"
         if "wings" in t:
             return "moffat_wings"
         return "moffat"
@@ -799,6 +801,8 @@ class LongRun_tab(QWidget):
         p = int(round(100.0 * done / total))
         self.progress.setValue(max(0, min(100, p)))
         self.lbl_progress.setText(f"{msg}  {done}/{total} frames  ({fps:.0f} fps)")
+        if done == total:
+            self.lbl_progress.setText("Fitting FWHM...")
 
     @Slot(object)
     def _on_long_run_finished(self, result: object):
@@ -832,12 +836,18 @@ class LongRun_tab(QWidget):
         fwhm_cmof_w = float(res.get("fwhm_arcsec_corrected_moffat_wings", float("nan")))
         fwhm_umof_w = float(res.get("fwhm_arcsec_uncorrected_moffat_wings", float("nan")))
 
+        fwhm_cc = float(res.get("fwhm_arcsec_corrected_contour", float("nan")))
+        fwhm_cu = float(res.get("fwhm_arcsec_uncorrected_contour", float("nan")))
+
         gauss_corr = res.get("gauss_corrected") or {}
         gauss_unc = res.get("gauss_uncorrected") or {}
         moff_corr = res.get("moffat_corrected") or {}
         moff_unc = res.get("moffat_uncorrected") or {}
         moffw_corr = res.get("moffat_wings_corrected") or {}
         moffw_unc = res.get("moffat_wings_uncorrected") or {}
+
+        contour_corr = res.get("contour_corrected")
+        contour_unc = res.get("contour_uncorrected")
 
         used = int(res.get("n_frames_used", done))
         discard_frames = int(res.get("discard_first_frames", 0))
@@ -883,9 +893,10 @@ class LongRun_tab(QWidget):
             fit_mode = self._fit_mode()
             coord_mode = self._offaxis_coord_mode()
 
-            show_g = fit_mode in ("gaussian", "both")
-            show_m = fit_mode in ("moffat", "both", "moffat_wings")
-            use_wings = (fit_mode == "moffat_wings")
+            show_g = fit_mode in ("gaussian", "all")
+            show_m = fit_mode in ("moffat", "all", "moffat_wings")
+            show_c = fit_mode in ("contour", "all")
+            use_wings = fit_mode in ("moffat_wings", "all")
 
             # Choose which Moffat values to display
             mc_on = fwhm_cmof_w if use_wings else fwhm_cmof
@@ -897,6 +908,7 @@ class LongRun_tab(QWidget):
                 "dx": 0.0, "dy": 0.0,
                 "gc": fwhm_c, "gu": fwhm_u,
                 "mc": mc_on, "mu": mu_on,
+                "cc": fwhm_cc, "cu": fwhm_cu,
                 "is_onaxis": True,
             })
 
@@ -911,10 +923,19 @@ class LongRun_tab(QWidget):
                 else:
                     mc = float(m.get("fwhm_arcsec_corrected_moffat", float("nan")))
                     mu = float(m.get("fwhm_arcsec_uncorrected_moffat", float("nan")))
+                try:
+                    cc = float(m.get("fwhm_arcsec_corrected_contour", float("nan")))
+                except Exception:
+                    cc = float("nan")
+                try:
+                    cu = float(m.get("fwhm_arcsec_uncorrected_contour", float("nan")))
+                except Exception:
+                    cu = float("nan")
                 rows.append({
                     "dx": dx, "dy": dy,
                     "gc": gc, "gu": gu,
                     "mc": mc, "mu": mu,
+                    "cc": cc, "cu": cu,
                     "is_onaxis": False,
                 })
 
@@ -930,8 +951,8 @@ class LongRun_tab(QWidget):
             mlabel = "Moffat(w)" if use_wings else "Moffat"
             self.tbl_offaxis.setHorizontalHeaderLabels([
                 h0, h1,
-                "Gauss corr\n(as)", f"{mlabel} corr\n(as)",
-                "Gauss unc\n(as)", f"{mlabel} unc\n(as)",
+                "Gauss corr\n(as)", f"{mlabel} corr\n(as)", "Contour corr\n(as)",
+                "Gauss unc\n(as)", f"{mlabel} unc\n(as)", "Contour unc\n(as)",
             ])
 
             # Determine whether uncorrected columns should be shown for the selected fit(s)
@@ -944,13 +965,16 @@ class LongRun_tab(QWidget):
             want_g_unc = show_g and (np.isfinite(fwhm_u) or (_n_from_stats("gauss_uncorrected_arcsec") > 0))
             m_unc_key = "moffat_wings_uncorrected_arcsec" if use_wings else "moffat_uncorrected_arcsec"
             want_m_unc = show_m and (np.isfinite(mu_on) or (_n_from_stats(m_unc_key) > 0))
-            show_unc = bool(want_g_unc or want_m_unc)
+            want_c_unc = show_c and (np.isfinite(fwhm_cu) or (_n_from_stats("contour_uncorrected_arcsec") > 0))
+            show_unc = bool(want_g_unc or want_m_unc or want_c_unc)
 
             # Show/hide fit columns
             self.tbl_offaxis.setColumnHidden(2, not show_g)
-            self.tbl_offaxis.setColumnHidden(4, (not show_g) or (not show_unc))
             self.tbl_offaxis.setColumnHidden(3, not show_m)
-            self.tbl_offaxis.setColumnHidden(5, (not show_m) or (not show_unc))
+            self.tbl_offaxis.setColumnHidden(4, not show_c)
+            self.tbl_offaxis.setColumnHidden(5, (not show_g) or (not show_unc))
+            self.tbl_offaxis.setColumnHidden(6, (not show_m) or (not show_unc))
+            self.tbl_offaxis.setColumnHidden(7, (not show_c) or (not show_unc))
 
             def _it(v: str, tooltip: str = ""):
                 item = QTableWidgetItem(v)
@@ -975,14 +999,17 @@ class LongRun_tab(QWidget):
                 dx = float(r["dx"]); dy = float(r["dy"])
                 gc = float(r["gc"]); gu = float(r["gu"])
                 mc = float(r["mc"]); mu = float(r["mu"])
+                cc = float(r.get("cc", float("nan"))); cu = float(r.get("cu", float("nan")))
                 tip = "On-axis" if r.get("is_onaxis") else ""
                 c0, c1 = _coord_strings(dx, dy)
                 self.tbl_offaxis.setItem(i, 0, _it(c0, tip))
                 self.tbl_offaxis.setItem(i, 1, _it(c1, tip))
                 self.tbl_offaxis.setItem(i, 2, _it("" if (not show_g or not np.isfinite(gc)) else f"{gc:.3f}", tip))
                 self.tbl_offaxis.setItem(i, 3, _it("" if (not show_m or not np.isfinite(mc)) else f"{mc:.3f}", tip))
-                self.tbl_offaxis.setItem(i, 4, _it("" if (not show_g or not show_unc or not np.isfinite(gu)) else f"{gu:.3f}", tip))
-                self.tbl_offaxis.setItem(i, 5, _it("" if (not show_m or not show_unc or not np.isfinite(mu)) else f"{mu:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 4, _it("" if (not show_c or not np.isfinite(cc)) else f"{cc:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 5, _it("" if (not show_g or not show_unc or not np.isfinite(gu)) else f"{gu:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 6, _it("" if (not show_m or not show_unc or not np.isfinite(mu)) else f"{mu:.3f}", tip))
+                self.tbl_offaxis.setItem(i, 7, _it("" if (not show_c or not show_unc or not np.isfinite(cu)) else f"{cu:.3f}", tip))
 
             # Stats label: on-axis + off-axis aggregates (for selected fits)
             stats_lines: list[str] = []
@@ -991,11 +1018,15 @@ class LongRun_tab(QWidget):
                 on_parts.append(f"G={fwhm_c:.3f} as")
             if show_m:
                 on_parts.append(f"{mlabel}={mc_on:.3f} as")
+            if show_c:
+                on_parts.append(f"C={fwhm_cc:.3f} as")
             if show_unc:
                 if show_g and np.isfinite(fwhm_u):
                     on_parts.append(f"G_unc={fwhm_u:.3f} as")
                 if show_m and np.isfinite(mu_on):
                     on_parts.append(f"{mlabel}_unc={mu_on:.3f} as")
+                if show_c and np.isfinite(fwhm_cu):
+                    on_parts.append(f"C_unc={fwhm_cu:.3f} as")
             if on_parts:
                 stats_lines.append("On-axis: " + ", ".join(on_parts))
 
@@ -1023,6 +1054,10 @@ class LongRun_tab(QWidget):
                     line = _fmt_stats_line(f"{mlabel} corrected", m_corr_key)
                     if line:
                         stats_lines.append(line)
+                if show_c:
+                    line = _fmt_stats_line("Contour corrected", "contour_corrected_arcsec")
+                    if line:
+                        stats_lines.append(line)
                 if show_unc:
                     if show_g:
                         line = _fmt_stats_line("Gaussian uncorrected", "gauss_uncorrected_arcsec")
@@ -1033,15 +1068,20 @@ class LongRun_tab(QWidget):
                         line = _fmt_stats_line(f"{mlabel} uncorrected", m_unc_key)
                         if line:
                             stats_lines.append(line)
+                    if show_c:
+                        line = _fmt_stats_line("Contour uncorrected", "contour_uncorrected_arcsec")
+                        if line:
+                            stats_lines.append(line)
 
             self.lbl_offaxis_stats.setText("\n".join(stats_lines))
 
 
         # What to show (display-only; worker always computes Gaussian + Moffat + Moffat(wings) when available)
         fit_mode = self._fit_mode()
-        show_g = fit_mode in ("gaussian", "both")
-        show_m = fit_mode in ("moffat", "both", "moffat_wings")
-        use_wings = (fit_mode == "moffat_wings")
+        show_g = fit_mode in ("gaussian", "all")
+        show_m = fit_mode in ("moffat", "all", "moffat_wings")
+        show_c = fit_mode in ("contour", "all")
+        use_wings = fit_mode in ("all", "moffat_wings")
         mlabel = "Moffat(w)" if use_wings else "Moffat"
 
         # Select which Moffat fit dicts to use for overlays/profiles
@@ -1065,7 +1105,13 @@ class LongRun_tab(QWidget):
             else:
                 panel["canvas"].set_image(a.astype(np.float32, copy=False))
 
-        def _apply_overlays(canvas: PGCanvas, img: np.ndarray, g: Dict[str, Any], m: Dict[str, Any]):
+        def _apply_overlays(
+            canvas: PGCanvas,
+            img: np.ndarray,
+            g: Dict[str, Any],
+            m: Dict[str, Any],
+            c: Optional[Dict[str, Any]],
+        ):
             if img is None:
                 return
 
@@ -1089,6 +1135,7 @@ class LongRun_tab(QWidget):
 
             pen_g = pg.mkPen((255, 0, 0), width=2)
             pen_m = pg.mkPen((255, 0, 222), width=2)
+            pen_c = pg.mkPen((160, 160, 160), width=2)
 
 
             # Only draw what the user selected.
@@ -1102,11 +1149,34 @@ class LongRun_tab(QWidget):
             else:
                 canvas.remove_overlay("fwhm_moffat")
 
+            # Contour ellipse (native pixels)
+            if show_c and isinstance(c, dict):
+                try:
+                    cx = float(c.get("x0_px", xpk))
+                    cy = float(c.get("y0_px", ypk))
+                    rx = float(c.get("rx_px", float("nan")))
+                    ry = float(c.get("ry_px", float("nan")))
+                    ang = float(c.get("angle_deg", 0.0))
+                except Exception:
+                    cx, cy, rx, ry, ang = xpk, ypk, float("nan"), float("nan"), 0.0
+
+                if not np.isfinite(cx) or not np.isfinite(cy):
+                    cx, cy = xpk, ypk
+                if np.isfinite(rx) and np.isfinite(ry) and rx > 0 and ry > 0:
+                    canvas.set_ellipse_overlay("fwhm_contour", cx, cy, rx, ry, angle_deg=ang, pen=pen_c)
+                else:
+                    canvas.remove_overlay("fwhm_contour")
+            else:
+                canvas.remove_overlay("fwhm_contour")
+
             legend_lines = []
             if show_g:
                 legend_lines.append('<span style="color:rgb(255,0,0);">●</span> Gaussian FWHM')
             if show_m:
                 legend_lines.append(f'<span style="color:rgb(255,0,222);">●</span> {mlabel} FWHM')
+
+            if show_c:
+                legend_lines.append('<span style="color:rgb(160,160,160);">⬭</span> Contour FWHM')
 
             if legend_lines:
                 legend_html = (
@@ -1162,13 +1232,14 @@ class LongRun_tab(QWidget):
 
             return mosaic, offsets, rows, cols, h, w, mx, my, pad, block_h, block_w
 
-        def _show_mosaic(panel, imgs, gfits, mfits, labels, prefix: str):
+        def _show_mosaic(panel, imgs, gfits, mfits, cfits, labels, prefix: str):
             canvas = panel["canvas"]
 
             # Clear previous overlays (tiles + profiles)
             for i in range(512):
                 canvas.remove_overlay(f"{prefix}_g_{i}")
                 canvas.remove_overlay(f"{prefix}_m_{i}")
+                canvas.remove_overlay(f"{prefix}_c_{i}")
                 canvas.remove_overlay(f"{prefix}_t_{i}")
 
                 for name in (
@@ -1193,6 +1264,7 @@ class LongRun_tab(QWidget):
             for name in (
                 "fwhm_gauss",
                 "fwhm_moffat",
+                "fwhm_contour",
                 "legend",
                 "prof_x_data",
                 "prof_y_data",
@@ -1223,12 +1295,15 @@ class LongRun_tab(QWidget):
                 legend_items.append("<span style='color:yellow;'>●</span> Gaussian FWHM")
             if show_m:
                 legend_items.append(f"<span style='color:magenta;'>●</span> {mlabel} FWHM")
+            if show_c:
+                legend_items.append("<span style='color:rgb(160,160,160);'>⬭</span> Contour FWHM")
             legend_items.append("<span style='color:rgb(200,200,200);'>—</span> Data slice")
             legend_html = "<div style='background-color:rgba(0,0,0,140); padding:6px;'>" + "&nbsp;&nbsp;".join(legend_items[:-1]) + "<br>" + legend_items[-1] + "</div>"
             canvas.set_text_overlay("legend", legend_html, anchor=(0, -10), offset=(8, 8), relative_to="image")
 
             pen_g = pg.mkPen((255, 0 ,0), width=2)
             pen_m = pg.mkPen((255, 0, 255), width=2)
+            pen_c = pg.mkPen((160, 160, 160), width=2)
 
             # Profile pens
             pen_data = pg.mkPen((200, 200, 200), width=1)
@@ -1449,10 +1524,13 @@ class LongRun_tab(QWidget):
 
                 g = gfits[i] if i < len(gfits) else None
                 m = mfits[i] if i < len(mfits) else None
+                c = cfits[i] if i < len(cfits) else None
                 if not isinstance(g, dict):
                     g = {}
                 if not isinstance(m, dict):
                     m = {}
+                if not isinstance(c, dict):
+                    c = {}
 
                 gx = float(g.get("x0_px", xpk))
                 gy = float(g.get("y0_px", ypk))
@@ -1475,6 +1553,26 @@ class LongRun_tab(QWidget):
                     canvas.set_circle_overlay(f"{prefix}_m_{i}", x0 + mx0, y0 + my0, mr, pen=pen_m)
                 else:
                     canvas.remove_overlay(f"{prefix}_m_{i}")
+
+                # Contour ellipse
+                if show_c and isinstance(c, dict):
+                    try:
+                        cx = float(c.get("x0_px", xpk))
+                        cy = float(c.get("y0_px", ypk))
+                        rx = float(c.get("rx_px", float("nan")))
+                        ry = float(c.get("ry_px", float("nan")))
+                        ang = float(c.get("angle_deg", 0.0))
+                    except Exception:
+                        cx, cy, rx, ry, ang = xpk, ypk, float("nan"), float("nan"), 0.0
+
+                    if not np.isfinite(cx) or not np.isfinite(cy):
+                        cx, cy = xpk, ypk
+                    if np.isfinite(rx) and np.isfinite(ry) and rx > 0 and ry > 0:
+                        canvas.set_ellipse_overlay(f"{prefix}_c_{i}", x0 + cx, y0 + cy, rx, ry, angle_deg=ang, pen=pen_c)
+                    else:
+                        canvas.remove_overlay(f"{prefix}_c_{i}")
+                else:
+                    canvas.remove_overlay(f"{prefix}_c_{i}")
                 if labels and i < len(labels):
                     lbl = labels[i]
                     html = f"<div style='background-color:rgba(0,0,0,140); padding:3px;'><span style='color:white;'>{lbl}</span></div>"
@@ -1526,6 +1624,14 @@ class LongRun_tab(QWidget):
                 if np.isfinite(v):
                     mp = "Mw" if use_wings else "M"
                     parts.append(f"{mp} {v:.3f}")
+            if show_c:
+                k = "fwhm_arcsec_corrected_contour" if corrected else "fwhm_arcsec_uncorrected_contour"
+                try:
+                    v = float(m.get(k, float("nan")))
+                except Exception:
+                    v = float("nan")
+                if np.isfinite(v):
+                    parts.append(f"C {v:.3f}")
             return "  ".join(parts) if parts else ""
 
 
@@ -1536,11 +1642,13 @@ class LongRun_tab(QWidget):
                 gfits = [gauss_corr if show_g else {}] + [((m.get("gauss_corrected") or {}) if show_g else {}) for m in off_metrics]
                 m_key = "moffat_wings_corrected" if use_wings else "moffat_corrected"
                 mfits = [moff_corr_show if show_m else {}] + [((m.get(m_key) or {}) if show_m else {}) for m in off_metrics]
+                cfits = [((contour_corr or {}) if show_c else {})] + [((m.get("contour_corrected") or {}) if show_c else {}) for m in off_metrics]
 
                 on_m = {
                     "fwhm_arcsec_corrected": fwhm_c,
                     "fwhm_arcsec_corrected_moffat": fwhm_cmof,
                     "fwhm_arcsec_corrected_moffat_wings": fwhm_cmof_w,
+                    "fwhm_arcsec_corrected_contour": fwhm_cc,
                 }
                 on_lbl = "on-axis"
                 extra = _fit_lbl(on_m, corrected=True)
@@ -1548,10 +1656,16 @@ class LongRun_tab(QWidget):
                     on_lbl = on_lbl + "\n" + extra
 
                 labels = [on_lbl] + [f"{_coord_lbl(float(m.get('dx_arcsec',0.0)), float(m.get('dy_arcsec',0.0)))}\n{_fit_lbl(m, corrected=True)}" for m in off_metrics]
-                _show_mosaic(self._psf_corr, imgs, gfits, mfits, labels, prefix="corr")
+                _show_mosaic(self._psf_corr, imgs, gfits, mfits, cfits, labels, prefix="corr")
             else:
                 _show(self._psf_corr, img_corr_a)
-                _apply_overlays(self._psf_corr["canvas"], img_corr_a, (gauss_corr if show_g else {}), (moff_corr_show if show_m else {}))
+                _apply_overlays(
+                    self._psf_corr["canvas"],
+                    img_corr_a,
+                    (gauss_corr if show_g else {}),
+                    (moff_corr_show if show_m else {}),
+                    (contour_corr if (show_c and isinstance(contour_corr, dict)) else None),
+                )
                 self._update_profiles(self._psf_corr, img_corr_a, (gauss_corr if show_g else {}), (moff_corr_show if show_m else {}), plate)
 
         if img_unc_a is not None and img_unc_a.ndim == 2:
@@ -1560,11 +1674,13 @@ class LongRun_tab(QWidget):
                 gfits = [gauss_unc if show_g else {}] + [((m.get("gauss_uncorrected") or {}) if show_g else {}) for m in off_metrics]
                 m_key = "moffat_wings_uncorrected" if use_wings else "moffat_uncorrected"
                 mfits = [moff_unc_show if show_m else {}] + [((m.get(m_key) or {}) if show_m else {}) for m in off_metrics]
+                cfits = [((contour_unc or {}) if show_c else {})] + [((m.get("contour_uncorrected") or {}) if show_c else {}) for m in off_metrics]
 
                 on_m = {
                     "fwhm_arcsec_uncorrected": fwhm_u,
                     "fwhm_arcsec_uncorrected_moffat": fwhm_umof,
                     "fwhm_arcsec_uncorrected_moffat_wings": fwhm_umof_w,
+                    "fwhm_arcsec_uncorrected_contour": fwhm_cu,
                 }
                 on_lbl = "on-axis"
                 extra = _fit_lbl(on_m, corrected=False)
@@ -1572,10 +1688,16 @@ class LongRun_tab(QWidget):
                     on_lbl = on_lbl + "\n" + extra
 
                 labels = [on_lbl] + [f"{_coord_lbl(float(m.get('dx_arcsec',0.0)), float(m.get('dy_arcsec',0.0)))}\n{_fit_lbl(m, corrected=False)}" for m in off_metrics]
-                _show_mosaic(self._psf_unc, imgs, gfits, mfits, labels, prefix="unc")
+                _show_mosaic(self._psf_unc, imgs, gfits, mfits, cfits, labels, prefix="unc")
             else:
                 _show(self._psf_unc, img_unc_a)
-                _apply_overlays(self._psf_unc["canvas"], img_unc_a, (gauss_unc if show_g else {}), (moff_unc_show if show_m else {}))
+                _apply_overlays(
+                    self._psf_unc["canvas"],
+                    img_unc_a,
+                    (gauss_unc if show_g else {}),
+                    (moff_unc_show if show_m else {}),
+                    (contour_unc if (show_c and isinstance(contour_unc, dict)) else None),
+                )
                 self._update_profiles(self._psf_unc, img_unc_a, (gauss_unc if show_g else {}), (moff_unc_show if show_m else {}), plate)
 
     @Slot(str)

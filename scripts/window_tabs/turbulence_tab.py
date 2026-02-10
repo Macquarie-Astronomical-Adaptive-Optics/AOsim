@@ -184,7 +184,7 @@ class Turbulence_tab(QWidget):
             ranges_m=ranges_m,
             patch_size_px=N,
             patch_M=N,
-            dt_s=0.001,
+            dt_s=0.002,
             emit_psf=True,
         )
         self.scheduler.moveToThread(self.scheduler_thread)

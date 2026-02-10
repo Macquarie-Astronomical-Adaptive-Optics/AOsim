@@ -539,24 +539,32 @@ class Analysis:
             f = int(factor)
         return xp.repeat(xp.repeat(I, f, axis=0), f, axis=1)
 
-    def fwhm_contour(
+    def _fwhm_contour_region_pca(
         psf,
         pixelScale,          # e.g. mas/pix (recommended)
         rebin=1,             # upsample factor
         min_pts=30,          # required number of half-max pixels
         bg_percentile=1.0,   # background estimate from low percentile of image (robust for cropped PSFs)
-        use_bg=True,
+        use_bg=False,
         return_ratio_theta=True,
+        return_ellipse: bool = False,
     ):
         """
         Contour FWHM using the half-maximum region.
         Uses upsampling (rebin) to reduce discretization.
 
         Returns:
-        if return_ratio_theta:
+        - If return_ratio_theta and not return_ellipse:
             (fwhm_major, fwhm_minor, aRatio, theta_deg)
-        else:
+        - If return_ratio_theta and return_ellipse:
+            (fwhm_major, fwhm_minor, aRatio, theta_deg, ellipse)
+        - If not return_ratio_theta and not return_ellipse:
             (fwhm_major, fwhm_minor)
+        - If not return_ratio_theta and return_ellipse:
+            (fwhm_major, fwhm_minor, ellipse)
+
+        Where ellipse is a dict in **native PSF pixels**:
+            {"x0_px", "y0_px", "rx_px", "ry_px", "angle_deg"}
         """
         xp = cp.get_array_module(psf)
         I0 = xp.asarray(psf).astype(xp.float32, copy=False)
@@ -568,7 +576,12 @@ class Analysis:
 
         peak = float(xp.max(I).item())
         if peak <= 0:
-            out = (float("nan"),) * (4 if return_ratio_theta else 2)
+            if return_ratio_theta:
+                out = (float("nan"), float("nan"), float("nan"), float("nan"))
+            else:
+                out = (float("nan"), float("nan"))
+            if return_ellipse:
+                out = tuple(out) + (None,)
             return out
 
         # Background estimate (low percentile is safer than "outer ring" for cropped long-PSFs)
@@ -590,22 +603,25 @@ class Analysis:
 
         n = int(mask.sum())
         if n < min_pts:
-            out = (float("nan"),) * (4 if return_ratio_theta else 2)
+            if return_ratio_theta:
+                out = (float("nan"), float("nan"), float("nan"), float("nan"))
+            else:
+                out = (float("nan"), float("nan"))
+            if return_ellipse:
+                out = tuple(out) + (None,)
             return out
 
         ys, xs = xp.nonzero(mask)
         xs = xs.astype(xp.float32)
         ys = ys.astype(xp.float32)
 
-        # center: bbox midpoint of the contour region
-        cx = 0.5 * (float(xs.min().item()) + float(xs.max().item()))
-        cy = 0.5 * (float(ys.min().item()) + float(ys.max().item()))
-        dx = xs - cx
-        dy = ys - cy
+        # center at centroid (more stable than bbox midpoint for asymmetric PSFs)
+        cx = float(xp.mean(xs).item())
+        cy = float(xp.mean(ys).item())
+        dx0 = xs - cx
+        dy0 = ys - cy
 
         # PCA for orientation
-        dx0 = dx - xp.mean(dx)
-        dy0 = dy - xp.mean(dy)
         cxx = xp.mean(dx0 * dx0)
         cyy = xp.mean(dy0 * dy0)
         cxy = xp.mean(dx0 * dy0)
@@ -629,17 +645,244 @@ class Analysis:
             u = v
 
         # Convert back to ORIGINAL pixels by dividing by rebin, then to angular units
-        fwhm_major = (2.0 * a / r) * float(pixelScale)
-        fwhm_minor = (2.0 * b / r) * float(pixelScale)
+        a0 = float(a) / float(r)  # semi-major in native pixels
+        b0 = float(b) / float(r)  # semi-minor in native pixels
+        fwhm_major = (2.0 * a0) * float(pixelScale)
+        fwhm_minor = (2.0 * b0) * float(pixelScale)
+
+        ellipse = None
+        if return_ellipse:
+            ellipse = {
+                "x0_px": float(cx) / float(r),
+                "y0_px": float(cy) / float(r),
+                "rx_px": float(a0),
+                "ry_px": float(b0),
+                "angle_deg": float((xp.arctan2(u[1], u[0]) * 180.0 / xp.pi).item()),
+            }
 
         if not return_ratio_theta:
-            return fwhm_major, fwhm_minor
+            out = (fwhm_major, fwhm_minor)
+            if return_ellipse:
+                out = tuple(out) + (ellipse,)
+            return out
 
         aRatio = fwhm_major / max(fwhm_minor, 1e-12)
         theta_deg = float((xp.arctan2(u[1], u[0]) * 180.0 / xp.pi).item())
+        if return_ellipse and isinstance(ellipse, dict):
+            ellipse["angle_deg"] = float(theta_deg)
+            return fwhm_major, fwhm_minor, aRatio, theta_deg, ellipse
         return fwhm_major, fwhm_minor, aRatio, theta_deg
 
-    # ---------- Long Exposure PSF ----------
+    def _find_contour_points_tiptop(image, level):
+        """
+        Find contour points at a given level using the TIPTOP-style radial interpolation
+        from the peak. Returns an (N,2) array of [x, y] points in image pixel coords.
+        If no points are found, returns [0] (to match TIPTOP's caller behavior).
+        """
+        # NOTE: this implementation is intentionally close to TIPTOP's reference code.
+        import numpy as _np
+        try:
+            from scipy import ndimage as _ndimage
+        except Exception:
+            _ndimage = None
+
+        image = _np.asarray(image, dtype=_np.float32)
+
+        # Peak position
+        peak_y, peak_x = _np.unravel_index(_np.argmax(image), image.shape)
+
+        # Above threshold
+        above_threshold = image > float(level)
+
+        # Boundary points via dilation
+        if _ndimage is None:
+            return [0]
+        kernel = _np.array([[0, 1, 0],
+                            [1, 1, 1],
+                            [0, 1, 0]], dtype=bool)
+        dilated = _ndimage.binary_dilation(above_threshold, structure=kernel)
+        boundary_points = dilated & ~above_threshold
+
+        boundary_y, boundary_x = _np.where(boundary_points)
+        if boundary_x.size == 0:
+            return [0]
+
+        # Precompute above-threshold coordinates
+        above_y, above_x = _np.where(above_threshold)
+        if above_x.size == 0:
+            return [0]
+
+        contour_points = []
+        # For every edge point
+        for x, y in zip(boundary_x, boundary_y):
+            # Find closest points above threshold
+            dists_to_above = _np.sqrt((above_y - y) ** 2 + (above_x - x) ** 2)
+
+            if dists_to_above.size > 4:
+                nearest_indices = _np.argpartition(dists_to_above, 4)[:4]
+            else:
+                nearest_indices = _np.argsort(dists_to_above)[:dists_to_above.size]
+
+            nearest_points = _np.column_stack((above_x[nearest_indices], above_y[nearest_indices]))
+            dists_from_peak = _np.sqrt(_np.sum((nearest_points - [peak_x, peak_y]) ** 2, axis=1))
+
+            # Farthest (among nearest) from peak
+            farthest_idx = int(_np.argmax(dists_from_peak))
+            far_point = nearest_points[farthest_idx]
+            far_val = float(image[int(far_point[1]), int(far_point[0])])
+
+            curr_val = float(image[int(y), int(x)])
+
+            # Direction vector from peak to farthest point
+            direction = _np.array([far_point[0] - peak_x, far_point[1] - peak_y], dtype=_np.float32)
+            direction_norm = float(_np.sqrt(_np.sum(direction ** 2)))
+            if direction_norm > 0:
+                direction = direction / direction_norm
+
+            # Interpolation on the line
+            if curr_val < float(level) < far_val:
+                t = (float(level) - curr_val) / (far_val - curr_val)
+
+                curr_dist = float(_np.sqrt((x - peak_x) ** 2 + (y - peak_y) ** 2))
+                far_dist = float(_np.sqrt(_np.sum((far_point - [peak_x, peak_y]) ** 2)))
+
+                interp_dist = curr_dist + t * (far_dist - curr_dist)
+
+                px = float(peak_x + direction[0] * interp_dist)
+                py = float(peak_y + direction[1] * interp_dist)
+                contour_points.append([px, py])
+
+        if not contour_points:
+            return [0]
+
+        contour_points = _np.array(contour_points, dtype=_np.float32)
+
+        # Filter outliers (TIPTOP: within 2*std of median distance from peak)
+        distances_from_peak = _np.sqrt(_np.sum((contour_points - [peak_x, peak_y]) ** 2, axis=1))
+        med_distance = float(_np.median(distances_from_peak))
+        std_distance = float(_np.std(distances_from_peak))
+        if std_distance > 0:
+            mask = _np.abs(distances_from_peak - med_distance) < 2.0 * std_distance
+            contour_points = contour_points[mask]
+
+        return contour_points
+
+    def fwhm_contour(
+        psf,
+        pixelScale,          # e.g. arcsec/pix (recommended)
+        rebin=1,             # upsample factor
+        min_pts=30,          # kept for backward-compat; not used by TIPTOP method
+        bg_percentile=1.0,   # kept for backward-compat; not used by TIPTOP method
+        use_bg=False,        # kept for backward-compat; not used by TIPTOP method
+        return_ratio_theta=True,
+        return_ellipse: bool = False,
+    ):
+        """
+        TIPTOP-style contour FWHM:
+          1) Upsample by `rebin`
+          2) Find interpolated contour points at half-maximum
+          3) Estimate ellipse center from bounding box midpoint
+          4) Major/minor radii from max/min distance to center
+          5) Orientation from the farthest contour point
+
+        Returns (in angular units):
+          - (fwhm_major, fwhm_minor, aRatio, theta_deg)  if return_ratio_theta
+          - plus `ellipse` dict if return_ellipse=True
+
+        ellipse dict is in **native PSF pixels**:
+          {"x0_px","y0_px","rx_px","ry_px","angle_deg"}
+        """
+        xp = cp.get_array_module(psf)
+        I0 = xp.asarray(psf).astype(xp.float32, copy=False)
+
+        r = int(rebin) if rebin is not None else 1
+        r = max(r, 1)
+        I_hr = Analysis._zoom2d(I0, r, xp)
+
+        # move to CPU for the TIPTOP contour-point search (Python loop)
+        if xp is cp:
+            im_hr = cp.asnumpy(I_hr)
+        else:
+            im_hr = np.asarray(I_hr)
+
+        peak_val = float(np.max(im_hr))
+        if not np.isfinite(peak_val) or peak_val <= 0:
+            if return_ratio_theta:
+                out = (float("nan"), float("nan"), float("nan"), float("nan"))
+            else:
+                out = (float("nan"), float("nan"))
+            if return_ellipse:
+                out = tuple(out) + (None,)
+            return out
+
+        contour_points = Analysis._find_contour_points_tiptop(im_hr, peak_val / 2.0)
+
+        # TIPTOP fallback behavior: if not enough contour points, fall back to the older region-PCA method
+        if not isinstance(contour_points, np.ndarray) or contour_points.ndim != 2 or contour_points.shape[0] < 3:
+            return Analysis._fwhm_contour_region_pca(
+                psf,
+                pixelScale,
+                rebin=rebin,
+                min_pts=min_pts,
+                bg_percentile=bg_percentile,
+                use_bg=use_bg,
+                return_ratio_theta=return_ratio_theta,
+                return_ellipse=return_ellipse,
+            )
+
+        xC = contour_points[:, 0]
+        yC = contour_points[:, 1]
+
+        # Centering (TIPTOP: bbox midpoint)
+        mx = np.array([float(xC.max()), float(yC.max())], dtype=np.float32)
+        mn = np.array([float(xC.min()), float(yC.min())], dtype=np.float32)
+        cent = (mx + mn) / 2.0
+
+        wx = xC - cent[0]
+        wy = yC - cent[1]
+
+        # Radii (native pixels) and in angular units
+        rr_hr = np.hypot(wx, wy).astype(np.float32)  # high-res pixels
+        # TIPTOP: wr = rr_hr/rebin*pixelScale
+        wr = (rr_hr / float(r)) * float(pixelScale)
+
+        # FWHM major/minor (TIPTOP: max/min radius)
+        r_major = float(np.max(wr))
+        r_minor = float(np.min(wr))
+        fwhm_major = 2.0 * r_major
+        fwhm_minor = 2.0 * r_minor
+
+        # Orientation from farthest point
+        idx = int(np.argmax(wr))
+        xm = float(wx[idx])
+        ym = float(wy[idx])
+        theta_deg = float(np.mean(180.0 * np.arctan2(ym, xm) / np.pi))
+
+        ellipse = None
+        if return_ellipse:
+            # convert center/radii back to native pixels (divide by rebin)
+            rx_px = float(np.max(rr_hr) / float(r))
+            ry_px = float(np.min(rr_hr) / float(r))
+            ellipse = {
+                "x0_px": float(cent[0]) / float(r),
+                "y0_px": float(cent[1]) / float(r),
+                "rx_px": rx_px,
+                "ry_px": ry_px,
+                "angle_deg": float(theta_deg),
+            }
+
+        if not return_ratio_theta:
+            out = (float(fwhm_major), float(fwhm_minor))
+            if return_ellipse:
+                out = tuple(out) + (ellipse,)
+            return out
+
+        aRatio = float(fwhm_major) / max(float(fwhm_minor), 1e-12)
+        if return_ellipse:
+            return float(fwhm_major), float(fwhm_minor), aRatio, float(theta_deg), ellipse
+        return float(fwhm_major), float(fwhm_minor), aRatio, float(theta_deg)
+
+# ---------- Long Exposure PSF ----------
     class PSFRingMean:
         def __init__(self, shape, K, dtype=cp.float32, save_path=rootdir / "output" / "psf", save_label = ""):
             self.K = int(K)

@@ -1344,7 +1344,7 @@ class AOBatchRunner:
             rec_corr_tt.close()
 
         # FWHM estimates via Gaussian fit (uses GPU LM fit)
-        zoom = int(params.get("fwhm_zoom", 2))
+        zoom = int(params.get("fwhm_zoom", 1))
         fitter = Gaussian2DFitter(roi_half=int(params.get("fwhm_roi_half", 32)))
 
         # Fit metadata (native PSF pixels; for overlays)
@@ -1361,9 +1361,64 @@ class AOBatchRunner:
         Icorr_moffat_wings = float("nan")
         Iunc_moffat_wings = float("nan")
 
+        fwhm_px_corr = float("nan")
+        fwhm_px_unc = float("nan")
+
+        # Contour FWHM (half-maximum region; ellipse approximation). Values are in arcsec.
+        fwhm_arcsec_corrected_contour = float("nan")
+        fwhm_arcsec_uncorrected_contour = float("nan")
+        fwhm_arcsec_corrected_contour_major = float("nan")
+        fwhm_arcsec_corrected_contour_minor = float("nan")
+        fwhm_arcsec_uncorrected_contour_major = float("nan")
+        fwhm_arcsec_uncorrected_contour_minor = float("nan")
+        fwhm_contour_corrected_ratio = float("nan")
+        fwhm_contour_uncorrected_ratio = float("nan")
+        fwhm_contour_corrected_theta_deg = float("nan")
+        fwhm_contour_uncorrected_theta_deg = float("nan")
+
+        # Ellipse fits for contour method (native PSF pixels; for UI overlays)
+        contour_corr = None
+        contour_unc = None
+
         if int(n_used) > 0:
             Icorr_zoom = Analysis._zoom2d(psf_long_corr, zoom, cp)
             Iunc_zoom = Analysis._zoom2d(psf_long_unc, zoom, cp)
+
+            # Contour FWHM (arcsec) from the half-maximum region.
+            # Use the native-resolution PSF but upsample internally by rebin=zoom to reduce discretization.
+            pixelScale_as_per_pix = float(plate_rad) * (180.0 / np.pi) * 3600.0
+            try:
+                cmaj, cmin, cr, ct, cell = Analysis.fwhm_contour(
+                    psf_long_corr,
+                    pixelScale_as_per_pix,
+                    rebin=zoom,
+                    return_ellipse=True,
+                )
+                fwhm_arcsec_corrected_contour_major = float(cmaj)
+                fwhm_arcsec_corrected_contour_minor = float(cmin)
+                fwhm_contour_corrected_ratio = float(cr)
+                fwhm_contour_corrected_theta_deg = float(ct)
+                contour_corr = cell
+                if np.isfinite(fwhm_arcsec_corrected_contour_major) and np.isfinite(fwhm_arcsec_corrected_contour_minor):
+                    fwhm_arcsec_corrected_contour = float(np.sqrt(fwhm_arcsec_corrected_contour_major * fwhm_arcsec_corrected_contour_minor))
+            except Exception:
+                pass
+            try:
+                cmaj, cmin, cr, ct, cell = Analysis.fwhm_contour(
+                    psf_long_unc,
+                    pixelScale_as_per_pix,
+                    rebin=zoom,
+                    return_ellipse=True,
+                )
+                fwhm_arcsec_uncorrected_contour_major = float(cmaj)
+                fwhm_arcsec_uncorrected_contour_minor = float(cmin)
+                fwhm_contour_uncorrected_ratio = float(cr)
+                fwhm_contour_uncorrected_theta_deg = float(ct)
+                contour_unc = cell
+                if np.isfinite(fwhm_arcsec_uncorrected_contour_major) and np.isfinite(fwhm_arcsec_uncorrected_contour_minor):
+                    fwhm_arcsec_uncorrected_contour = float(np.sqrt(fwhm_arcsec_uncorrected_contour_major * fwhm_arcsec_uncorrected_contour_minor))
+            except Exception:
+                pass
 
             # Gaussian (GPU). Note: centers are returned in zoomed pixel coordinates.
             _p, (xc_z, yc_z), (fwhm_eq_native, _), *_rest = fitter.fit_frame(
@@ -1404,8 +1459,6 @@ class AOBatchRunner:
             Iunc_moffat  = float(moff_unc.get("fwhm_px", float("nan")))
             Icorr_moffat_wings = float(moffw_corr.get("fwhm_px", float("nan")))
             Iunc_moffat_wings  = float(moffw_unc.get("fwhm_px", float("nan")))
-            fwhm_px_corr = float("nan")
-            fwhm_px_unc = float("nan")
 
         # Off-axis FWHM evaluation (full-duration long-exposure, post-discard)
         offaxis_metrics: List[Dict[str, Any]] = []
@@ -1433,13 +1486,41 @@ class AOBatchRunner:
                 fwhm_px_c_mw = float(moffw_c.get("fwhm_px", float("nan")))
 
 
+                # Contour FWHM (arcsec) for this off-axis point
+                fwhm_as_c_contour = float("nan")
+                fwhm_as_c_contour_major = float("nan")
+                fwhm_as_c_contour_minor = float("nan")
+                fwhm_c_contour_ratio = float("nan")
+                fwhm_c_contour_theta_deg = float("nan")
+                contour_c = None
+                try:
+                    cmaj, cmin, cr, ct, cell = Analysis.fwhm_contour(
+                        Icor_k, pixelScale_as_per_pix, rebin=zoom, return_ellipse=True
+                    )
+                    fwhm_as_c_contour_major = float(cmaj)
+                    fwhm_as_c_contour_minor = float(cmin)
+                    fwhm_c_contour_ratio = float(cr)
+                    fwhm_c_contour_theta_deg = float(ct)
+                    contour_c = cell
+                    if np.isfinite(fwhm_as_c_contour_major) and np.isfinite(fwhm_as_c_contour_minor):
+                        fwhm_as_c_contour = float(np.sqrt(fwhm_as_c_contour_major * fwhm_as_c_contour_minor))
+                except Exception:
+                    pass
+
                 # Uncorrected (optional; computed if we also accumulated it)
                 fwhm_px_u = float("nan")
                 fwhm_px_u_m = float("nan")
                 fwhm_px_u_mw = float("nan")
+                fwhm_as_u_contour = float("nan")
+                fwhm_as_u_contour_major = float("nan")
+                fwhm_as_u_contour_minor = float("nan")
+                fwhm_u_contour_ratio = float("nan")
+                fwhm_u_contour_theta_deg = float("nan")
+                contour_u = None
                 gauss_u: Optional[Dict[str, Any]] = None
                 moff_u: Optional[Dict[str, Any]] = None
                 moffw_u: Optional[Dict[str, Any]] = None
+                contour_u = None
                 if psf_long_unc_eval is not None:
                     Iunc_k = psf_long_unc_eval[k]
                     Iunc_k_zoom = Analysis._zoom2d(Iunc_k, zoom, cp)
@@ -1462,6 +1543,26 @@ class AOBatchRunner:
                     fwhm_px_u_mw = float(moffw_u.get("fwhm_px", float("nan")))
 
 
+                    # Contour FWHM (arcsec) for this off-axis point (uncorrected)
+                    fwhm_as_u_contour = float("nan")
+                    fwhm_as_u_contour_major = float("nan")
+                    fwhm_as_u_contour_minor = float("nan")
+                    fwhm_u_contour_ratio = float("nan")
+                    fwhm_u_contour_theta_deg = float("nan")
+                    try:
+                        cmaj, cmin, cr, ct, cell = Analysis.fwhm_contour(
+                            Iunc_k, pixelScale_as_per_pix, rebin=zoom, return_ellipse=True
+                        )
+                        fwhm_as_u_contour_major = float(cmaj)
+                        fwhm_as_u_contour_minor = float(cmin)
+                        fwhm_u_contour_ratio = float(cr)
+                        fwhm_u_contour_theta_deg = float(ct)
+                        contour_u = cell
+                        if np.isfinite(fwhm_as_u_contour_major) and np.isfinite(fwhm_as_u_contour_minor):
+                            fwhm_as_u_contour = float(np.sqrt(fwhm_as_u_contour_major * fwhm_as_u_contour_minor))
+                    except Exception:
+                        pass
+
                 # Convert to arcsec for convenience
                 fwhm_as_c = fwhm_px_c * plate_rad * (180.0 / np.pi) * 3600.0
                 fwhm_as_c_m = fwhm_px_c_m * plate_rad * (180.0 / np.pi) * 3600.0
@@ -1480,6 +1581,16 @@ class AOBatchRunner:
                         "fwhm_arcsec_uncorrected": float(fwhm_as_u),
                         "fwhm_arcsec_uncorrected_moffat": float(fwhm_as_u_m),
                         "fwhm_arcsec_uncorrected_moffat_wings": float(fwhm_as_u_mw),
+                        "fwhm_arcsec_corrected_contour": float(fwhm_as_c_contour),
+                        "fwhm_arcsec_corrected_contour_major": float(fwhm_as_c_contour_major),
+                        "fwhm_arcsec_corrected_contour_minor": float(fwhm_as_c_contour_minor),
+                        "fwhm_contour_corrected_ratio": float(fwhm_c_contour_ratio),
+                        "fwhm_contour_corrected_theta_deg": float(fwhm_c_contour_theta_deg),
+                        "fwhm_arcsec_uncorrected_contour": float(fwhm_as_u_contour),
+                        "fwhm_arcsec_uncorrected_contour_major": float(fwhm_as_u_contour_major),
+                        "fwhm_arcsec_uncorrected_contour_minor": float(fwhm_as_u_contour_minor),
+                        "fwhm_contour_uncorrected_ratio": float(fwhm_u_contour_ratio),
+                        "fwhm_contour_uncorrected_theta_deg": float(fwhm_u_contour_theta_deg),
                         "fwhm_px_corrected": float(fwhm_px_c),
                         "fwhm_px_corrected_moffat": float(fwhm_px_c_m),
                         "fwhm_px_corrected_moffat_wings": float(fwhm_px_c_mw),
@@ -1493,6 +1604,8 @@ class AOBatchRunner:
                         "gauss_uncorrected": gauss_u,
                         "moffat_uncorrected": moff_u,
                         "moffat_wings_uncorrected": moffw_u,
+                        "contour_corrected": contour_c,
+                        "contour_uncorrected": contour_u,
                     }
                 )
 
@@ -1516,11 +1629,13 @@ class AOBatchRunner:
             offaxis_stats["gauss_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_moffat", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_wings_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_moffat_wings", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["contour_corrected_arcsec"] = _stats([m.get("fwhm_arcsec_corrected_contour", float("nan")) for m in offaxis_metrics])
 
             # Uncorrected only if present (not skipped)
             offaxis_stats["gauss_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_moffat", float("nan")) for m in offaxis_metrics])
             offaxis_stats["moffat_wings_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_moffat_wings", float("nan")) for m in offaxis_metrics])
+            offaxis_stats["contour_uncorrected_arcsec"] = _stats([m.get("fwhm_arcsec_uncorrected_contour", float("nan")) for m in offaxis_metrics])
 
         fwhm_px_corr_tt = None
         if psf_long_corr_tt is not None:
@@ -1539,6 +1654,18 @@ class AOBatchRunner:
             "fwhm_rad_uncorrected_moffat": Iunc_moffat * plate_rad,
             "fwhm_rad_corrected_moffat_wings": Icorr_moffat_wings * plate_rad,
             "fwhm_rad_uncorrected_moffat_wings": Iunc_moffat_wings * plate_rad,
+            "fwhm_rad_corrected_contour": float(fwhm_arcsec_corrected_contour) * (np.pi / (180.0 * 3600.0)),
+            "fwhm_rad_uncorrected_contour": float(fwhm_arcsec_uncorrected_contour) * (np.pi / (180.0 * 3600.0)),
+            "fwhm_arcsec_corrected_contour": float(fwhm_arcsec_corrected_contour),
+            "fwhm_arcsec_uncorrected_contour": float(fwhm_arcsec_uncorrected_contour),
+            "fwhm_arcsec_corrected_contour_major": float(fwhm_arcsec_corrected_contour_major),
+            "fwhm_arcsec_corrected_contour_minor": float(fwhm_arcsec_corrected_contour_minor),
+            "fwhm_arcsec_uncorrected_contour_major": float(fwhm_arcsec_uncorrected_contour_major),
+            "fwhm_arcsec_uncorrected_contour_minor": float(fwhm_arcsec_uncorrected_contour_minor),
+            "fwhm_contour_corrected_ratio": float(fwhm_contour_corrected_ratio),
+            "fwhm_contour_uncorrected_ratio": float(fwhm_contour_uncorrected_ratio),
+            "fwhm_contour_corrected_theta_deg": float(fwhm_contour_corrected_theta_deg),
+            "fwhm_contour_uncorrected_theta_deg": float(fwhm_contour_uncorrected_theta_deg),
             "fwhm_arcsec_corrected_moffat_wings": Icorr_moffat_wings * plate_rad * (180.0 / np.pi) * 3600.0,
             "fwhm_arcsec_uncorrected_moffat_wings": Iunc_moffat_wings * plate_rad * (180.0 / np.pi) * 3600.0,
             # Fit metadata for overlays (native PSF pixels)
@@ -1548,6 +1675,8 @@ class AOBatchRunner:
             "moffat_uncorrected": moff_unc,
             "moffat_wings_corrected": moffw_corr,
             "moffat_wings_uncorrected": moffw_unc,
+            "contour_corrected": contour_corr,
+            "contour_uncorrected": contour_unc,
             "psf_tt_mode": self.psf_tt_mode,
             "n_frames_requested": int(n_frames),
             "n_frames_done": int(n_done),

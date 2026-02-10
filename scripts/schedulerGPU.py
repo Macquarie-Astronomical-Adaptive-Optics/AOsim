@@ -1176,6 +1176,18 @@ class SimWorker(QObject):
                 "fwhm_arcsec_uncorrected_moffat": float(res.get("fwhm_rad_uncorrected_moffat", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_corrected_moffat_wings": float(res.get("fwhm_rad_corrected_moffat_wings", 0.0)) * (180.0 * 3600.0) / math.pi,
                 "fwhm_arcsec_uncorrected_moffat_wings": float(res.get("fwhm_rad_uncorrected_moffat_wings", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_rad_corrected_contour": float(res.get("fwhm_rad_corrected_contour", float("nan"))),
+                "fwhm_rad_uncorrected_contour": float(res.get("fwhm_rad_uncorrected_contour", float("nan"))),
+                "fwhm_arcsec_corrected_contour": float(res.get("fwhm_rad_corrected_contour", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_uncorrected_contour": float(res.get("fwhm_rad_uncorrected_contour", 0.0)) * (180.0 * 3600.0) / math.pi,
+                "fwhm_arcsec_corrected_contour_major": float(res.get("fwhm_arcsec_corrected_contour_major", float("nan"))),
+                "fwhm_arcsec_corrected_contour_minor": float(res.get("fwhm_arcsec_corrected_contour_minor", float("nan"))),
+                "fwhm_arcsec_uncorrected_contour_major": float(res.get("fwhm_arcsec_uncorrected_contour_major", float("nan"))),
+                "fwhm_arcsec_uncorrected_contour_minor": float(res.get("fwhm_arcsec_uncorrected_contour_minor", float("nan"))),
+                "fwhm_contour_corrected_ratio": float(res.get("fwhm_contour_corrected_ratio", float("nan"))),
+                "fwhm_contour_uncorrected_ratio": float(res.get("fwhm_contour_uncorrected_ratio", float("nan"))),
+                "fwhm_contour_corrected_theta_deg": float(res.get("fwhm_contour_corrected_theta_deg", float("nan"))),
+                "fwhm_contour_uncorrected_theta_deg": float(res.get("fwhm_contour_uncorrected_theta_deg", float("nan"))),
                 "plate_rad_per_pix": float(res.get("plate_rad_per_pix", 0.0) or 0.0),
                 # Fit metadata for overlays (native PSF pixels)
                 "gauss_corrected": res.get("gauss_corrected"),
@@ -1184,6 +1196,8 @@ class SimWorker(QObject):
                 "moffat_uncorrected": res.get("moffat_uncorrected"),
                 "moffat_wings_corrected": res.get("moffat_wings_corrected"),
                 "moffat_wings_uncorrected": res.get("moffat_wings_uncorrected"),
+                "contour_corrected": res.get("contour_corrected"),
+                "contour_uncorrected": res.get("contour_uncorrected"),
             }
 
             # Off-axis evaluation (optional)
