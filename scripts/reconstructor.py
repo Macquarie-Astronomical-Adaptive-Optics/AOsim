@@ -1,7 +1,7 @@
 import math
 import cupy as cp
 import cupyx.scipy.ndimage as cndi
-from typing import Sequence
+from typing import Sequence, Optional
 from scripts.utilities import params, Pupil_tools
 
 
@@ -19,13 +19,30 @@ class TipTiltReconstructor_CuPy:
     - Provides an in-place TT stripping helper for LGS slopes (used before HO recon).
     """
 
-    def __init__(self, sensors, wfs_is_lgs, wfs_wavelengths, weight_mode: str = "pupil"):
+    def __init__(
+        self,
+        sensors,
+        wfs_is_lgs,
+        wfs_wavelengths,
+        weight_mode: str = "pupil",
+        sensor_method: Optional[str] = None,
+        pad: int = 4,
+        auto_calibrate: bool = True,
+        calib_slope_amp: float = 1e-3,
+    ):
         self.sensors = sensors
         self.wfs_is_lgs = list(wfs_is_lgs) if wfs_is_lgs is not None else None
         self.wfs_wavelengths = list(wfs_wavelengths) if wfs_wavelengths is not None else None
         self.weight_mode = str(weight_mode).lower().strip()
-        self.w_norm = []  # list of (n_active,) vectors (sum=1)
+        self.sensor_method = (str(sensor_method).lower().strip() if sensor_method is not None else None)
+        self.pad = int(pad)
+        self.calib_slope_amp = float(calib_slope_amp)
+
+        self.w_norm = []          # list of (n_active,) vectors (sum=1)
+        self.k500_yx = []         # list of (2,) gains: measured_mean_500nm / commanded_slope (per axis)
         self._build_weights()
+        if auto_calibrate and (self.sensor_method is not None):
+            self._calibrate_k500_yx()
 
     def _build_weights(self):
         self.w_norm = []
@@ -65,6 +82,94 @@ class TipTiltReconstructor_CuPy:
             w = w / cp.maximum(ssum, cp.float32(1e-12))
             self.w_norm.append(w.astype(cp.float32, copy=False))
 
+        # default unity gain (safe fallback)
+        self.k500_yx = [cp.ones((2,), dtype=cp.float32) for _ in range(len(self.w_norm))]
+
+
+    def _calibrate_k500_yx(self):
+        """Calibrate per-WFS conversion from measured mean slopes to phase-ramp slope (500nm-ref units).
+
+        Why: the FFT (centroid) path returns slopes in *centroid-bin* units, not rad/pixel phase gradients.
+        A dedicated TT corrector applies a *pupil-plane phase ramp* (rad/pixel), so we need a consistent
+        mapping from the WFS output to that ramp slope.
+
+        Approach: inject a small known phase ramp (in 500nm-ref radians) and measure the resulting
+        weighted-mean slopes. Convert the measured mean back to 500nm-ref units via (wl/500nm).
+        The resulting gain k500_yx satisfies:
+            mean_slopes_500nm ≈ k500_yx * slope_amp
+        so that slope_amp_est ≈ mean_slopes_500nm / k500_yx.
+        """
+        if not self.sensors:
+            return
+
+        # Temporarily disable stochastic noise during calibration.
+        p0 = params.get("wfs_photons_per_subap", 0)
+        r0 = params.get("wfs_read_noise_e", 0.0)
+        try:
+            params["wfs_photons_per_subap"] = 0
+            params["wfs_read_noise_e"] = 0.0
+
+            for wi, s in enumerate(self.sensors):
+                try:
+                    M = int(getattr(s, "grid_size", 0) or 0)
+                    if M <= 1:
+                        continue
+
+                    yy, xx = cp.indices((M, M), dtype=cp.float32)
+                    yy = yy - cp.float32((M - 1) * 0.5)
+                    xx = xx - cp.float32((M - 1) * 0.5)
+
+                    amp = cp.float32(self.calib_slope_amp)
+                    # y-ramp then x-ramp
+                    ramps = [amp * yy, amp * xx]
+                    k_yx = cp.ones((2,), dtype=cp.float32)
+
+                    for ax in (0, 1):
+                        ph = ramps[ax]
+                        # try to apply the pupil mask if available to reduce edge effects
+                        try:
+                            pup = cp.asarray(getattr(s, "pupil", None), dtype=cp.float32)
+                            if pup is not None and pup.shape == ph.shape:
+                                ph = ph * pup
+                        except Exception:
+                            pass
+
+                        # measure
+                        _, sl, _ = s.measure(
+                            phase_map=ph[None, :, :],
+                            return_image=False,
+                            pad=int(self.pad),
+                            method=str(self.sensor_method),
+                            assume_radians=True,
+                        )
+                        sl = cp.asarray(sl, dtype=cp.float32)
+                        if sl.ndim == 2:
+                            sl = sl[None, :, :]
+
+                        mu_meas = self._weighted_mean_yx(sl[0], wi)  # [sy,sx] in *measured* units
+                        # convert to 500nm-ref units (undo per-WFS wavelength scaling)
+                        try:
+                            wl = cp.float32(self.wfs_wavelengths[wi])
+                            mu_500 = mu_meas * (wl / cp.float32(500e-9))
+                        except Exception:
+                            mu_500 = mu_meas
+
+                        val = mu_500[ax] / cp.maximum(amp, cp.float32(1e-20))
+                        # Guard against pathological values.
+                        if not cp.isfinite(val):
+                            val = cp.float32(1.0)
+                        if cp.abs(val) < cp.float32(1e-6):
+                            val = cp.float32(1.0)
+                        k_yx[ax] = val
+
+                    self.k500_yx[wi] = k_yx.astype(cp.float32, copy=False)
+                except Exception:
+                    # keep unity gain on failures
+                    continue
+        finally:
+            params["wfs_photons_per_subap"] = p0
+            params["wfs_read_noise_e"] = r0
+
     def _weighted_mean_yx(self, slopes_yx: cp.ndarray, wi: int) -> cp.ndarray:
         """Return weighted mean (sy,sx) for one WFS slopes array."""
         s = cp.asarray(slopes_yx, dtype=cp.float32)
@@ -99,7 +204,12 @@ class TipTiltReconstructor_CuPy:
         for wi in ngs_idx:
             mu = self._weighted_mean_yx(sl[wi], wi)
             wl = cp.float32(self.wfs_wavelengths[wi])
-            acc += mu * (wl / cp.float32(500e-9))
+            mu_500 = mu * (wl / cp.float32(500e-9))
+            # convert measured mean -> phase-ramp slope (rad/pixel @500nm ref)
+            if wi < len(self.k500_yx):
+                k = self.k500_yx[wi]
+                mu_500 = mu_500 / cp.maximum(k, cp.float32(1e-20))
+            acc += mu_500
         return acc / cp.float32(len(ngs_idx))
 
     def strip_tt_inplace(self, slopes_err_stack: cp.ndarray, wfs_indices: Sequence[int]):

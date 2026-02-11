@@ -15,9 +15,10 @@
     "dm_delay_frames": 2,
     "tt_enabled": true,
     "tt_gain": 0.3,
-    "tt_leak": 1.0,
+    "tt_leak": 0.0,
     "tt_rate_hz": 250,
     "tt_delay_frames": 1,
+    "tt_measure_average": true,
     "wfs_photons_per_subap": 0,
     "wfs_read_noise_e": 0.0,
     "wfs_centroid_window_px": 0

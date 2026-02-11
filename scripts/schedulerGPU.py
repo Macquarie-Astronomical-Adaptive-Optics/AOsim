@@ -337,6 +337,9 @@ class SimWorker(QObject):
         self._tt_leak = float(params.get("tt_leak", 0.0))
         self._tt_rate_hz = float(params.get("tt_rate_hz", 0.0))
         self._tt_delay_frames = int(params.get("tt_delay_frames", 1))
+        # If TT runs slower than the main simulation tick, average the TT measurements over
+        # the integration period (closer to a real SH exposure). Default: enabled.
+        self._tt_measure_average = bool(params.get("tt_measure_average", True))
         self._tt_period_ticks = 1
         self._tt_tick_phase = 0
         self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)  # [sy, sx] command (500nm-ref units)
@@ -879,7 +882,14 @@ class SimWorker(QObject):
                     self._wfs_is_lgs = [s0.is_lgs for s0 in wfs_list]
                     self._wfs_wavelengths = [float(getattr(s0, "wavelength", 500e-9)) for s0 in wfs_list]
                     # Dedicated low-order (TT) reconstructor (separate from HO reconstructor)
-                    self._tt_recon = TipTiltReconstructor_CuPy(wfs_list, self._wfs_is_lgs, self._wfs_wavelengths, weight_mode=str(params.get("tt_weight_mode", "pupil")))
+                    self._tt_recon = TipTiltReconstructor_CuPy(
+                        wfs_list,
+                        self._wfs_is_lgs,
+                        self._wfs_wavelengths,
+                        weight_mode=str(params.get("tt_weight_mode", "pupil")),
+                        sensor_method=str(getattr(self, "sensor_method", "southwell")),
+                        pad=int(params.get("wfs_pad", 4) or 4),
+                    )
 
                     self.status_log.emit(f"Batched Southwell slopes enabled for {n_wfs} WFS ({n_active} active subaps each).")
                 else:
@@ -895,7 +905,14 @@ class SimWorker(QObject):
                 self._wfs_is_lgs = [s0.is_lgs for s0 in wfs_list]
                 self._wfs_wavelengths = [float(getattr(s0, "wavelength", 500e-9)) for s0 in wfs_list]
                 # Dedicated low-order (TT) reconstructor (separate from HO reconstructor)
-                self._tt_recon = TipTiltReconstructor_CuPy(wfs_list, self._wfs_is_lgs, self._wfs_wavelengths, weight_mode=str(params.get("tt_weight_mode", "pupil")))
+                self._tt_recon = TipTiltReconstructor_CuPy(
+                    wfs_list,
+                    self._wfs_is_lgs,
+                    self._wfs_wavelengths,
+                    weight_mode=str(params.get("tt_weight_mode", "pupil")),
+                    sensor_method=str(getattr(self, "sensor_method", "southwell")),
+                    pad=int(params.get("wfs_pad", 4) or 4),
+                )
 
                 self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
                 lens = [2 * n for n in self._wfs_n_active]
@@ -2007,6 +2024,8 @@ class SimWorker(QObject):
                 cp.subtract(slopes_stack, self._slopes_ref_stack, out=self._slopes_err_stack)
 
                 # --- TT measurement from NGS WFS (before we zero NGS for DM solve) ---
+                # NOTE: if TT runs slower than the main loop, we optionally average measurements across
+                # the TT integration period (closer to a real WFS exposure).
                 tt_meas_yx = None
                 if getattr(self, "_tt_enabled", False):
                     # Dedicated low-order reconstructor (NGS-only) for TT
@@ -2040,7 +2059,22 @@ class SimWorker(QObject):
 
                 # --- TT controller update (runs at its own rate) ---
                 if (tt_meas_yx is not None) and (getattr(self, "_tt_enabled", False)):
+                    # accumulate/average TT measurements across the TT period if enabled
+                    if getattr(self, "_tt_meas_acc", None) is None:
+                        self._tt_meas_acc = cp.zeros((2,), dtype=cp.float32)
+                        self._tt_meas_count = 0
+
+                    if bool(getattr(self, "_tt_measure_average", True)) and int(getattr(self, "_tt_period_ticks", 1)) > 1:
+                        self._tt_meas_acc = self._tt_meas_acc + tt_meas_yx
+                        self._tt_meas_count = int(getattr(self, "_tt_meas_count", 0)) + 1
+
                     if (tc % int(getattr(self, "_tt_period_ticks", 1))) == 0:
+                        if bool(getattr(self, "_tt_measure_average", True)) and int(getattr(self, "_tt_period_ticks", 1)) > 1:
+                            cnt = max(1, int(getattr(self, "_tt_meas_count", 0)))
+                            tt_meas_yx = self._tt_meas_acc / cp.float32(cnt)
+                            # reset accumulator for next TT exposure
+                            self._tt_meas_acc = cp.zeros((2,), dtype=cp.float32)
+                            self._tt_meas_count = 0
                         # Guard against non-finite WFS outputs to avoid poisoning the sim.
                         try:
                             if not bool(cp.all(cp.isfinite(tt_meas_yx)).get()):
@@ -2095,11 +2129,35 @@ class SimWorker(QObject):
                         sx = self._slopes_err_vec[a : a + na]
                         sy = self._slopes_err_vec[a + na : a + 2 * na]
                         wl = cp.float32(self._wfs_wavelengths[wi])
-                        acc[0] += sy.mean() * (wl / cp.float32(500e-9))  # sy
-                        acc[1] += sx.mean() * (wl / cp.float32(500e-9))  # sx
+                        mu_y = sy.mean() * (wl / cp.float32(500e-9))  # sy (500nm-ref)
+                        mu_x = sx.mean() * (wl / cp.float32(500e-9))  # sx (500nm-ref)
+                        # If available, convert centroid-bin units -> phase-ramp slope via TT calibration.
+                        try:
+                            if getattr(self, "_tt_recon", None) is not None and wi < len(self._tt_recon.k500_yx):
+                                k = self._tt_recon.k500_yx[wi]
+                                mu_y = mu_y / cp.maximum(k[0], cp.float32(1e-20))
+                                mu_x = mu_x / cp.maximum(k[1], cp.float32(1e-20))
+                        except Exception:
+                            pass
+                        acc[0] += mu_y
+                        acc[1] += mu_x
                         n_tt += 1
                     tt_meas_yx = acc / cp.float32(max(1, n_tt))
+                    # accumulate/average TT measurements across the TT period if enabled
+                    if getattr(self, "_tt_meas_acc", None) is None:
+                        self._tt_meas_acc = cp.zeros((2,), dtype=cp.float32)
+                        self._tt_meas_count = 0
+
+                    if bool(getattr(self, "_tt_measure_average", True)) and int(getattr(self, "_tt_period_ticks", 1)) > 1:
+                        self._tt_meas_acc = self._tt_meas_acc + tt_meas_yx
+                        self._tt_meas_count = int(getattr(self, "_tt_meas_count", 0)) + 1
+
                     if (tc % int(getattr(self, "_tt_period_ticks", 1))) == 0:
+                        if bool(getattr(self, "_tt_measure_average", True)) and int(getattr(self, "_tt_period_ticks", 1)) > 1:
+                            cnt = max(1, int(getattr(self, "_tt_meas_count", 0)))
+                            tt_meas_yx = self._tt_meas_acc / cp.float32(cnt)
+                            self._tt_meas_acc = cp.zeros((2,), dtype=cp.float32)
+                            self._tt_meas_count = 0
                         try:
                             if not bool(cp.all(cp.isfinite(tt_meas_yx)).get()):
                                 tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
