@@ -136,7 +136,20 @@ class SensorTabWidget(QWidget):
 
         # Left: config + busy + table
         left_v = QVBoxLayout()
-        config_keys = ["sub_apertures","wfs_lambda","dx","dy","gs_range_m","lgs_launch_offset_px","lgs_thickness_m","lenslet_f_m","pixel_pitch_m"]
+        config_keys = [
+            "sub_apertures",
+            "wfs_lambda",
+            "dx",
+            "dy",
+            "gs_range_m",
+            "lgs_launch_offset_px",
+            "lgs_thickness_m",
+            "lenslet_f_m",
+            "pixel_pitch_m",
+            "wfs_photons_per_subap",
+            "wfs_read_noise_e",
+            "wfs_centroid_window_px",
+        ]
         self.config_table = Config_table(config_keys, self.params)
         left_v.addWidget(self.config_table)
 

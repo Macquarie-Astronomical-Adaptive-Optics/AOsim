@@ -36,6 +36,7 @@ _XY_CACHE = {}          # (device, grid_size, dtype) -> (y_col, x_row)
 _PUPIL_CACHE = {}       # (device, grid_size, obsc, dtype) -> pupil
 _SCIENCE_I0PEAK = {}    # (device, grid_size, obsc, pad, science_lambda, dtype) -> float
 _SUBAP_GEOM_CACHE = {}  # (device, n_sub, grid_size, obsc) -> dict geometry (for SH)
+_CENTROID_WIN_CACHE = {}  # (device, h_p, w_p, win_px, dtype) -> window mask (fftshifted coords)
 
 def _device_id():
     try:
@@ -65,6 +66,47 @@ def _get_xy(grid_size: int, dtype=cp.float32):
         out = (y, x)
         _XY_CACHE[key] = out
     return out
+
+
+def _get_centroid_window_mask(h_p: int, w_p: int, win_px: int, dtype=cp.float32):
+    """Return a 2D square centroid window mask in *fftshifted* pixel coordinates.
+
+    The returned mask is centered on (0,0) after fftshift, i.e. its center pixel is
+    at (h_p//2, w_p//2). It is intended to be applied to `cp.fft.fftshift(I)`.
+    """
+    win_px = int(win_px)
+    if win_px <= 0:
+        return None
+    win_px = int(min(win_px, h_p, w_p))
+    key = (_device_id(), int(h_p), int(w_p), int(win_px), dtype)
+    m = _CENTROID_WIN_CACHE.get(key)
+    if m is None:
+        hy = h_p // 2
+        hx = w_p // 2
+        y = cp.arange(h_p, dtype=cp.int32) - hy
+        x = cp.arange(w_p, dtype=cp.int32) - hx
+        # Define a symmetric square window of size win_px (approx; even sizes include both sides).
+        half = win_px // 2
+        m2d = (cp.abs(y)[:, None] <= half) & (cp.abs(x)[None, :] <= half)
+        m = m2d.astype(dtype)
+        _CENTROID_WIN_CACHE[key] = m
+    return m
+
+
+def _is_lgs_range(gs_range_m: object, lgs_max_range_m: float = 1.0e7) -> bool:
+    """Heuristic LGS/NGS classifier.
+
+    We classify as LGS if the range is finite and <= lgs_max_range_m (~10,000 km).
+    This keeps typical sodium LGS (90 km) as LGS while allowing configurations that
+    represent NGS range as a huge finite number.
+    """
+    try:
+        r = float(gs_range_m)
+    except Exception:
+        return False
+    if not math.isfinite(r):
+        return False
+    return r <= float(lgs_max_range_m)
 
 # -----------------------------
 # Phase screen / phase maps
@@ -1174,6 +1216,7 @@ class WFSensor_tools:
 
             # LGS 
             self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            self.is_lgs = not (self.gs_range_m == float("inf"))
             self.lgs_thickness_m = float(lgs_thickness_m) if lgs_thickness_m is not None else 0.0
             self.lgs_remove_tt = bool(lgs_remove_tt)
             if lgs_launch_offset_px is None:
@@ -1458,10 +1501,10 @@ class WFSensor_tools:
             ker = cp.asarray(arr, dtype=cp.float32)
             self._lgs_kernel_cache[key] = ker
             return ker
-        
+
         def _ensure_lgs_elong_plan(self):
             # Quick reject
-            if (not math.isfinite(float(self.gs_range_m))) or float(self.lgs_thickness_m) <= 0.0:
+            if (not _is_lgs_range(getattr(self, "gs_range_m", float("inf")))) or float(self.lgs_thickness_m) <= 0.0:
                 self._lgs_elong_plan = None
                 self._lgs_elong_plan_key = None
                 return
@@ -1809,6 +1852,77 @@ class WFSensor_tools:
             method = str(method).lower().strip()
 
             if method in ("southwell", "southwell_fast"):
+                def _apply_southwell_sensor_noise(slopes_in: cp.ndarray) -> cp.ndarray:
+                    """Approximate WFS photon/read noise for the Southwell (phase-difference) slope model.
+
+                    Southwell does not form an intensity image, so we cannot apply Poisson/read noise on pixels
+                    directly. Instead we add an *equivalent* Gaussian noise to the measured slopes.
+
+                    The scaling uses the same config keys as the FFT centroiding path:
+                      - wfs_photons_per_subap
+                      - wfs_read_noise_e
+                      - wfs_centroid_window_px (used only to size the read-noise moment window)
+
+                    If wfs_photons_per_subap <= 0, noise injection is disabled for Southwell (no photon budget).
+                    """
+                    try:
+                        photons_per_subap = float(params.get("wfs_photons_per_subap", 0) or 0)
+                    except Exception:
+                        photons_per_subap = 0.0
+                    if photons_per_subap <= 0:
+                        return slopes_in
+
+                    try:
+                        read_noise_e = float(params.get("wfs_read_noise_e", 0.0) or 0.0)
+                    except Exception:
+                        read_noise_e = 0.0
+                    try:
+                        win_px = int(params.get("wfs_centroid_window_px", 0) or 0)
+                    except Exception:
+                        win_px = 0
+
+                    # FFT size used by the full SH model (also sets the tilt->centroid scaling in bins)
+                    h_loc = int(self.h)
+                    w_loc = int(self.w)
+                    h_p_loc = int(h_loc + 2 * int(pad))
+                    w_p_loc = int(w_loc + 2 * int(pad))
+                    N_loc = float(max(h_p_loc, w_p_loc))
+
+                    # Estimate focal-plane spot RMS (in "centroid bins") from the diffraction-limited scaling:
+                    # spot width ~ N / D_subap. Here D_subap ~ h_loc (pupil pixels).
+                    # This is a lightweight approximation intended for fast Southwell runs.
+                    D_eff = max(1.0, float(min(h_loc, w_loc)))
+                    sigma_spot = max(0.5, 0.30 * (N_loc / D_eff))
+
+                    # Photon term: Var(centroid) ≈ sigma_spot^2 / Nph
+                    var_c = (sigma_spot * sigma_spot) / max(photons_per_subap, 1.0)
+
+                    # Read-noise term (CoM approximation): Var(centroid) scales like
+                    # (sigma_r^2 / Nph^2) * Sum(x^2) over the moment window.
+                    if read_noise_e > 0.0:
+                        W = int(win_px) if (win_px and win_px > 0) else int(max(h_p_loc, w_p_loc))
+                        # Sum(x^2) for a square window: N_pix * rms_coord^2
+                        N_pix = float(W * W)
+                        rms_coord = float(W) / math.sqrt(12.0)
+                        var_c += (read_noise_e * read_noise_e) * N_pix * (rms_coord * rms_coord) / (
+                            max(photons_per_subap, 1.0) ** 2
+                        )
+
+                    sigma_c = math.sqrt(max(0.0, var_c))
+
+                    # Convert centroid-bin noise to phase-slope noise (rad per pupil pixel).
+                    # For a DFT of size N, a phase ramp slope (rad/pix) produces a centroid shift of
+                    # approximately slope * N / (2π). => slope_noise ≈ (2π/N) * centroid_noise.
+                    sigma_slope = (2.0 * math.pi / max(N_loc, 1.0)) * sigma_c
+                    if sigma_slope <= 0.0:
+                        return slopes_in
+
+                    return slopes_in + cp.random.normal(
+                        loc=0.0,
+                        scale=sigma_slope,
+                        size=slopes_in.shape,
+                    ).astype(cp.float32, copy=False)
+
                 # weighted mean phase at each active lenslet center
                 wsum_inv = getattr(self, "_southwell_wsum_inv", None)
                 if wsum_inv is None:
@@ -1875,6 +1989,14 @@ class WFSensor_tools:
                                                cp.where(only_u, (phi_cur - phi_u) * invp, cp.float32(0.0))))
 
                     slopes = cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
+
+                    # Match FFT path behaviour for LGS: remove global TT if requested.
+                    if _is_lgs_range(getattr(self, "gs_range_m", float("inf"))) and bool(self.lgs_remove_tt):
+                        slopes = slopes - cp.mean(slopes, axis=1, keepdims=True)
+
+                    # Optional approximate sensor noise for Southwell slopes.
+                    slopes = _apply_southwell_sensor_noise(slopes)
+
                     centroids = cp.zeros_like(slopes)
                     return centroids, slopes, None
 
@@ -1928,6 +2050,13 @@ class WFSensor_tools:
                 sx_act = sx[:, rr, cc]
                 slopes = cp.stack([sy_act, sx_act], axis=-1)  # (n_map,n_active,2)
 
+                # Match FFT path behaviour for LGS: remove global TT if requested.
+                if _is_lgs_range(getattr(self, "gs_range_m", float("inf"))) and bool(self.lgs_remove_tt):
+                    slopes = slopes - cp.mean(slopes, axis=1, keepdims=True)
+
+                # Optional approximate sensor noise for Southwell slopes.
+                slopes = _apply_southwell_sensor_noise(slopes)
+
                 centroids = cp.zeros_like(slopes)
                 return centroids, slopes, None
 
@@ -1945,7 +2074,7 @@ class WFSensor_tools:
 
 
             # --- LGS elongation here ---
-            if math.isfinite(self.gs_range_m) and self.lgs_thickness_m > 0.0:
+            if _is_lgs_range(getattr(self, "gs_range_m", float("inf"))) and self.lgs_thickness_m > 0.0:
                 self._ensure_lgs_elong_plan()
                 plan = getattr(self, "_lgs_elong_plan", None)
                 if plan:
@@ -1964,18 +2093,66 @@ class WFSensor_tools:
                     slopes    = slopes[:, inv, :]
 
 
-            # moments without normalizing I
-            yrel, xrel = self._ensure_freq_coords(h_p, w_p)
+            # --- optional WFS noise + centroid windowing ---
+            # Photon noise model: if wfs_photons_per_subap>0, intensity in each subap is normalized
+            # to that photon budget and a Poisson draw is applied.
+            try:
+                photons_per_subap = float(params.get("wfs_photons_per_subap", 0) or 0)
+            except Exception:
+                photons_per_subap = 0.0
+            try:
+                read_noise_e = float(params.get("wfs_read_noise_e", 0.0) or 0.0)
+            except Exception:
+                read_noise_e = 0.0
+            try:
+                win_px = int(params.get("wfs_centroid_window_px", 0) or 0)
+            except Exception:
+                win_px = 0
 
-            # reduce then multiply
-            Ix = I.sum(axis=-2)                           # (n_map, n_sub, w_p)
-            denom = Ix.sum(axis=-1)                       # (n_map, n_sub)
-            denom = cp.maximum(denom, cp.float32(1e-20))  # avoid 0
+            I_mom = I
+            if (photons_per_subap > 0) or (read_noise_e > 0):
+                if photons_per_subap > 0:
+                    # Normalize each subap to a fixed photon budget
+                    sumI = cp.sum(I_mom, axis=(-2, -1), keepdims=True)
+                    sumI = cp.maximum(sumI, cp.float32(1e-20))
+                    I_norm = I_mom / sumI
+                    lam = I_norm * cp.float32(photons_per_subap)
+                    I_mom = cp.random.poisson(lam).astype(cp.float32, copy=False)
+                # Add Gaussian read noise (in electrons) in the same "count" units
+                if read_noise_e > 0:
+                    I_mom = I_mom + cp.random.normal(
+                        loc=0.0,
+                        scale=read_noise_e,
+                        size=I_mom.shape,
+                    ).astype(cp.float32, copy=False)
+                    I_mom = cp.maximum(I_mom, cp.float32(0.0))
 
-            num_x = (Ix * xrel[None, None, :]).sum(axis=-1)
+            # moments without normalizing I (optionally windowed)
+            if win_px and win_px > 0:
+                I_shift = cp.fft.fftshift(I_mom, axes=(-2, -1))
+                mwin = _get_centroid_window_mask(h_p, w_p, win_px, dtype=cp.float32)
+                if mwin is not None:
+                    I_shift = I_shift * mwin[None, None, :, :]
 
-            Iy = I.sum(axis=-1)                           # (n_map, n_sub, h_p)
-            num_y = (Iy * yrel[None, None, :]).sum(axis=-1)
+                ypix = (cp.arange(h_p, dtype=cp.float32) - cp.float32(h_p // 2))
+                xpix = (cp.arange(w_p, dtype=cp.float32) - cp.float32(w_p // 2))
+
+                Ix = I_shift.sum(axis=-2)                         # (n_map,n_sub,w_p)
+                denom = Ix.sum(axis=-1)                           # (n_map,n_sub)
+                denom = cp.maximum(denom, cp.float32(1e-20))
+                num_x = (Ix * xpix[None, None, :]).sum(axis=-1)
+
+                Iy = I_shift.sum(axis=-1)                         # (n_map,n_sub,h_p)
+                num_y = (Iy * ypix[None, None, :]).sum(axis=-1)
+            else:
+                yrel, xrel = self._ensure_freq_coords(h_p, w_p)
+                Ix = I_mom.sum(axis=-2)                           # (n_map,n_sub,w_p)
+                denom = Ix.sum(axis=-1)                           # (n_map,n_sub)
+                denom = cp.maximum(denom, cp.float32(1e-20))
+                num_x = (Ix * xrel[None, None, :]).sum(axis=-1)
+
+                Iy = I_mom.sum(axis=-1)                           # (n_map,n_sub,h_p)
+                num_y = (Iy * yrel[None, None, :]).sum(axis=-1)
 
             cx_rel = num_x / denom
             cy_rel = num_y / denom
@@ -1988,13 +2165,15 @@ class WFSensor_tools:
 
             slopes = cp.stack((cy_rel, cx_rel), axis=-1)
 
-            if math.isfinite(float(self.gs_range_m)) and bool(self.lgs_remove_tt):
+            if _is_lgs_range(getattr(self, "gs_range_m", float("inf"))) and bool(self.lgs_remove_tt):
                 slopes = slopes - cp.mean(slopes, axis=1, keepdims=True)
 
             sensor_image = None
             if return_image:
                 # normalize only for display
-                I_norm = I / denom[:, :, None, None]
+                den_disp = cp.sum(I_mom, axis=(-2, -1), keepdims=True)
+                den_disp = cp.maximum(den_disp, cp.float32(1e-20))
+                I_norm = I_mom / den_disp
                 I_norm = cp.fft.fftshift(I_norm, axes=(-2, -1))
                 I_norm = I_norm[:, :, pad:-pad -1, pad:-pad -1]
 
@@ -2368,21 +2547,37 @@ class Gaussian2DFitter:
         """
         H, W = img.shape
 
+        # Ignore NaNs/Infs when searching for the brightest pixel.
+        img2 = cp.where(cp.isfinite(img), img, cp.asarray(-cp.inf, dtype=img.dtype))
+
+        # If we don't have a valid prior estimate, use global argmax.
         if self.xc is None or self.yc is None:
-            idx = int(cp.argmax(img).get())
+            idx = int(cp.argmax(img2).get())
             yc = idx // W
             xc = idx %  W
             return xc, yc
 
-        xc0, yc0 = self.xc, self.yc
+        # Prior center might become NaN if a previous fit failed; reset in that case.
+        try:
+            xc0 = float(self.xc)
+            yc0 = float(self.yc)
+            if (not math.isfinite(xc0)) or (not math.isfinite(yc0)):
+                raise ValueError("non-finite prior")
+        except Exception:
+            self.xc = None
+            self.yc = None
+            idx = int(cp.argmax(img2).get())
+            yc = idx // W
+            xc = idx % W
+            return xc, yc
         r = int(search_r)
 
         x1 = max(0, int(round(xc0 - r))); x2 = min(W, int(round(xc0 + r + 1)))
         y1 = max(0, int(round(yc0 - r))); y2 = min(H, int(round(yc0 + r + 1)))
 
-        patch = img[y1:y2, x1:x2]
+        patch = img2[y1:y2, x1:x2]
         if patch.size == 0:
-            idx = int(cp.argmax(img).get())
+            idx = int(cp.argmax(img2).get())
             yc = idx // W
             xc = idx %  W
             return xc, yc
@@ -2439,11 +2634,29 @@ class Gaussian2DFitter:
 
         # 4) fit
         p = self.fit_roi(roi, p0=p0, loss=loss, max_iter=max_iter)
+
+        # If the fit diverged (NaNs/Infs), fall back to a moment-based init instead
+        # of poisoning the tracker state.
+        try:
+            p_host = cp.asnumpy(p)
+            if not np.all(np.isfinite(p_host)):
+                raise ValueError("non-finite fit")
+        except Exception:
+            p = self.init_from_roi(roi)
+
         self.p_prev = p
 
-        # 5) update global center for next frame
-        self.xc = x0 + float(p[1].get())  # p[1]=x0 (ROI coords)
-        self.yc = y0 + float(p[2].get())  # p[2]=y0 (ROI coords)
+        # 5) update global center for next frame (guard against NaNs)
+        try:
+            xc_new = x0 + float(p[1].get())  # p[1]=x (ROI coords)
+            yc_new = y0 + float(p[2].get())  # p[2]=y (ROI coords)
+            if (not math.isfinite(xc_new)) or (not math.isfinite(yc_new)):
+                raise ValueError("non-finite center")
+            self.xc = xc_new
+            self.yc = yc_new
+        except Exception:
+            self.xc = float(xc)
+            self.yc = float(yc)
 
         # 6) FWHM (area-equivalent), convert back to native pixels if zoom>1
         k = 2.354820045

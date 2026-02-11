@@ -37,7 +37,7 @@ CONFIG_DTYPES: Dict[str, type] = {
     "loop_leak": float,
     "dm_delay_frames": int,
 
-    # TT loop
+    # TT loop (new)
     "tt_enabled": bool,
     "tt_gain": float,
     "tt_leak": float,
@@ -55,7 +55,7 @@ CONFIG_DTYPES: Dict[str, type] = {
     "lenslet_f_m": float,
     "pixel_pitch_m": float,
 
-    # WFS noise / centroiding
+    # WFS noise / centroiding (new)
     "wfs_photons_per_subap": float,
     "wfs_read_noise_e": float,
     "wfs_background_photons_per_pix": float,

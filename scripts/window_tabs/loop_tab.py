@@ -95,7 +95,19 @@ class Loop_tab(QWidget):
         fwhm_toggle.checkStateChanged.connect(lambda x: self._loop_r0_only(fwhm_toggle.isChecked()))
 
         
-        self.config_table = Config_table(["loop_gain", "loop_leak", "dm_delay_frames"], self.params)
+        self.config_table = Config_table(
+            [
+                "loop_gain",
+                "loop_leak",
+                "dm_delay_frames",
+                "tt_enabled",
+                "tt_gain",
+                "tt_leak",
+                "tt_rate_hz",
+                "tt_delay_frames",
+            ],
+            self.params,
+        )
         self.config_table.params_changed.connect(self.update_loop_params)
         right.addWidget(self.config_table)
 
@@ -147,17 +159,52 @@ class Loop_tab(QWidget):
         self.scheduler._loop_gain = params.get("loop_gain")
         self.scheduler._loop_leak = params.get("loop_leak")
 
+
         # Optional: DM servo lag (integer frames). Keep default=1 if missing.
         try:
-            self.scheduler.set_dm_delay_frames(int(params.get("dm_delay_frames", 1)))
+            dm_delay_frames = int(params.get("dm_delay_frames", 1))
         except Exception:
-            self.scheduler.set_dm_delay_frames(1)
+            dm_delay_frames = 1
+        if hasattr(self.scheduler, "set_dm_delay_frames"):
+            self.scheduler.set_dm_delay_frames(dm_delay_frames)
+
+        # Separate tip-tilt controller (uses NGS WFS). Safe defaults if missing.
+        try:
+            tt_enabled = bool(params.get("tt_enabled", False))
+        except Exception:
+            tt_enabled = False
+        try:
+            tt_gain = float(params.get("tt_gain", 0.25))
+        except Exception:
+            tt_gain = 0.25
+        try:
+            tt_leak = float(params.get("tt_leak", 0.0))
+        except Exception:
+            tt_leak = 0.0
+        try:
+            tt_rate_hz = float(params.get("tt_rate_hz", 0.0))
+        except Exception:
+            tt_rate_hz = 0.0
+
+        try:
+            tt_delay_frames = int(params.get("tt_delay_frames", 0))
+        except Exception:
+            tt_delay_frames = 0
+
+        if hasattr(self.scheduler, "set_tt_controller"):
+            self.scheduler.set_tt_controller(tt_enabled, tt_gain, tt_leak, tt_rate_hz)
+        # Servo lag for TT loop (in simulation ticks)
+        if hasattr(self.scheduler, "set_tt_delay_frames"):
+            self.scheduler.set_tt_delay_frames(tt_delay_frames)
 
         print(
             "Updated loop parameters: "
             "\n  gain:", self.scheduler._loop_gain,
             "\n  leak:", self.scheduler._loop_leak,
             "\n  dm_delay_frames:", getattr(self.scheduler, "_dm_delay_frames", 1),
+            "\n  tt_enabled:", getattr(self.scheduler, "_tt_enabled", False),
+            "\n  tt_rate_hz:", getattr(self.scheduler, "_tt_rate_hz", 0.0),
+            "\n  tt_delay_frames:", getattr(self.scheduler, "_tt_delay_frames", 0),
         )
 
     @Slot(object, object, float, float, float, float, object)

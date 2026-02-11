@@ -1,18 +1,24 @@
 {
     "telescope_diameter": 8.2,
     "telescope_center_obscuration": 0.14,
-    "wfs_lambda": 500e-9,
-	"science_lambda": 2.150e-6,
-    "actuators": 35,  
-	"grid_size": 512,
-	"field_padding": 4,
-	"poke_amplitude": 1e-6,
-	"frame_rate": 500,
+    "wfs_lambda": 5e-07,
+    "science_lambda": 2.15e-06,
+    "actuators": 35,
+    "grid_size": 512,
+    "field_padding": 4,
+    "poke_amplitude": 1e-06,
+    "frame_rate": 500,
     "use_gpu": true,
     "data_path": "data/",
-    "loop_gain" : 0.25,
-    "loop_leak" : 0.01,
-
-    "dm_delay_frames": 2
-	
+    "loop_gain": 0.25,
+    "loop_leak": 0.01,
+    "dm_delay_frames": 2,
+    "tt_enabled": true,
+    "tt_gain": 0.3,
+    "tt_leak": 1.0,
+    "tt_rate_hz": 250,
+    "tt_delay_frames": 1,
+    "wfs_photons_per_subap": 0,
+    "wfs_read_noise_e": 0.0,
+    "wfs_centroid_window_px": 0
 }

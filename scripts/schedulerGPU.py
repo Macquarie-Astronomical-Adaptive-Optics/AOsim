@@ -7,13 +7,13 @@ import os
 import inspect
 import traceback
 import math
-from typing import Any, Dict, List, Optional
 from collections import deque
+from typing import Any, Dict, List, Optional
 
 import cupy as cp
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, Qt
 
-from scripts.reconstructor import TomoOnAxisIM_CuPy
+from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy
 from scripts.utilities import Pupil_tools, Analysis, Gaussian2DFitter, params
 from scripts.batch_runner import AOBatchRunner
 
@@ -129,6 +129,7 @@ class SimWorker(QObject):
     ):
         super().__init__(parent)
 
+
         # ---------------- DM servo lag (frame-delayed actuation) ----------------
         # dm_delay_frames = number of simulation frames between computing a DM command
         # and it becoming active. Default=1 matches the previous behaviour
@@ -139,6 +140,7 @@ class SimWorker(QObject):
             self._dm_delay_frames = 1
         self._dm_delay_frames = max(1, int(self._dm_delay_frames))
         self._dm_phi_pipeline = deque([None] * self._dm_delay_frames)
+
 
         self.sim_factory = sim_factory
         self.sim_kwargs = dict(sim_kwargs)
@@ -257,6 +259,7 @@ class SimWorker(QObject):
         self._slopes_total_len = 0           # total packed slope length
 
         self._wfs_is_lgs = None              # (n_wfs,) bool
+        self._wfs_wavelengths = None         # (n_wfs,) float
         self._m_f = None                     # float pupil mask cache
         self._m_sum = None
         self._sf_cache = None                # structure-function mask cache
@@ -318,10 +321,117 @@ class SimWorker(QObject):
         self.long_exposure_psf = None
         self.long_exposure_psf_uncorrected = None
 
+        # ------------------------------------------------------------
+        # Tip-tilt (TT) controller (separate from DM loop)
+        #
+        # Physically, this represents a fast-steering mirror (FSM) in the common path.
+        # In a pupil-plane phase screen model, an FSM is equivalent to adding a global
+        # phase ramp: phi_tt = (sy * y + sx * x) * pupil.
+        #
+        # Controller runs at `tt_rate_hz` (may be different from DM loop) and can have
+        # an additional discrete delay `tt_delay_frames` (in *simulation ticks*).
+        # TT measurements are formed from the mean slopes of the NGS WFS (infinite range).
+        # ------------------------------------------------------------
+        self._tt_enabled = bool(params.get("tt_enabled", False))
+        self._tt_gain = float(params.get("tt_gain", 0.25))
+        self._tt_leak = float(params.get("tt_leak", 0.0))
+        self._tt_rate_hz = float(params.get("tt_rate_hz", 0.0))
+        self._tt_delay_frames = int(params.get("tt_delay_frames", 1))
+        self._tt_period_ticks = 1
+        self._tt_tick_phase = 0
+        self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)  # [sy, sx] command (500nm-ref units)
+        # Centered coord grids for phase ramp
+        yy0, xx0 = cp.indices((self.patch_M, self.patch_M), dtype=cp.float32)
+        self._tt_xx = xx0 - (self.patch_M - 1) * 0.5
+        self._tt_yy = yy0 - (self.patch_M - 1) * 0.5
+        self._tt_phi_cmd = cp.zeros((self.patch_M, self.patch_M), dtype=cp.float32)
+        self._tt_phi = cp.zeros((self.patch_M, self.patch_M), dtype=cp.float32)  # active TT phase (after delay)
+        self._tt_delay_line = deque()
+        self._rebuild_tt_delay_line()
+
     # ------------------ helpers ------------------
     def _hz_to_period(self, hz: int) -> int:
         hz = max(1, int(hz))
         return max(1, int(round(self.fps_cap / hz)))
+
+    def _update_tt_period_ticks(self):
+        """Compute TT update period in simulation ticks from tt_rate_hz."""
+        if self._tt_rate_hz is None or float(self._tt_rate_hz) <= 0.0:
+            self._tt_period_ticks = 1
+            return
+        dt = float(max(getattr(self, "dt_s", 0.0), 1e-12))
+        period_s = 1.0 / float(self._tt_rate_hz)
+        self._tt_period_ticks = max(1, int(round(period_s / dt)))
+
+    def _rebuild_tt_delay_line(self):
+        """(Re)create the TT delay line.
+
+        Convention: tt_delay_frames = 1 means *one* simulation tick of delay
+        (command computed at tick t becomes active at tick t+1).
+        """
+        try:
+            d = int(self._tt_delay_frames)
+        except Exception:
+            d = 1
+        # See note above: queue length is (d-1) because we update at end of tick.
+        qlen = max(0, d - 1)
+        self._tt_delay_line = deque([cp.zeros_like(self._tt_phi_cmd) for _ in range(qlen)])
+        # active phase (what is applied in the next tick) starts at zero
+        self._tt_phi.fill(0.0)
+        self._update_tt_period_ticks()
+
+    def _tt_cmd_to_phase(self, cmd_yx: cp.ndarray) -> cp.ndarray:
+        """Convert [sy,sx] command (500nm-ref slope units) to a pupil-masked phase ramp."""
+        cmd_yx = cp.asarray(cmd_yx, dtype=cp.float32).reshape(2,)
+        phi = (cmd_yx[0] * self._tt_yy + cmd_yx[1] * self._tt_xx)
+        # Apply pupil mask + remove piston over the pupil
+        m, m_f, m_sum = self._ensure_pupil_float_cache(self.patch_M)
+        phi = phi * m_f
+        mu = cp.sum(phi) / cp.maximum(m_sum, cp.float32(1e-20))
+        return (phi - mu) * m_f
+
+    # ------------------ public TT controls (called by Loop tab) ------------------
+    def set_tt_controller(self, enabled: bool, gain: float, leak: float, rate_hz: float):
+        """Enable/configure the separate NGS tip-tilt controller."""
+        self._tt_enabled = bool(enabled)
+        try:
+            self._tt_gain = float(gain)
+        except Exception:
+            pass
+        try:
+            self._tt_leak = float(leak)
+        except Exception:
+            pass
+        try:
+            self._tt_rate_hz = float(rate_hz)
+        except Exception:
+            pass
+
+        # Recompute period in ticks (doesn't disturb controller state)
+        self._update_tt_period_ticks()
+
+        if not self._tt_enabled:
+            # Clear any residual TT correction
+            try:
+                self._tt_cmd_yx.fill(0.0)
+                self._tt_phi_cmd.fill(0.0)
+                self._tt_phi.fill(0.0)
+            except Exception:
+                pass
+
+    def set_tt_delay_frames(self, delay_frames: int):
+        """Set TT servo-lag (in simulation ticks)."""
+        try:
+            self._tt_delay_frames = int(delay_frames)
+        except Exception:
+            self._tt_delay_frames = 1
+        # Rebuild delay line using current command so we don't introduce a large step
+        try:
+            d = int(self._tt_delay_frames)
+        except Exception:
+            d = 1
+        qlen = max(0, d - 1)
+        self._tt_delay_line = deque([self._tt_phi_cmd.copy() for _ in range(qlen)])
 
     def _build_circular_pupil(self, M: int):
         y, x = cp.mgrid[0:M, 0:M]
@@ -367,9 +477,16 @@ class SimWorker(QObject):
         return out
 
     def _apply_dm_to_phases(self, phases_atm):
-        if (not self._loop_enabled) or (self._dm_phi is None):
+        """Apply active closed-loop corrections (DM + optional TT) to a sampled phase stack."""
+        if not self._loop_enabled:
             return phases_atm
-        return phases_atm.copy() - self._dm_phi
+
+        out = phases_atm
+        if self._dm_phi is not None:
+            out = out.copy() - self._dm_phi
+        if getattr(self, "_tt_enabled", False):
+            out = out.copy() - self._tt_phi
+        return out
 
     def _invalidate_frame_cache(self):
         self._frame_tick = -1
@@ -759,7 +876,11 @@ class SimWorker(QObject):
                     self._slopes_ref_stack = cp.zeros((n_wfs, n_active, 2), dtype=cp.float32)
                     self._slopes_err_stack = cp.empty_like(self._slopes_ref_stack)
                     self._slopes_sub_stack = cp.empty_like(self._slopes_ref_stack)
-                    self._wfs_is_lgs = [math.isfinite(float(getattr(s0, "gs_range_m", float("inf")))) for s0 in wfs_list]
+                    self._wfs_is_lgs = [s0.is_lgs for s0 in wfs_list]
+                    self._wfs_wavelengths = [float(getattr(s0, "wavelength", 500e-9)) for s0 in wfs_list]
+                    # Dedicated low-order (TT) reconstructor (separate from HO reconstructor)
+                    self._tt_recon = TipTiltReconstructor_CuPy(wfs_list, self._wfs_is_lgs, self._wfs_wavelengths, weight_mode=str(params.get("tt_weight_mode", "pupil")))
+
                     self.status_log.emit(f"Batched Southwell slopes enabled for {n_wfs} WFS ({n_active} active subaps each).")
                 else:
                     self.status_log.emit("Batched Southwell slopes disabled (WFS geometry mismatch).")
@@ -771,7 +892,11 @@ class SimWorker(QObject):
         if (sm in ("southwell", "southwell_fast")) and (len(self._sensor_list) > 1) and (not self._wfs_batch_enabled):
             try:
                 wfs_list = list(self._sensor_list[1:])
-                self._wfs_is_lgs = [math.isfinite(float(getattr(s0, "gs_range_m", float("inf")))) for s0 in wfs_list]
+                self._wfs_is_lgs = [s0.is_lgs for s0 in wfs_list]
+                self._wfs_wavelengths = [float(getattr(s0, "wavelength", 500e-9)) for s0 in wfs_list]
+                # Dedicated low-order (TT) reconstructor (separate from HO reconstructor)
+                self._tt_recon = TipTiltReconstructor_CuPy(wfs_list, self._wfs_is_lgs, self._wfs_wavelengths, weight_mode=str(params.get("tt_weight_mode", "pupil")))
+
                 self._wfs_n_active = [int(len(getattr(s0, "sub_aps_idx"))) for s0 in wfs_list]
                 lens = [2 * n for n in self._wfs_n_active]
                 offs = [0]
@@ -910,6 +1035,7 @@ class SimWorker(QObject):
             n = 0
         self._sync_profile_every = max(0, n)
 
+
     @Slot(int)
     def set_dm_delay_frames(self, frames: int):
         """Set DM servo-lag in integer simulation frames.
@@ -930,6 +1056,7 @@ class SimWorker(QObject):
         cur = getattr(self, "_dm_phi", None)
         fill = cur if cur is not None else None
         self._dm_phi_pipeline = deque([fill] * int(frames))
+
 
     # ------------------ external API (restored for GUI signals) ------------------
     @Slot(dict)
@@ -1039,6 +1166,17 @@ class SimWorker(QObject):
         except Exception:
             n = 1
         self._dm_phi_pipeline = deque([None] * max(1, n))
+
+        # Reset TT controller state
+        try:
+            self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+            self._tt_phi_cmd = cp.zeros((self.patch_M, self.patch_M), dtype=cp.float32)
+            self._tt_phi = cp.zeros((self.patch_M, self.patch_M), dtype=cp.float32)
+            if hasattr(self, "_rebuild_tt_delay_line"):
+                self._rebuild_tt_delay_line()
+        except Exception:
+            pass
+
         self._s_ref = None
 
         if self.long_exposure_psf is not None:
@@ -1171,6 +1309,13 @@ class SimWorker(QObject):
                 strip_tt_lgs=True,
                 psf_tt_mode=psf_tt_mode,
                 tt_wfs_indices=None,
+
+                # Separate NGS-based tip-tilt controller (optional)
+                tt_enabled=bool(cfg.get("tt_enabled", getattr(self, "_tt_enabled", False))),
+                tt_gain=float(cfg.get("tt_gain", getattr(self, "_tt_gain", 0.25))),
+                tt_leak=float(cfg.get("tt_leak", getattr(self, "_tt_leak", 0.0))),
+                tt_rate_hz=float(cfg.get("tt_rate_hz", getattr(self, "_tt_rate_hz", 0.0))),
+                tt_delay_frames=int(cfg.get("tt_delay_frames", getattr(self, "_tt_delay_frames", 1))),
                 dm_delay_frames=int(getattr(self, "_dm_delay_frames", 1)),
             )
 
@@ -1750,6 +1895,8 @@ class SimWorker(QObject):
 
         # DM phase applied for *this* measurement tick (new DM command becomes active next tick)
         dm_phi_prev = self._dm_phi
+        # TT phase applied for this measurement tick (after configurable delay line)
+        tt_phi_prev = self._tt_phi if (getattr(self, "_tt_enabled", False) and self._loop_enabled) else None
 
         t2 = tn()
 
@@ -1762,6 +1909,8 @@ class SimWorker(QObject):
             cp.copyto(self._wfs_phase_buf, phases_atm[1:].astype(cp.float32, copy=False))
             if dm_phi_prev is not None:
                 self._wfs_phase_buf -= dm_phi_prev[None, :, :]
+            if tt_phi_prev is not None:
+                self._wfs_phase_buf -= tt_phi_prev[None, :, :]
             slopes_stack = self._measure_wfs_slopes_stack(self._wfs_phase_buf)
 
             # One-time reference slopes (flat). Handle both stack and packed-vector modes.
@@ -1827,6 +1976,8 @@ class SimWorker(QObject):
             sci_res = phases_atm[0]
             if dm_phi_prev is not None:
                 sci_res = sci_res - dm_phi_prev
+            if tt_phi_prev is not None:
+                sci_res = sci_res - tt_phi_prev
             phase0 = self._remove_piston_tt_fast(sci_res)
 
             # “perfect instantaneous” correction preview
@@ -1855,15 +2006,57 @@ class SimWorker(QObject):
                 # slope error relative to flat
                 cp.subtract(slopes_stack, self._slopes_ref_stack, out=self._slopes_err_stack)
 
+                # --- TT measurement from NGS WFS (before we zero NGS for DM solve) ---
+                tt_meas_yx = None
+                if getattr(self, "_tt_enabled", False):
+                    # Dedicated low-order reconstructor (NGS-only) for TT
+                    if getattr(self, "_tt_recon", None) is not None:
+                        tt_meas_yx = self._tt_recon.estimate_tt_yx_500nm(self._slopes_err_stack)
+                    else:
+                        # Fallback: unweighted mean slopes (500nm-ref scaled)
+                        if (self._wfs_is_lgs is not None) and (self._wfs_wavelengths is not None):
+                            ngs_idx = [i for i, is_lgs in enumerate(self._wfs_is_lgs) if not is_lgs]
+                            if ngs_idx:
+                                acc = cp.zeros((2,), dtype=cp.float32)
+                                for wi in ngs_idx:
+                                    wl = cp.float32(self._wfs_wavelengths[wi])
+                                    acc += self._slopes_err_stack[wi].mean(axis=0) * (wl / cp.float32(500e-9))
+                                tt_meas_yx = acc / cp.float32(len(ngs_idx))
+                            else:
+                                tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+
                 # LGS cannot sense global TT; strip mean slopes. Off-axis NGS: keep prior behaviour (ignore).
                 if self._wfs_is_lgs is not None:
                     lgs_idx = [i for i, is_lgs in enumerate(self._wfs_is_lgs) if is_lgs]
                     ngs_idx = [i for i, is_lgs in enumerate(self._wfs_is_lgs) if not is_lgs]
                     if lgs_idx:
-                        means = self._slopes_err_stack[lgs_idx].mean(axis=1, keepdims=True)
-                        self._slopes_err_stack[lgs_idx] -= means
+                        if getattr(self, "_tt_recon", None) is not None:
+                            self._tt_recon.strip_tt_inplace(self._slopes_err_stack, lgs_idx)
+                        else:
+                            means = self._slopes_err_stack[lgs_idx].mean(axis=1, keepdims=True)
+                            self._slopes_err_stack[lgs_idx] -= means
                     if ngs_idx:
                         self._slopes_err_stack[ngs_idx].fill(0.0)
+
+                # --- TT controller update (runs at its own rate) ---
+                if (tt_meas_yx is not None) and (getattr(self, "_tt_enabled", False)):
+                    if (tc % int(getattr(self, "_tt_period_ticks", 1))) == 0:
+                        # Guard against non-finite WFS outputs to avoid poisoning the sim.
+                        try:
+                            if not bool(cp.all(cp.isfinite(tt_meas_yx)).get()):
+                                tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+                        except Exception:
+                            tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+
+                        self._tt_cmd_yx = (1.0 - self._tt_leak) * self._tt_cmd_yx - self._tt_gain * tt_meas_yx
+
+                        # If controller state goes non-finite, reset rather than propagating NaNs.
+                        try:
+                            if not bool(cp.all(cp.isfinite(self._tt_cmd_yx)).get()):
+                                self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+                        except Exception:
+                            self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+                        self._tt_phi_cmd = self._tt_cmd_to_phase(self._tt_cmd_yx)
 
                 # pack to [sx..., sy...] ordering to match interaction-matrix convention
                 nS, nA = int(self._slopes_err_stack.shape[0]), int(self._slopes_err_stack.shape[1])
@@ -1886,6 +2079,41 @@ class SimWorker(QObject):
 
                 # slope error relative to flat
                 cp.subtract(slopes_stack, self._slopes_ref_vec, out=self._slopes_err_vec)
+
+                # --- TT measurement from NGS WFS (before we zero NGS for DM solve) ---
+                if getattr(self, "_tt_enabled", False) and (self._wfs_is_lgs is not None) and (self._wfs_slices is not None) and (self._wfs_n_active is not None) and (self._wfs_wavelengths is not None):
+                    acc = cp.zeros((2,), dtype=cp.float32)
+                    n_tt = 0
+                    for wi, is_lgs in enumerate(self._wfs_is_lgs):
+                        if is_lgs:
+                            continue
+                        na = int(self._wfs_n_active[wi])
+                        if na <= 0:
+                            continue
+                        a, b = self._wfs_slices[wi]
+                        # vector layout per WFS is [sx(0..na-1), sy(0..na-1)]
+                        sx = self._slopes_err_vec[a : a + na]
+                        sy = self._slopes_err_vec[a + na : a + 2 * na]
+                        wl = cp.float32(self._wfs_wavelengths[wi])
+                        acc[0] += sy.mean() * (wl / cp.float32(500e-9))  # sy
+                        acc[1] += sx.mean() * (wl / cp.float32(500e-9))  # sx
+                        n_tt += 1
+                    tt_meas_yx = acc / cp.float32(max(1, n_tt))
+                    if (tc % int(getattr(self, "_tt_period_ticks", 1))) == 0:
+                        try:
+                            if not bool(cp.all(cp.isfinite(tt_meas_yx)).get()):
+                                tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+                        except Exception:
+                            tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+
+                        self._tt_cmd_yx = (1.0 - self._tt_leak) * self._tt_cmd_yx - self._tt_gain * tt_meas_yx
+
+                        try:
+                            if not bool(cp.all(cp.isfinite(self._tt_cmd_yx)).get()):
+                                self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+                        except Exception:
+                            self._tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+                        self._tt_phi_cmd = self._tt_cmd_to_phase(self._tt_cmd_yx)
 
                 # LGS cannot sense global TT; strip mean slopes per-WFS block. Off-axis NGS: ignore (fill 0).
                 if (self._wfs_is_lgs is not None) and (self._wfs_slices is not None) and (self._wfs_n_active is not None):
@@ -1914,9 +2142,7 @@ class SimWorker(QObject):
             # DM phase already piston+TT removed in coeffs_to_onaxis_phase (remove_tt_in_output=True)
             dm_phi_new = -self.R.coeffs_to_onaxis_phase(self._dm_cmd)
 
-            # --- DM servo-lag pipeline ---
-            # Queue the newly computed DM command and pop the oldest command.
-            # The front of the queue becomes the DM phase used on the next tick.
+            # DM servo-lag FIFO: command computed at tick t becomes active at tick t+dm_delay_frames.
             if getattr(self, "_dm_phi_pipeline", None) is None:
                 try:
                     n = int(getattr(self, "_dm_delay_frames", 1))
@@ -1926,12 +2152,26 @@ class SimWorker(QObject):
             self._dm_phi_pipeline.append(dm_phi_new)
             if len(self._dm_phi_pipeline) > int(getattr(self, "_dm_delay_frames", 1)):
                 self._dm_phi_pipeline.popleft()
-            # Next-tick active DM phase (may be None during warm-up when delay>1)
             self._dm_phi = self._dm_phi_pipeline[0]
+
+            # --- TT delay line advance (once per simulation tick) ---
+            if getattr(self, "_tt_enabled", False):
+                if len(self._tt_delay_line) == 0:
+                    self._tt_phi = self._tt_phi_cmd
+                else:
+                    self._tt_delay_line.append(self._tt_phi_cmd)
+                    self._tt_phi = self._tt_delay_line.popleft()
+            else:
+                self._tt_phi.fill(0.0)
 
             # ---- loop tab outputs (decoupled from 1 kHz control) ----
             if ((tc % self._loop_disp_period) == 0) or (self._loop_t == 0):
-                phi_corr = self._remove_piston_tt_fast(phases_atm[0] - (dm_phi_prev if dm_phi_prev is not None else 0.0))
+                corr = phases_atm[0]
+                if dm_phi_prev is not None:
+                    corr = corr - dm_phi_prev
+                if tt_phi_prev is not None:
+                    corr = corr - tt_phi_prev
+                phi_corr = self._remove_piston_tt_fast(corr)
                 phi_unc = self._remove_piston_tt_fast(phases_atm[0])
 
                 # r0 via phase structure function at a few lags

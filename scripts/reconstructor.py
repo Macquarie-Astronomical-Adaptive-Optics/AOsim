@@ -1,7 +1,117 @@
 import math
 import cupy as cp
 import cupyx.scipy.ndimage as cndi
+from typing import Sequence
 from scripts.utilities import params, Pupil_tools
+
+
+# -----------------------------
+# Tip-tilt (LO) reconstructor
+# -----------------------------
+class TipTiltReconstructor_CuPy:
+    """2-DOF tip/tilt reconstructor from Shack-Hartmann slopes.
+
+    This is a dedicated *low-order* reconstructor that projects WFS slopes onto the
+    global TT modes using weighted least squares (equivalently: weighted mean slopes).
+
+    - Uses only NGS WFSs (non-LGS) when estimating TT.
+    - Expresses the reconstructed TT in 500 nm reference units via per-sensor scaling (wl/500nm).
+    - Provides an in-place TT stripping helper for LGS slopes (used before HO recon).
+    """
+
+    def __init__(self, sensors, wfs_is_lgs, wfs_wavelengths, weight_mode: str = "pupil"):
+        self.sensors = sensors
+        self.wfs_is_lgs = list(wfs_is_lgs) if wfs_is_lgs is not None else None
+        self.wfs_wavelengths = list(wfs_wavelengths) if wfs_wavelengths is not None else None
+        self.weight_mode = str(weight_mode).lower().strip()
+        self.w_norm = []  # list of (n_active,) vectors (sum=1)
+        self._build_weights()
+
+    def _build_weights(self):
+        self.w_norm = []
+        if self.sensors is None:
+            return
+
+        for s in self.sensors:
+            w = None
+            if self.weight_mode == "pupil" and hasattr(s, "sub_pupils") and (getattr(s, "sub_pupils", None) is not None):
+                try:
+                    sp = cp.asarray(s.sub_pupils, dtype=cp.float32)
+                    # mean pupil transmission per active subap
+                    w = cp.mean(sp.reshape(sp.shape[0], -1), axis=1).astype(cp.float32, copy=False)
+                except Exception:
+                    w = None
+
+            if w is None:
+                try:
+                    n = int(getattr(s, "active_sub_aps", 0))
+                    if n <= 0 and hasattr(s, "sub_pupils") and (getattr(s, "sub_pupils", None) is not None):
+                        n = int(cp.asarray(s.sub_pupils).shape[0])
+                    if n <= 0:
+                        n = 1
+                    w = cp.ones((n,), dtype=cp.float32)
+                except Exception:
+                    w = cp.ones((1,), dtype=cp.float32)
+
+            w = cp.asarray(w, dtype=cp.float32)
+            ssum = cp.sum(w)
+            # init-time sync is OK; ensures a robust fallback
+            try:
+                if float(ssum.get()) <= 0.0 or (not math.isfinite(float(ssum.get()))):
+                    w = cp.ones_like(w)
+                    ssum = cp.sum(w)
+            except Exception:
+                pass
+            w = w / cp.maximum(ssum, cp.float32(1e-12))
+            self.w_norm.append(w.astype(cp.float32, copy=False))
+
+    def _weighted_mean_yx(self, slopes_yx: cp.ndarray, wi: int) -> cp.ndarray:
+        """Return weighted mean (sy,sx) for one WFS slopes array."""
+        s = cp.asarray(slopes_yx, dtype=cp.float32)
+        if wi < len(self.w_norm):
+            w = self.w_norm[wi]
+        else:
+            w = None
+
+        if w is None or w.shape[0] != s.shape[0]:
+            return cp.mean(s, axis=0).astype(cp.float32, copy=False)
+        return cp.sum(s * w[:, None], axis=0).astype(cp.float32, copy=False)
+
+    def estimate_tt_yx_500nm(self, slopes_err_stack: cp.ndarray) -> cp.ndarray:
+        """Estimate global TT from NGS sensors. Returns [sy,sx] in 500nm-ref units."""
+        if slopes_err_stack is None:
+            return cp.zeros((2,), dtype=cp.float32)
+        sl = cp.asarray(slopes_err_stack, dtype=cp.float32)
+        n_wfs = int(sl.shape[0])
+
+        if self.wfs_is_lgs is None or self.wfs_wavelengths is None:
+            # fallback: treat all as NGS, no scaling
+            acc = cp.zeros((2,), dtype=cp.float32)
+            for wi in range(n_wfs):
+                acc += self._weighted_mean_yx(sl[wi], wi)
+            return acc / cp.float32(max(n_wfs, 1))
+
+        ngs_idx = [i for i, is_lgs in enumerate(self.wfs_is_lgs[:n_wfs]) if not is_lgs]
+        if not ngs_idx:
+            return cp.zeros((2,), dtype=cp.float32)
+
+        acc = cp.zeros((2,), dtype=cp.float32)
+        for wi in ngs_idx:
+            mu = self._weighted_mean_yx(sl[wi], wi)
+            wl = cp.float32(self.wfs_wavelengths[wi])
+            acc += mu * (wl / cp.float32(500e-9))
+        return acc / cp.float32(len(ngs_idx))
+
+    def strip_tt_inplace(self, slopes_err_stack: cp.ndarray, wfs_indices: Sequence[int]):
+        """Subtract global TT (weighted mean slopes) from selected WFS slope arrays in-place."""
+        if slopes_err_stack is None:
+            return
+        for wi in wfs_indices:
+            if wi < 0 or wi >= int(slopes_err_stack.shape[0]):
+                continue
+            mu = self._weighted_mean_yx(slopes_err_stack[wi], wi)[None, :]
+            slopes_err_stack[wi] = slopes_err_stack[wi] - mu
+
 
 
 # -----------------------------

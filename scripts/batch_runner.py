@@ -2,37 +2,16 @@ import os
 import time
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from collections import deque
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cupy as cp
 import numpy as np
 
-from scripts.reconstructor import TomoOnAxisIM_CuPy
+from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy
 from scripts.fits_writer import PsfFITSRecorder
 from scripts.utilities import Analysis, Gaussian2DFitter, params
 from astropy.modeling import models, fitting
-
-def remove_tt(phi: cp.ndarray, pupil: cp.ndarray) -> cp.ndarray:
-    """Remove best-fit tip/tilt plane from phi over the pupil.
-
-    Uses the same masked least-squares plane fit used in schedulerGPU.py.
-    """
-    m = (pupil > 0)
-    yy, xx = cp.indices(phi.shape, dtype=cp.float32)
-    xx = xx - (phi.shape[1] - 1) * 0.5
-    yy = yy - (phi.shape[0] - 1) * 0.5
-
-    z = phi[m].ravel()
-    X = cp.stack([xx[m].ravel(), yy[m].ravel(), cp.ones_like(z)], axis=1)
-    beta, *_ = cp.linalg.lstsq(X, z, rcond=None)
-    plane = (beta[0] * xx + beta[1] * yy + beta[2]) * m
-    return phi - plane
-
-
-def strip_tt_from_slopes(sl_yx: cp.ndarray) -> cp.ndarray:
-    """Remove mean slope (global TT) from a (n_sub,2) slope array."""
-    return sl_yx - cp.mean(sl_yx, axis=0, keepdims=True)
 
 
 class TTPlaneRemover:
@@ -544,6 +523,13 @@ class AOBatchRunner:
         psf_tt_mode: Optional[str] = None,
         tt_wfs_indices: Optional[Sequence[int]] = None,
         dm_delay_frames: int = 1,
+
+        # Separate NGS-based tip-tilt controller
+        tt_enabled: bool = False,
+        tt_gain: float = 0.25,
+        tt_leak: float = 0.0,
+        tt_rate_hz: float = 0.0,
+        tt_delay_frames: int = 1,
     ):
         self.sim = sim
         self.sensors = list(sensors)
@@ -572,11 +558,33 @@ class AOBatchRunner:
         # If None, prefer NGS WFS (infinite range), otherwise fall back to all WFS.
         self.tt_wfs_indices = None if tt_wfs_indices is None else [int(i) for i in tt_wfs_indices]
 
+
         # --- DM servo-lag ---
         try:
             self.dm_delay_frames = max(1, int(dm_delay_frames))
         except Exception:
             self.dm_delay_frames = 1
+
+        self.tt_enabled = bool(tt_enabled)
+        # Physically consistent behaviour (and TIPTOP-like): when a dedicated NGS TT loop is enabled,
+        # the high-order reconstructor must *not* try to chase global TT from LGS slopes, otherwise
+        # the DM loop can wind up in an unobservable mode (NaNs/instability). Therefore we enforce
+        # LGS TT stripping in the recon path whenever the TT loop is active.
+        if self.tt_enabled:
+            self.strip_tt_lgs = True
+        self.tt_gain = float(tt_gain)
+        self.tt_leak = float(tt_leak)
+        self.tt_rate_hz = float(tt_rate_hz)
+        try:
+            self.tt_delay_frames = int(tt_delay_frames)
+        except Exception:
+            self.tt_delay_frames = 1
+        self.tt_period_frames = 1
+        if self.tt_rate_hz and self.tt_rate_hz > 0:
+            try:
+                self.tt_period_frames = max(1, int(round((1.0 / self.tt_rate_hz) / max(self.dt_s, 1e-12))))
+            except Exception:
+                self.tt_period_frames = 1
 
         # --- Dynamic pointing support ---
         # If any sensor provides a field_angle_fn, we must update thetas each frame and
@@ -624,13 +632,18 @@ class AOBatchRunner:
         self.n_wfs = int(len(self.wfs_list))
 
         # LGS/NGS classification: finite range -> LGS (cannot sense global TT).
-        self._wfs_is_lgs = [np.isfinite(float(getattr(s, "gs_range_m", np.inf))) for s in self.wfs_list]
+        # Classify WFS as LGS/NGS (robust to "NGS at huge finite range" configs)
+        self._wfs_is_lgs = [s.is_lgs for s in self.wfs_list]
+        print(self._wfs_is_lgs)
 
         # Cache WFS wavelengths. ShackHartmann.measure assumes phase screens are
         # in "radians at 500 nm" and internally applies a factor (500e-9 / wl).
         # For hybrid TT we want TT coefficients in the *same units as the phase*
         # (i.e. 500 nm reference), so we may need to undo that scaling.
         self._wfs_wavelengths = [float(getattr(s, "wavelength", 500e-9)) for s in self.wfs_list]
+        # Dedicated low-order (TT) reconstructor (separate from HO reconstructor)
+        self._tt_recon = TipTiltReconstructor_CuPy(self.wfs_list, self._wfs_is_lgs, self._wfs_wavelengths, weight_mode=str(params.get("tt_weight_mode", "pupil")))
+
 
         # Active subap counts + packed offsets per WFS (supports heterogeneous geometries).
         self._n_active = [int(len(getattr(s, "sub_aps_idx"))) for s in self.wfs_list]
@@ -701,6 +714,16 @@ class AOBatchRunner:
         self.dm_phi = cp.zeros((patch_M, patch_M), dtype=cp.float32)
         # FIFO pipeline: command computed at tick t becomes active at tick t+dm_delay_frames
         self._dm_phi_pipeline = deque([cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(self.dm_delay_frames)])
+        self.dm_phi = self._dm_phi_pipeline[0]
+
+        # Separate NGS-based tip-tilt loop state
+        self.tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)  # (sy, sx) in 500nm-reference rad/pixel
+        self.tt_phi_cmd = cp.zeros((patch_M, patch_M), dtype=cp.float32)
+        self.tt_phi = cp.zeros((patch_M, patch_M), dtype=cp.float32)  # active TT phase (after delay)
+        # Delay line: length is (d-1) where d=1 corresponds to the inherent 1-frame control latency.
+        d = max(1, int(self.tt_delay_frames))
+        qlen = max(0, d - 1)
+        self._tt_delay_line = deque([cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(qlen)])
 
         # Centered coordinate grids for fast TT ramp removal (hybrid mode)
         yy0, xx0 = cp.indices((patch_M, patch_M), dtype=cp.float32)
@@ -1015,7 +1038,10 @@ class AOBatchRunner:
                 )
             # 3) Science residual phase (DM from previous tick is conjugate to ground)
             phi_unc = phases_atm[0]
-            phi_cor = phi_unc - self.dm_phi
+            if self.tt_enabled:
+                phi_cor = phi_unc - self.dm_phi - self.tt_phi
+            else:
+                phi_cor = phi_unc - self.dm_phi
 
             if self.psf_tt_mode == "fit" and self._tt_remover is not None:
                 self._tt_remover.remove_inplace(phi_unc)
@@ -1049,8 +1075,11 @@ class AOBatchRunner:
                 if eval_accumulate_uncorrected and (eval_buf_unc is not None):
                     cp.copyto(eval_buf_unc[j0:j1], eval_phi_unc)
 
-                # Corrected: subtract current DM (DM is on-axis; apply to all eval points)
-                cp.subtract(eval_phi_unc, self.dm_phi[None, :, :], out=eval_buf_cor[j0:j1])
+                # Corrected: subtract current DM and global TT (apply to all eval points)
+                if self.tt_enabled:
+                    cp.subtract(eval_phi_unc, (self.dm_phi + self.tt_phi)[None, :, :], out=eval_buf_cor[j0:j1])
+                else:
+                    cp.subtract(eval_phi_unc, self.dm_phi[None, :, :], out=eval_buf_cor[j0:j1])
 
                 eval_buf_t += 1
                 if eval_buf_t == eval_chunk_frames:
@@ -1061,6 +1090,8 @@ class AOBatchRunner:
             # Reuse buffers to avoid per-frame allocations.
             cp.copyto(wfs_phase_buf, phases_atm[1:])
             wfs_phase_buf -= self.dm_phi[None, :, :]
+            if self.tt_enabled:
+                wfs_phase_buf -= self.tt_phi[None, :, :]
 
             if self.psf_tt_mode == "hybrid":
                 tt_acc.fill(0.0)
@@ -1068,6 +1099,16 @@ class AOBatchRunner:
 
             # NGS are ignored for recon; leave zeros in their blocks.
             self._slopes_err_vec.fill(0.0)
+
+            # TT controller update uses NGS mean slopes at its own rate.
+            do_tt_update = bool(
+                self.tt_enabled
+                and (self.tt_period_frames > 0)
+                and ((t % int(self.tt_period_frames)) == 0)
+            )
+            if do_tt_update:
+                tt_ctrl_acc = cp.zeros((2,), dtype=cp.float32)  # (sy, sx)
+                tt_ctrl_n = 0
 
             for g in self._wfs_groups:
                 inds = g["inds"]
@@ -1088,6 +1129,12 @@ class AOBatchRunner:
                     ref = self._slopes_ref_list[wi]
                     sl_err = sl - ref
 
+                    # Separate TT loop: use NGS mean slopes (before LGS TT stripping / NGS ignore for recon)
+                    if do_tt_update and (not self._wfs_is_lgs[wi]):
+                        wl = cp.float32(self._wfs_wavelengths[wi])
+                        tt_ctrl_acc += self._tt_recon._weighted_mean_yx(sl_err, wi) * (wl / cp.float32(500e-9))
+                        tt_ctrl_n += 1
+
                     # Hybrid TT estimate from mean slopes (before LGS TT stripping / NGS ignore)
                     if self.psf_tt_mode == "hybrid" and (wi in self._tt_wfs_set):
                         # sl_err is a gradient of the phase *after* ShackHartmann has
@@ -1101,7 +1148,12 @@ class AOBatchRunner:
                     if not self._wfs_is_lgs[wi]:
                         continue
                     if self.strip_tt_lgs:
-                        sl_err = sl_err - cp.mean(sl_err, axis=0, keepdims=True)
+                        if getattr(self, "_tt_recon", None) is not None:
+                            # Strip TT using the LO reconstructor projector (weighted mean)
+                            mu = self._tt_recon._weighted_mean_yx(sl_err, wi)[None, :]
+                            sl_err = sl_err - mu
+                        else:
+                            sl_err = sl_err - cp.mean(sl_err, axis=0, keepdims=True)
 
                     na = self._n_active[wi]
                     if na <= 0:
@@ -1109,6 +1161,46 @@ class AOBatchRunner:
                     a, _ = self._slices[wi]
                     self._slopes_err_vec[a : a + na] = sl_err[:, 1]
                     self._slopes_err_vec[a + na : a + 2 * na] = sl_err[:, 0]
+
+            # ---- TT controller update (NGS mean slopes) ----
+            if self.tt_enabled and do_tt_update:
+                if tt_ctrl_n > 0:
+                    tt_meas_yx = tt_ctrl_acc / cp.float32(tt_ctrl_n)
+                else:
+                    tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+
+                # Guard against NaNs/Infs (e.g., if a WFS measurement returns non-finite slopes)
+                try:
+                    if not bool(cp.all(cp.isfinite(tt_meas_yx)).get()):
+                        tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+                except Exception:
+                    tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+
+                # Integrator with optional leak
+                self.tt_cmd_yx = (1.0 - cp.float32(self.tt_leak)) * self.tt_cmd_yx - cp.float32(self.tt_gain) * tt_meas_yx
+
+                # If the controller state ever goes non-finite, reset to zero rather than poisoning the sim.
+                try:
+                    if not bool(cp.all(cp.isfinite(self.tt_cmd_yx)).get()):
+                        self.tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+                except Exception:
+                    self.tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)
+
+                # Convert command to pupil-masked phase ramp (500nm-ref radians)
+                phi = (self.tt_cmd_yx[0] * self._yy + self.tt_cmd_yx[1] * self._xx)
+                phi = phi * self.pupil
+                mu = cp.sum(phi) / cp.maximum(cp.sum(self.pupil), cp.float32(1e-20))
+                self.tt_phi_cmd = (phi - mu) * self.pupil
+
+            # Advance TT delay line once per simulation tick
+            if self.tt_enabled:
+                if len(self._tt_delay_line) == 0:
+                    self.tt_phi = self.tt_phi_cmd
+                else:
+                    self._tt_delay_line.append(self.tt_phi_cmd)
+                    self.tt_phi = self._tt_delay_line.popleft()
+            else:
+                self.tt_phi.fill(0.0)
 
             if self.psf_tt_mode == "hybrid":
                 if tt_n > 0:
@@ -1122,23 +1214,20 @@ class AOBatchRunner:
             # 5) Reconstruct + controller
             xhat = self.R.solve_coeffs_stack(self._slopes_err_vec)
             self.dm_cmd = (1.0 - self.leak) * self.dm_cmd - self.gain * xhat
-
-            # Newly computed DM surface (not necessarily active immediately when dm_delay_frames>1)
             dm_phi_new = -self.R.coeffs_to_onaxis_phase(self.dm_cmd)
             dm_phi_new = (dm_phi_new - cp.mean(dm_phi_new)) * self.pupil
 
+            # If PSF TT mode is "fit", remove any residual TT from the DM command phase before it enters the delay line.
+            if self.psf_tt_mode == "fit" and self._tt_remover is not None:
+                self._tt_remover.remove_inplace(dm_phi_new)
+
             # DM servo-lag FIFO: command computed at tick t becomes active at tick t+dm_delay_frames.
             if getattr(self, "_dm_phi_pipeline", None) is None:
-                self._dm_phi_pipeline = deque(
-                    [cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(int(getattr(self, "dm_delay_frames", 1)))]
-                )
+                self._dm_phi_pipeline = deque([cp.zeros_like(dm_phi_new) for _ in range(max(1, int(getattr(self, "dm_delay_frames", 1))))])
             self._dm_phi_pipeline.append(dm_phi_new)
             if len(self._dm_phi_pipeline) > int(getattr(self, "dm_delay_frames", 1)):
                 self._dm_phi_pipeline.popleft()
             self.dm_phi = self._dm_phi_pipeline[0]
-
-            if self.psf_tt_mode == "fit" and self._tt_remover is not None:
-                self._tt_remover.remove_inplace(self.dm_phi)
 
             # 6) Record structure function stats (cheap; no FFT)
             # (Apply discard window only to final statistics.)
@@ -1366,7 +1455,7 @@ class AOBatchRunner:
             rec_corr_tt.close()
 
         # FWHM estimates via Gaussian fit (uses GPU LM fit)
-        zoom = int(params.get("fwhm_zoom", 1))
+        zoom = int(params.get("fwhm_zoom", 2))
         fitter = Gaussian2DFitter(roi_half=int(params.get("fwhm_roi_half", 32)))
 
         # Fit metadata (native PSF pixels; for overlays)
