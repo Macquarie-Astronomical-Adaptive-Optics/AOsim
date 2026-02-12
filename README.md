@@ -1,32 +1,41 @@
-# Adaptive Optics simulator
+# AOsim
 
-(WIP) A User Interface / GUI for creating, editing, and running Adaptive Optics simulations
+A PySide6 + CuPy adaptive optics simulation GUI.
 
+## Quick start
 
-## Current features
+```bash
+# (Recommended) create a venv
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
-Poke matrix diagnostics:
-- Poke matrix visualisation
-- WFS editing
-- Sub aperture centroids / images view
-- Reference and Poke matrix Science image view
-- FWHM, Diffraction Limit, Strehl Calculations
-- Parameter config save/load
+# Install dependencies (you may need the CUDA-specific CuPy build)
+pip install -r requirements.txt
 
-<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/bb720d5d-3636-4416-85ae-2811e8903c8e" />
+# Run
+python main.py --log-console
+```
 
-Turbulence 
-- Turbulence phase screen generator/editor
-  - Parameter save/load
-  - **to be implemented** File-based loading for additional phase map generation functions
-- Layered turbulence viewer
-  - Combined phase map view
-  - Final PSF view
+## Config
 
-<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/a1c90480-9079-4be8-bdb1-bce9f4fa1897" />
+- Default config: `config_default.json`
+- Override any key from the command line, e.g.:
 
-Sensor View
-- Individual Sensor PSF grid
-- Layer-by-layer view for WFS footprint/fov
+```bash
+python main.py --grid_size 512 --actuators 35 --no-gpu
+```
 
-<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/f3995c0e-5ca1-4a8e-9534-597eb354f31b" />
+If you pass `--config path/to/file.json`, that file is loaded instead of the default.
+
+## Project layout
+
+- `main.py`: GUI entrypoint
+- `scripts/`: simulation + GUI tabs/widgets
+- `turbulence/`: example turbulence profiles
+- `data/`: shared dtype/config helpers
+
+## Notes
+
+- The simulation is GPU-first (CuPy). CPU-only mode is best-effort and mainly intended
+  for development/UI testing.
+- Enable the Qt log console (`--log-console`) to capture `print()` output and exceptions.

@@ -1,0 +1,14 @@
+# Core
+numpy>=1.24
+matplotlib>=3.8
+PySide6>=6.6
+pyqtgraph>=0.13
+
+aotools>=1.0
+
+# GPU
+# Install the CUDA-matched build for your system, e.g.:
+#   pip install cupy-cuda12x
+# or:
+#   pip install cupy
+cupy

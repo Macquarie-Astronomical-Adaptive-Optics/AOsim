@@ -1,6 +1,8 @@
 import math
 from typing import Dict
+import logging
 
+logger = logging.getLogger(__name__)
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
@@ -11,7 +13,6 @@ from scripts.window_tabs.wfsensor_tab import SensorTabWidget
 
 ARCSEC2RAD = math.pi / (180.0 * 3600.0)
 RAD2ARCSEC = (180.0 * 3600.0) / math.pi
-
 
 class Poke_tab(QWidget):
     update_request = Signal(int, int)
@@ -52,7 +53,7 @@ class Poke_tab(QWidget):
         sensor_tabs = DetachableTabWidget()
         sensor_tabs.setMovable(True)
 
-        print("Starting sensor tab editor:")
+        logger.info("Starting sensor tab editor")
 
         self.tab_pages = []
         for key, sensor in self.wfsensors.items():
@@ -78,7 +79,7 @@ class Poke_tab(QWidget):
         self.sensors_changed.emit(self.wfsensors)
 
     def _build_sensors(self) -> None:
-        print("Creating sensors")
+        logger.info("Creating sensors")
         # Note: keep off_x_px=0.0 to preserve existing behaviour (placeholder for future scaling).
         off_x_px = 0.0  # (0.5 * telescope_diameter) / (telescope_diameter / grid_size)
 
@@ -96,12 +97,12 @@ class Poke_tab(QWidget):
 
         # LGS constellation (units consistent with original code)
         add(
-            "LGS_right",
+            "LGS_NE",
             ut.WFSensor_tools.ShackHartmann(
                 90_000,
-                n_sub=32,
-                dx=10 * 60,
-                dy=0,
+                n_sub=40,
+                dx=2.828 * 60,
+                dy=2.828 * 60,
                 lgs_thickness_m=10_000.0,  # ~10 km sodium thickness
                 lgs_launch_offset_px=(off_x_px, 0.0),
                 lgs_remove_tt=True,
@@ -109,12 +110,12 @@ class Poke_tab(QWidget):
             ),
         )
         add(
-            "LGS_left",
+            "LGS_NW",
             ut.WFSensor_tools.ShackHartmann(
                 90_000,
-                n_sub=32,
-                dx=-10 * 60,
-                dy=0,
+                n_sub=40,
+                dx=-2.828 * 60,
+                dy=2.828 * 60,
                 lgs_thickness_m=10_000.0,
                 lgs_launch_offset_px=(-off_x_px, 0.0),
                 lgs_remove_tt=True,
@@ -122,12 +123,12 @@ class Poke_tab(QWidget):
             ),
         )
         add(
-            "LGS_up",
+            "LGS_SE",
             ut.WFSensor_tools.ShackHartmann(
                 90_000,
-                n_sub=32,
-                dx=0,
-                dy=10 * 60,
+                n_sub=40,
+                dx=2.828 * 60,
+                dy=-2.828 * 60,
                 lgs_thickness_m=10_000.0,
                 lgs_launch_offset_px=(0.0, off_x_px),
                 lgs_remove_tt=True,
@@ -135,12 +136,12 @@ class Poke_tab(QWidget):
             ),
         )
         add(
-            "LGS_down",
+            "LGS_SW",
             ut.WFSensor_tools.ShackHartmann(
                 90_000,
-                n_sub=32,
-                dx=0,
-                dy=-10 * 60,
+                n_sub=40,
+                dx=-2.828 * 60,
+                dy=-2.828 * 60,
                 lgs_thickness_m=10_000.0,
                 lgs_launch_offset_px=(0.0, -off_x_px),
                 lgs_remove_tt=True,
@@ -149,20 +150,21 @@ class Poke_tab(QWidget):
         )
 
         # NGS quad
-        for name, dx, dy in [
-            ("NGS_NE", 4.95 * 60, 4.95 * 60),
-            ("NGS_NW", -4.95 * 60, 4.95 * 60),
-            ("NGS_SE", 4.95 * 60, -4.95 * 60),
-            ("NGS_SW", -4.95 * 60, -4.95 * 60),
-        ]:
-            add(name, ut.WFSensor_tools.ShackHartmann(n_sub=2, dx=dx, dy=dy, wavelength=1650e-9))
+        # for name, dx, dy in [
+        #     ("NGS_NE", 4.95 * 60, 4.95 * 60),
+        #     ("NGS_NW", -4.95 * 60, 4.95 * 60),
+        #     ("NGS_SE", 4.95 * 60, -4.95 * 60),
+        #     ("NGS_SW", -4.95 * 60, -4.95 * 60),
+        # ]:
+        #     add(name, ut.WFSensor_tools.ShackHartmann(n_sub=2, dx=dx, dy=dy, wavelength=1650e-9))
+        add("NGS", ut.WFSensor_tools.ShackHartmann(n_sub=2, dx=0, dy=0, wavelength=1650e-9))
 
         self.sensors_changed.emit(self.wfsensors)
 
         for key, sensor in self.wfsensors.items():
             dx_arcsec = getattr(sensor, "dx", 0.0) * RAD2ARCSEC
             dy_arcsec = getattr(sensor, "dy", 0.0) * RAD2ARCSEC
-            print(f" - {key}: ({dx_arcsec:.0f}, {dy_arcsec:.0f}) arcsec")
+            logger.info(" - %s: (%.0f, %.0f) arcsec", key, dx_arcsec, dy_arcsec)
 
     def update_tabs(self, params: dict) -> None:
         # also update sensor view tab while we're at it

@@ -2,6 +2,8 @@ from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget, QCheckBox
 
 import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 
 from scripts.widgets.config_table import Config_table
 from scripts.widgets.pgcanvas import PGCanvas, TwoLineGraph
@@ -197,15 +199,13 @@ class Loop_tab(QWidget):
         if hasattr(self.scheduler, "set_tt_delay_frames"):
             self.scheduler.set_tt_delay_frames(tt_delay_frames)
 
-        print(
-            "Updated loop parameters: "
-            "\n  gain:", self.scheduler._loop_gain,
-            "\n  leak:", self.scheduler._loop_leak,
-            "\n  dm_delay_frames:", getattr(self.scheduler, "_dm_delay_frames", 1),
-            "\n  tt_enabled:", getattr(self.scheduler, "_tt_enabled", False),
-            "\n  tt_rate_hz:", getattr(self.scheduler, "_tt_rate_hz", 0.0),
-            "\n  tt_delay_frames:", getattr(self.scheduler, "_tt_delay_frames", 0),
-        )
+        logger.info("Updated loop parameters: gain=%s leak=%s dm_delay_frames=%s tt_enabled=%s tt_rate_hz=%s tt_delay_frames=%s",
+                    getattr(self.scheduler, '_loop_gain', None),
+                    getattr(self.scheduler, '_loop_leak', None),
+                    getattr(self.scheduler, '_dm_delay_frames', 1),
+                    getattr(self.scheduler, '_tt_enabled', False),
+                    getattr(self.scheduler, '_tt_rate_hz', 0.0),
+                    getattr(self.scheduler, '_tt_delay_frames', 0))
 
     @Slot(object, object, float, float, float, float, object)
     def update_graphs(self, psf, residual, r0_eff_corrected, r0_eff_uncorrected, fwhm1, fwhm2, time, coord) -> None:
@@ -246,7 +246,7 @@ class Loop_tab(QWidget):
 
     def _loop_r0_only(self, r0_bool):
         self.scheduler._loop_r0_only = r0_bool
-        print("sim calculating r0 only:", self.scheduler._loop_r0_only)
+        logger.info("sim calculating r0 only: %s", self.scheduler._loop_r0_only)
 
 
     def showEvent(self, event):

@@ -113,11 +113,11 @@ class LongRun_tab(QWidget):
 
         grid.addWidget(QLabel("TT removal"), row, 2)
         # Simple cycle: none / fit / hybrid
-        self.btn_tt_mode = QPushButton("fit")
+        self.btn_tt_mode = QPushButton("none")
         self.btn_tt_mode.setCheckable(True)
         self.btn_tt_mode.setChecked(False)
         self.btn_tt_mode.clicked.connect(self._cycle_tt_mode)
-        self._tt_mode = "fit"
+        self._tt_mode = "none"
         grid.addWidget(self.btn_tt_mode, row, 3)
         row += 1
 
@@ -129,7 +129,7 @@ class LongRun_tab(QWidget):
         off_hdr_l.addWidget(QLabel("Off-axis points"))
         self.cmb_offaxis_coords = QComboBox()
         self.cmb_offaxis_coords.addItems(["dx,dy (arcsec)", "θ,r (deg, arcsec)"])
-        self.cmb_offaxis_coords.setCurrentIndex(0)
+        self.cmb_offaxis_coords.setCurrentIndex(1)
         self.cmb_offaxis_coords.currentIndexChanged.connect(self._on_offaxis_coord_mode_changed)
         off_hdr_l.addWidget(self.cmb_offaxis_coords)
         off_hdr_l.addStretch(1)
@@ -139,12 +139,12 @@ class LongRun_tab(QWidget):
         grid.addWidget(self.edit_offaxis, row, 1, 1, 3)
         row += 1
 
-        self.chk_eval_unc_offaxis = QCheckBox("Compute off-axis uncorrected PSFs (slower)")
+        self.chk_eval_unc_offaxis = QCheckBox("Compute off-axis uncorrected PSFs")
         self.chk_eval_unc_offaxis.setChecked(True)
         grid.addWidget(self.chk_eval_unc_offaxis, row, 0, 1, 2)
 
         self.chk_write_offaxis_fits = QCheckBox("Write off-axis long-exposure FITS")
-        self.chk_write_offaxis_fits.setChecked(True)
+        self.chk_write_offaxis_fits.setChecked(False)
         grid.addWidget(self.chk_write_offaxis_fits, row, 2, 1, 2)
         row += 1
 
@@ -159,13 +159,13 @@ class LongRun_tab(QWidget):
         row += 1
 
         self.chk_record_psfs = QCheckBox("Record per-frame PSFs")
-        self.chk_record_psfs.setChecked(True)
+        self.chk_record_psfs.setChecked(False)
         grid.addWidget(self.chk_record_psfs, row, 0, 1, 2)
 
         row += 1
 
         self.chk_save_tt = QCheckBox("Save TT time series")
-        self.chk_save_tt.setChecked(True)
+        self.chk_save_tt.setChecked(False)
         grid.addWidget(self.chk_save_tt, row, 0, 1, 2)
 
         self.chk_reset_before = QCheckBox("Reset sim before run")

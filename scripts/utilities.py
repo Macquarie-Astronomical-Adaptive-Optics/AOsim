@@ -6,6 +6,8 @@ import json
 import threading
 import math
 import hashlib
+import logging
+logger = logging.getLogger(__name__)
 from typing import Callable, Optional, Tuple
 
 # -----------------------------
@@ -21,13 +23,43 @@ except FileNotFoundError:
 except json.JSONDecodeError as e:
     raise RuntimeError(f"Failed to parse {_DEFAULT_CONFIG_PATH}: {e}") from e
 
-params = config.copy()
+class Params(dict):
+    """Lightweight params wrapper (dict-compatible).
+
+    Adds small typed helpers while staying fully compatible with existing code.
+    """
+
+    def get_int(self, key: str, default: int = 0) -> int:
+        try:
+            return int(self.get(key, default))
+        except Exception:
+            return int(default)
+
+    def get_float(self, key: str, default: float = 0.0) -> float:
+        try:
+            return float(self.get(key, default))
+        except Exception:
+            return float(default)
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        try:
+            return bool(self.get(key, default))
+        except Exception:
+            return bool(default)
+
+
+params = Params(config)
 rootdir = Path(__file__).parent.parent
 
 def set_params(new_params):
     """Update module-level params (used as defaults when explicit args are None)."""
     global params
-    params = new_params
+    if isinstance(new_params, Params):
+        params = new_params
+    else:
+        # Accept any mapping/dict-like object.
+        params = Params(dict(new_params))
+
 
 # -----------------------------
 # Small GPU caches (keyed)
@@ -2717,9 +2749,9 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
 
     if args.list_functions:
-        print("Available functions:")
+        logger.info("Available functions:")
         for name in functions.keys():
-            print("-", name)
+            logger.info("- %s", name)
         sys.exit()
 
     for key, value in vars(args).items():
@@ -2737,4 +2769,4 @@ if __name__ == "__main__":
             kwargs[key] = value
 
     result = functions[args.function](**kwargs)
-    print("Result:", result)
+    logger.info("Result: %s", result)

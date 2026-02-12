@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 from PySide6.QtCore import QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
@@ -70,9 +72,9 @@ class Turbulence_tab(QWidget):
         # sensors -> angles (radians) (used for debug output)
         thetas = [s.field_angle for s in self.sensors.values()]  # list of (theta_x, theta_y) rad
         ranges_m = [getattr(s, "gs_range_m", float("inf")) for s in self.sensors.values()]  # meters
-        print("Loaded sensors at angles")
+        logger.info("Loaded sensors at angles")
         for t in thetas:
-            print(f" - ({t[0] * RAD2ARCSEC:.0f}, {t[1] * RAD2ARCSEC:.0f}) arcsec")
+            logger.info(" - (%.0f, %.0f) arcsec", t[0]*RAD2ARCSEC, t[1]*RAD2ARCSEC)
 
         # ---------- UI ----------
         main_layout = QHBoxLayout(self)
@@ -99,9 +101,9 @@ class Turbulence_tab(QWidget):
         add_layer_btn.clicked.connect(self.add_layer)
         left_layout.addWidget(add_layer_btn)
 
-        print("Active layers:")
+        logger.info("Active layers:")
         for w in self.layer_selector.active_items():
-            print(" -", w.title)
+            logger.info(" - %s", w.title)
 
         main_layout.addWidget(left_frame)
 
@@ -171,10 +173,10 @@ class Turbulence_tab(QWidget):
         main_layout.addLayout(right_layout)
 
         # ---------- Worker thread ----------
-        print("Starting GPU Scheduler")
+        logger.info("Starting GPU Scheduler")
         self.scheduler_thread = QThread(self)
 
-        print("Building Turbulence Screen Generator")
+        logger.info("Building Turbulence Screen Generator")
         self.scheduler = SimWorker(
             sim_factory=screen["function"],
             sim_kwargs=base_kwargs,
@@ -184,11 +186,12 @@ class Turbulence_tab(QWidget):
             ranges_m=ranges_m,
             patch_size_px=N,
             patch_M=N,
-            dt_s=0.002,
+            dt_s=0.001,
             emit_psf=True,
+            params=self.params,
         )
         self.scheduler.moveToThread(self.scheduler_thread)
-        print("Scheduler moved to thread!")
+        logger.info("Scheduler moved to thread!")
 
         # build once thread starts, then emit a first frame
         self.req_overview_enabled.connect(self.scheduler.set_overview_enabled)
@@ -203,7 +206,7 @@ class Turbulence_tab(QWidget):
         self.scheduler.finished.connect(self.scheduler_thread.quit)
 
         # signals -> UI
-        self.scheduler.status_log.connect(print)
+        self.scheduler.status_log.connect(lambda s: logger.info(s))
         self.scheduler.status.connect(self.scheduler_status.setBaseText)
         self.scheduler.status_running.connect(self.scheduler_status.run)
 
@@ -355,7 +358,7 @@ class Turbulence_tab(QWidget):
 
         timer = getattr(self.scheduler, "timer", None)
         if timer is not None and timer.isActive():
-            print("exiting page while sim is running")
+            logger.warning("Exiting page while sim is running")
 
             def on_close_callback(returned_widget, returned_title):
                 self.control_popout_layout.addWidget(returned_widget)

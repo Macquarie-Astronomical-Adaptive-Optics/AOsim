@@ -6,11 +6,9 @@
     "seed": 12,
     "layers": 
         [
-            {"name":"Layer 1", "altitude_m":0.00001, "r0":0.24914, "L0":25.0, "wind":[5.5, 0.0],        "seed_offset":1},
-            {"name":"Layer 2", "altitude_m":30.0,    "r0":1.03146, "L0":25.0, "wind":[5.5, 0.0],        "seed_offset":2},
-            {"name":"Layer 3", "altitude_m":120.0,   "r0":1.24274, "L0":25.0, "wind":[5.90885, 1.04189],"seed_offset":3},
-            {"name":"Layer 4", "altitude_m":280.0,   "r0":2.02255, "L0":25.0, "wind":[6.57785, 2.39414],"seed_offset":4},
-            {"name":"Layer 5", "altitude_m":440.0,   "r0":8.79426, "L0":25.0, "wind":[6.92820, 4.0],    "seed_offset":5},
-            {"name":"Layer 6", "altitude_m":8000.0,  "r0":0.24934, "L0":25.0, "wind":[14.14214,14.14214],"seed_offset":6}
+            {"name":"Layer 1", "altitude_m":0.00001,  "r0":0.18697, "L0":25.0, "wind":[10.00000, 0.00000], "seed_offset":1},
+            {"name":"Layer 2", "altitude_m":5000.0,   "r0":0.34873, "L0":25.0, "wind":[7.87846,  1.38919], "seed_offset":2},
+            {"name":"Layer 3", "altitude_m":10000.0,  "r0":0.65716, "L0":25.0, "wind":[18.79385, 6.84040], "seed_offset":3},
+            {"name":"Layer 4", "altitude_m":15000.0,  "r0":0.99606, "L0":25.0, "wind":[11.25833, 6.50000], "seed_offset":4}
         ]
 }

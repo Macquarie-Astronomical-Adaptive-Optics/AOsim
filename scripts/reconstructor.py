@@ -2,7 +2,7 @@ import math
 import cupy as cp
 import cupyx.scipy.ndimage as cndi
 from typing import Sequence, Optional
-from scripts.utilities import params, Pupil_tools
+from scripts.utilities import params as default_params, Pupil_tools
 
 
 # -----------------------------
@@ -29,6 +29,7 @@ class TipTiltReconstructor_CuPy:
         pad: int = 4,
         auto_calibrate: bool = True,
         calib_slope_amp: float = 1e-3,
+        params: Optional[dict] = None,
     ):
         self.sensors = sensors
         self.wfs_is_lgs = list(wfs_is_lgs) if wfs_is_lgs is not None else None
@@ -37,6 +38,8 @@ class TipTiltReconstructor_CuPy:
         self.sensor_method = (str(sensor_method).lower().strip() if sensor_method is not None else None)
         self.pad = int(pad)
         self.calib_slope_amp = float(calib_slope_amp)
+
+        self.params = params if params is not None else default_params
 
         self.w_norm = []          # list of (n_active,) vectors (sum=1)
         self.k500_yx = []         # list of (2,) gains: measured_mean_500nm / commanded_slope (per axis)
@@ -103,11 +106,11 @@ class TipTiltReconstructor_CuPy:
             return
 
         # Temporarily disable stochastic noise during calibration.
-        p0 = params.get("wfs_photons_per_subap", 0)
-        r0 = params.get("wfs_read_noise_e", 0.0)
+        p0 = self.params.get("wfs_photons_per_subap", 0)
+        r0 = self.params.get("wfs_read_noise_e", 0.0)
         try:
-            params["wfs_photons_per_subap"] = 0
-            params["wfs_read_noise_e"] = 0.0
+            self.params["wfs_photons_per_subap"] = 0
+            self.params["wfs_read_noise_e"] = 0.0
 
             for wi, s in enumerate(self.sensors):
                 try:
@@ -167,8 +170,8 @@ class TipTiltReconstructor_CuPy:
                     # keep unity gain on failures
                     continue
         finally:
-            params["wfs_photons_per_subap"] = p0
-            params["wfs_read_noise_e"] = r0
+            self.params["wfs_photons_per_subap"] = p0
+            self.params["wfs_read_noise_e"] = r0
 
     def _weighted_mean_yx(self, slopes_yx: cp.ndarray, wi: int) -> cp.ndarray:
         """Return weighted mean (sy,sx) for one WFS slopes array."""
@@ -294,6 +297,7 @@ class TomoOnAxisIM_CuPy:
         sensors,
         layer_heights_m,
         dx_world_m,
+        conjugation_height_m=None,
         M=None,
         size_pixels=None,
         angle_deg=0.0,
@@ -310,14 +314,27 @@ class TomoOnAxisIM_CuPy:
         recon_sensor_indices=None,
         slopes_aggregation="stack",
 
+        # ---- slope weighting (helps edge/partial subap artifacts) ----
+        slope_weight_mode="none",          # "none" | "pupil"
+        slope_weight_threshold=0.15,       # below this fill-factor -> weight=0
+        slope_weight_power=1.0,            # >1 downweights partial subaps harder
+
         # ---- waffle control ----
         remove_waffle_in_solution=True,   # hard projection after solve
         waffle_per_layer=True,            # remove waffle independently per layer (recommended)
         reg_waffle_gamma=0.0,             # soft penalty strength (0 disables)
+        params: Optional[dict] = None,
     ):
         self.sensors = list(sensors)
-        self.layer_heights_m = [float(h) for h in layer_heights_m]
+        self.conjugation_height_m = (float(conjugation_height_m) if conjugation_height_m is not None else None)
+        if self.conjugation_height_m is not None:
+            # GLAO / single-conjugate mode: reconstruct a single phase screen at the chosen conjugation height.
+            self.layer_heights_m = [self.conjugation_height_m]
+        else:
+            self.layer_heights_m = [float(h) for h in layer_heights_m]
         self.dx_world_m = float(dx_world_m)
+
+        self.params = params if params is not None else default_params
 
         self.M = int(M if M is not None else self.sensors[0].grid_size)
         self.size_pixels = float(size_pixels if size_pixels is not None else self.M)
@@ -338,6 +355,14 @@ class TomoOnAxisIM_CuPy:
         self.slopes_aggregation = str(slopes_aggregation).lower()
         if self.slopes_aggregation not in ("stack", "mean"):
             raise ValueError("slopes_aggregation must be 'stack' or 'mean'")
+
+        # slope weighting
+        self.slope_weight_mode = str(slope_weight_mode).lower().strip()
+        if self.slope_weight_mode not in ("none", "pupil"):
+            raise ValueError("slope_weight_mode must be 'none' or 'pupil'")
+        self.slope_weight_threshold = float(slope_weight_threshold)
+        self.slope_weight_power = float(slope_weight_power)
+        self._w_sqrt = None  # (n_slopes,) applied to both A and slopes (weighted LS)
 
         # waffle options
         self.remove_waffle_in_solution = bool(remove_waffle_in_solution)
@@ -363,8 +388,8 @@ class TomoOnAxisIM_CuPy:
         self.pupil = cp.asarray(pupil_src.pupil, dtype=cp.float32)
 
         # basis with consistent actuator ordering
-        self.poke_amp = float(params.get("poke_amplitude"))
-        self.actuators = int(params.get("actuators"))
+        self.poke_amp = float(self.params.get("poke_amplitude"))
+        self.actuators = int(self.params.get("actuators"))
 
         self.act_centers_rc = Pupil_tools.generate_actuators(
             pupil=self.pupil, actuators=self.actuators, grid_size=self.M
@@ -379,7 +404,7 @@ class TomoOnAxisIM_CuPy:
             grid_size=self.M,
         )
 
-        scale = cp.float32(4.0 * cp.pi / float(params.get("wfs_lambda")))
+        scale = cp.float32(4.0 * cp.pi / float(self.params.get("wfs_lambda")))
         self.basis = [cp.asarray(b, dtype=cp.float32) * scale for b in basis_maps]
 
         self.nL = len(self.layer_heights_m)
@@ -423,6 +448,7 @@ class TomoOnAxisIM_CuPy:
         self._eig_V = None
         self._eig_inv = None
         self._At = None
+        self._P = None  # (k,n_slopes) compact runtime matrix: diag(inv_eigs) @ V^T @ A^T
 
         # science-angle projection cache
         self._Xbase = None
@@ -572,6 +598,51 @@ class TomoOnAxisIM_CuPy:
             self._ref_blocks = [rb.astype(self.chol_dtype, copy=False) for rb in ref_blocks]
             self._offsets = offsets
 
+        # Build optional per-slope weights to suppress edge/partial-subap artifacts.
+        # Uses per-subap fill-factor from sensor.sub_pupils when available.
+        if self.slope_weight_mode == "pupil":
+            w_blocks = []
+            for s in sensors:
+                w_sub = None
+                try:
+                    sp = getattr(s, "sub_pupils", None)
+                    if sp is not None:
+                        sp = cp.asarray(sp, dtype=cp.float32)
+                        w_sub = cp.mean(sp.reshape(sp.shape[0], -1), axis=1).astype(cp.float32, copy=False)
+                except Exception:
+                    w_sub = None
+
+                if w_sub is None:
+                    # fallback: uniform weights (all active subaps)
+                    try:
+                        n = int(getattr(s, "active_sub_aps", 0) or 0)
+                        if n <= 0:
+                            n = int(ref_blocks[0].size // 2)
+                        w_sub = cp.ones((n,), dtype=cp.float32)
+                    except Exception:
+                        w_sub = cp.ones((int(ref_blocks[0].size // 2),), dtype=cp.float32)
+
+                thr = cp.float32(max(self.slope_weight_threshold, 0.0))
+                w_sub = cp.clip(w_sub, 0.0, 1.0)
+                if thr > 0:
+                    w_sub = cp.where(w_sub >= thr, w_sub, cp.float32(0.0))
+                pwr = cp.float32(max(self.slope_weight_power, 0.0))
+                if pwr != 1.0:
+                    w_sub = w_sub ** pwr
+
+                # slopes vector is [sx..., sy...]
+                w_vec = cp.concatenate([w_sub, w_sub], axis=0).astype(cp.float32, copy=False)
+                w_blocks.append(w_vec)
+
+            if self.slopes_aggregation == "stack":
+                w_all = cp.concatenate(w_blocks, axis=0)
+                self._w_sqrt = cp.sqrt(cp.clip(w_all, 0.0, 1.0)).astype(cp.float32, copy=False)
+            else:
+                w_all = cp.mean(cp.stack(w_blocks, axis=0), axis=0)
+                self._w_sqrt = cp.sqrt(cp.clip(w_all, 0.0, 1.0)).astype(cp.float32, copy=False)
+        else:
+            self._w_sqrt = None
+
         A = cp.empty((n_slopes, self.nModes), dtype=cp.float32)
 
         Xbase, Ybase, cx0, cy0 = self._precompute_base_grid(self.M, self.size_pixels, self.angle_deg)
@@ -684,6 +755,10 @@ class TomoOnAxisIM_CuPy:
             if not (chunk_modes and chunk_modes > 0):
                 break
 
+        # Apply slope weights (weighted least squares): A <- W A
+        if self._w_sqrt is not None:
+            A = (self._w_sqrt[:, None].astype(cp.float32, copy=False) * A).astype(cp.float32, copy=False)
+
         self.A = A
         self.At = A.T
         cp.get_default_memory_pool().free_all_blocks()
@@ -776,7 +851,15 @@ class TomoOnAxisIM_CuPy:
 
         self._eig_V = V[:, keep]
         self._eig_inv = (1.0 / evals[keep]).astype(cp.float32)
+
+        # Cache A^T and a compact runtime matrix that folds in V^T and the eigenvalue inverse.
+        # This reduces per-frame compute from (A^T @ s) + (V^T @ rhs) to a single matmul.
         self._At = A.T
+        try:
+            VkT_At = (self._eig_V.T @ self._At).astype(cp.float32, copy=False)  # (k,n_slopes)
+            self._P = (self._eig_inv[:, None] * VkT_At).astype(cp.float32, copy=False)
+        except Exception:
+            self._P = None
 
     # -----------------------------
     # solve (with optional hard waffle projection)
@@ -809,10 +892,17 @@ class TomoOnAxisIM_CuPy:
                     acc = v if acc is None else (acc + v)
                 s = acc * (1.0 / float(len(self.recon_sensors)))
 
-        rhs = self._At @ s
-        t = self._eig_V.T @ rhs
-        t = t * self._eig_inv
-        x = self._eig_V @ t
+        if self._w_sqrt is not None:
+            s = s * self._w_sqrt.astype(s.dtype, copy=False)
+
+        if self._P is not None:
+            t = self._P @ s  # (k,)
+            x = self._eig_V @ t
+        else:
+            rhs = self._At @ s
+            t = self._eig_V.T @ rhs
+            t = t * self._eig_inv
+            x = self._eig_V @ t
 
         # Hard waffle removal (projects out null/near-null checkerboard)
         if self.remove_waffle_in_solution and (self._W_waffle is not None):
@@ -852,10 +942,17 @@ class TomoOnAxisIM_CuPy:
         if self._ref_stack is not None:
             s = s - self._ref_stack
 
-        rhs = self._At @ s
-        t = self._eig_V.T @ rhs
-        t = t * self._eig_inv
-        x = self._eig_V @ t
+        if self._w_sqrt is not None:
+            s = s * self._w_sqrt.astype(s.dtype, copy=False)
+
+        if self._P is not None:
+            t = self._P @ s  # (k,)
+            x = self._eig_V @ t
+        else:
+            rhs = self._At @ s
+            t = self._eig_V.T @ rhs
+            t = t * self._eig_inv
+            x = self._eig_V @ t
 
         if self.remove_waffle_in_solution and (self._W_waffle is not None):
             x = self._project_out_waffle(x.astype(cp.float32, copy=False))
@@ -987,3 +1084,24 @@ class TomoOnAxisIM_CuPy:
         xhat = self.solve_coeffs(slopes_list)
         ph = self.coeffs_to_onaxis_phase(xhat)
         return (ph, xhat) if return_coeffs else ph
+
+# -----------------------------
+# GLAO single-conjugate wrapper
+# -----------------------------
+class GLAOConjugateIM_CuPy(TomoOnAxisIM_CuPy):
+    """Single-conjugate (GLAO-style) reconstructor with an explicit conjugation height.
+
+    Use this when you have multiple WFSs and a *single* DM conjugated to some altitude h_c (often 0 m).
+    Internally this is just TomoOnAxisIM_CuPy forced into nL=1 at that conjugation height.
+    """
+    def __init__(self, sensors, conjugation_height_m, dx_world_m, **kwargs):
+        ch = float(conjugation_height_m)
+        # avoid accidental duplication if caller passes these in kwargs
+        kwargs.pop("conjugation_height_m", None)
+        super().__init__(
+            sensors=sensors,
+            layer_heights_m=[ch],
+            dx_world_m=dx_world_m,
+            conjugation_height_m=ch,
+            **kwargs,
+        )
