@@ -6,6 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from scripts.widgets.config_table import Config_table
+from scripts.core.config_store import ConfigStore
 from scripts.widgets.pgcanvas import PGCanvas, TwoLineGraph
 
 ARCSEC2RAD = np.pi / (180.0 * 3600.0)
@@ -13,9 +14,10 @@ RAD2ARCSEC = (180.0 * 3600.0) / np.pi
 
 
 class Loop_tab(QWidget):
-    def __init__(self, params: dict, scheduler, parent=None):
+    def __init__(self, params: dict | ConfigStore, scheduler, parent=None):
         super().__init__(parent)
-        self.params = params
+        self.config_store = params if isinstance(params, ConfigStore) else ConfigStore(dict(params))
+        self.params = self.config_store.data
         self.scheduler = scheduler
 
         layout = QHBoxLayout(self)
@@ -109,9 +111,13 @@ class Loop_tab(QWidget):
                 "tt_delay_frames",
             ],
             self.params,
+            config_store=self.config_store,
         )
         self.config_table.params_changed.connect(self.update_loop_params)
         right.addWidget(self.config_table)
+
+        # Apply settings if a full config is loaded from disk.
+        self.config_store.changed.connect(lambda: self.update_loop_params(dict(self.params)))
 
         self.peak_max = 0.0
         self.scheduler.loop_ready.connect(self.update_graphs)
@@ -157,14 +163,14 @@ class Loop_tab(QWidget):
 
     @Slot(dict)
     def update_loop_params(self, params: dict) -> None:
-        self.params = params
-        self.scheduler._loop_gain = params.get("loop_gain")
-        self.scheduler._loop_leak = params.get("loop_leak")
+        # `params` is a snapshot; the source of truth is self.params (shared store mapping).
+        self.scheduler._loop_gain = self.params.get("loop_gain")
+        self.scheduler._loop_leak = self.params.get("loop_leak")
 
 
         # Optional: DM servo lag (integer frames). Keep default=1 if missing.
         try:
-            dm_delay_frames = int(params.get("dm_delay_frames", 1))
+            dm_delay_frames = int(self.params.get("dm_delay_frames", 1))
         except Exception:
             dm_delay_frames = 1
         if hasattr(self.scheduler, "set_dm_delay_frames"):
@@ -172,24 +178,24 @@ class Loop_tab(QWidget):
 
         # Separate tip-tilt controller (uses NGS WFS). Safe defaults if missing.
         try:
-            tt_enabled = bool(params.get("tt_enabled", False))
+            tt_enabled = bool(self.params.get("tt_enabled", False))
         except Exception:
             tt_enabled = False
         try:
-            tt_gain = float(params.get("tt_gain", 0.25))
+            tt_gain = float(self.params.get("tt_gain", 0.25))
         except Exception:
             tt_gain = 0.25
         try:
-            tt_leak = float(params.get("tt_leak", 0.0))
+            tt_leak = float(self.params.get("tt_leak", 0.0))
         except Exception:
             tt_leak = 0.0
         try:
-            tt_rate_hz = float(params.get("tt_rate_hz", 0.0))
+            tt_rate_hz = float(self.params.get("tt_rate_hz", 0.0))
         except Exception:
             tt_rate_hz = 0.0
 
         try:
-            tt_delay_frames = int(params.get("tt_delay_frames", 0))
+            tt_delay_frames = int(self.params.get("tt_delay_frames", 0))
         except Exception:
             tt_delay_frames = 0
 

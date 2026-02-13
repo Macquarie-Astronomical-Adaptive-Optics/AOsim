@@ -1,5 +1,7 @@
 # sensor_tab_widget.py
 
+from __future__ import annotations
+
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel,
@@ -11,6 +13,11 @@ import scripts.utilities as ut
 from scripts.widgets.pgcanvas import PGCanvas
 from scripts.worker import CalculateWorker  # singleton shared worker
 from scripts.widgets.config_table import Config_table
+
+try:
+    from scripts.core.config_store import ConfigStore
+except Exception:  # pragma: no cover
+    ConfigStore = None  # type: ignore
 from data.CONFIG_DTYPES import enforce_config_types
 
 ARCSEC2RAD = 3.141592653589793 / (180.0 * 3600.0)
@@ -39,10 +46,19 @@ class SensorTabWidget(QWidget):
     actuator_changed = Signal(int, int)  # (actuator index, job_id)
     sensor_changed = Signal(object)
 
-    def __init__(self, params: dict, sensor_name: str = "main_sensor", sensor=None, parent=None):
+    def __init__(
+        self,
+        params,
+        sensor_name: str = "main_sensor",
+        sensor=None,
+        parent=None,
+        *,
+        config_store: ConfigStore | None = None,
+    ):
         super().__init__(parent)
         self.params = params
         self.sensor_name = sensor_name
+        self._store = config_store
 
         if sensor is None:
             sensor = ut.WFSensor_tools.ShackHartmann(
@@ -77,7 +93,6 @@ class SensorTabWidget(QWidget):
 
         # config table triggers
         self.config_table.params_changed.connect(self.recalculate)
-        self.config_table.params_changed.connect(ut.set_params)
 
         # connect actuator updates to shared worker
         self.actuator_changed.connect(
@@ -150,7 +165,7 @@ class SensorTabWidget(QWidget):
             "wfs_read_noise_e",
             "wfs_centroid_window_px",
         ]
-        self.config_table = Config_table(config_keys, self.params)
+        self.config_table = Config_table(config_keys, self.params, config_store=self._store)
         left_v.addWidget(self.config_table)
 
         self.busy_label = QLabel("Waiting")
@@ -390,4 +405,22 @@ class SensorTabWidget(QWidget):
         CalculateWorker.instance().request_recompute(self.sensor, dict(self.params))
         self._schedule_update(self.act_select_spinbox.value())
         self.sensor_changed.emit(self.sensor)
+
+    def reload_from_store(self) -> None:
+        """Refresh UI + sensor object from the current backing config.
+
+        Intended for when the central config is loaded from disk.
+        """
+        self.job_id += 1
+        enforce_config_types(self.params)
+        try:
+            self.config_table.refresh()
+        except Exception:
+            pass
+
+        # Apply per-sensor settings (dx/dy/subap/wavelength/etc) and recompute.
+        self._apply_sensor_params_to_sensor()
+        self.busy_label.setText("Recomputing…")
+        CalculateWorker.instance().request_recompute(self.sensor, dict(self.params))
+        self._schedule_update(self.act_select_spinbox.value())
 

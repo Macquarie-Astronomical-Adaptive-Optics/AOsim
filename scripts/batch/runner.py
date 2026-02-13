@@ -9,6 +9,10 @@ import cupy as cp
 import logging
 logger = logging.getLogger(__name__)
 import numpy as np
+import threading
+import queue
+import gc
+from astropy.io import fits
 
 from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy
 from scripts.fits_writer import PsfFITSRecorder
@@ -408,18 +412,30 @@ def fit_moffat2d_wings(
     }
 
 class PsfMemmapRecorder:
-    """Chunked PSF recorder.
+    """Chunked PSF recorder to a raw numpy memmap on disk.
 
-    Writes normalized PSFs to disk as float16 using a numpy memmap.
+    This is intended as a *fast intermediate* format during a run.
+    After the run, the memmap can be converted to a standard FITS file and
+    the temporary memmap deleted.
+
+    Notes
+    -----
+    - The file is a raw binary memmap (no header). Shape/dtype are known from
+      the run configuration.
+    - Writes are sequential and contiguous for best performance.
     """
 
-    out_path: str
-    n_frames: int
-    psf_shape: Tuple[int, int]
-    chunk: int = 256
-    dtype: np.dtype = np.float16
-
-    def __post_init__(self):
+    def __init__(
+        self,
+        out_path: str,
+        n_frames: int,
+        psf_shape: Tuple[int, int],
+        dtype: np.dtype = np.float16,
+    ):
+        self.out_path = str(out_path)
+        self.n_frames = int(n_frames)
+        self.psf_shape = (int(psf_shape[0]), int(psf_shape[1]))
+        self.dtype = np.dtype(dtype)
         os.makedirs(os.path.dirname(self.out_path) or ".", exist_ok=True)
         self._mm = np.memmap(
             self.out_path,
@@ -429,19 +445,140 @@ class PsfMemmapRecorder:
         )
         self._i0 = 0
 
-    def write_chunk(self, psf_batch: cp.ndarray):
-        """Write (B,H,W) batch to memmap."""
-        B = int(psf_batch.shape[0])
+    @property
+    def frames_written(self) -> int:
+        return int(self._i0)
+
+    def write_chunk_np(self, psf_batch_np: np.ndarray):
+        """Write a (B,H,W) numpy batch to the memmap."""
+        if psf_batch_np.ndim != 3:
+            raise ValueError("psf_batch_np must be (B,H,W)")
+        B, H, W = map(int, psf_batch_np.shape)
+        if (H, W) != self.psf_shape:
+            raise ValueError(f"psf_batch_np shape mismatch: expected (*,{self.psf_shape}), got {psf_batch_np.shape}")
         i1 = self._i0 + B
         if i1 > self.n_frames:
-            raise ValueError("PSF recorder overflow")
-        self._mm[self._i0 : i1] = cp.asnumpy(psf_batch).astype(self.dtype, copy=False)
+            raise ValueError("PSF memmap overflow")
+        if psf_batch_np.dtype != self.dtype:
+            psf_batch_np = psf_batch_np.astype(self.dtype, copy=False)
+        self._mm[self._i0:i1, :, :] = psf_batch_np
         self._i0 = i1
 
     def flush(self):
         self._mm.flush()
 
+    def close(self):
+        try:
+            self._mm.flush()
+        finally:
+            self._mm = None
+            gc.collect()
 
+
+class AsyncMemmapWriter:
+    """Background writer thread for PSF memmap recording.
+
+    The main simulation thread still pays for the GPU->CPU transfer (cp.asnumpy),
+    but disk writes are moved off-thread so the sim loop is less likely to stall
+    on filesystem flushes.
+    """
+
+    def __init__(self, sink: PsfMemmapRecorder, max_queue_chunks: int = 8):
+        self.sink = sink
+        self.q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=max(1, int(max_queue_chunks)))
+        self._exc: Optional[BaseException] = None
+        self._th = threading.Thread(target=self._run, name="psf-memmap-writer", daemon=True)
+        self._th.start()
+
+    @property
+    def frames_written(self) -> int:
+        return self.sink.frames_written
+
+    def _run(self):
+        try:
+            while True:
+                item = self.q.get()
+                try:
+                    if item is None:
+                        break
+                    self.sink.write_chunk_np(item)
+                finally:
+                    self.q.task_done()
+        except BaseException as e:
+            self._exc = e
+
+    def write_chunk_np(self, arr: np.ndarray):
+        if self._exc is not None:
+            raise RuntimeError("AsyncMemmapWriter failed") from self._exc
+        self.q.put(arr)
+
+    def flush_and_close(self):
+        self.q.put(None)
+        self.q.join()
+        self._th.join()
+        if self._exc is not None:
+            raise RuntimeError("AsyncMemmapWriter failed") from self._exc
+        self.sink.flush()
+        self.sink.close()
+
+
+def write_psf_fits_from_memmap(
+    memmap_path: str,
+    fits_path: str,
+    n_frames_valid: int,
+    psf_shape: Tuple[int, int],
+    dtype: np.dtype,
+    chunk_frames: int,
+    primary_header: Optional[Dict[str, Any]] = None,
+    longexp: Optional[np.ndarray] = None,
+    longexp_header: Optional[Dict[str, Any]] = None,
+):
+    """Convert a raw PSF memmap to a chunked FITS file.
+
+    Produces a FITS file with:
+      - PrimaryHDU with `primary_header`
+      - One ImageHDU per chunk, EXTNAME='PSF', data shape (B,H,W)
+      - Optional LONGEXP ImageHDU (2D)
+    """
+    n_frames_valid = int(n_frames_valid)
+    H, W = map(int, psf_shape)
+
+    hdr0 = fits.Header()
+    if primary_header:
+        for k, v in primary_header.items():
+            try:
+                hdr0[str(k)[:8]] = v
+            except Exception:
+                pass
+
+    hdus: List[fits.hdu.base.ExtensionHDU] = [fits.PrimaryHDU(header=hdr0)]
+
+    if n_frames_valid > 0:
+        mm = np.memmap(memmap_path, mode="r", dtype=np.dtype(dtype), shape=(n_frames_valid, H, W))
+        extver = 1
+        for i0 in range(0, n_frames_valid, int(chunk_frames)):
+            i1 = min(i0 + int(chunk_frames), n_frames_valid)
+            data = np.array(mm[i0:i1], copy=False)
+            h = fits.ImageHDU(data=data, name="PSF")
+            h.header["I0"] = int(i0)
+            h.header["I1"] = int(i1)
+            h.header["EXTVER"] = int(extver)
+            extver += 1
+            hdus.append(h)
+        del mm
+        gc.collect()
+
+    if longexp is not None:
+        h = fits.ImageHDU(data=np.asarray(longexp), name="LONGEXP")
+        if longexp_header:
+            for k, v in longexp_header.items():
+                try:
+                    h.header[str(k)[:8]] = v
+                except Exception:
+                    pass
+        hdus.append(h)
+
+    fits.HDUList(hdus).writeto(fits_path, overwrite=True, output_verify="silentfix")
 class StructureFunctionAccumulator:
     """Accumulate spatial structure function over time for a few pixel lags."""
 
@@ -527,8 +664,8 @@ class AOBatchRunner:
         dm_delay_frames: int = 1,
 
         # Separate NGS-based tip-tilt controller
-        tt_enabled: bool = False,
-        tt_gain: float = 0.25,
+        tt_enabled: bool = True,
+        tt_gain: float = 0.1,
         tt_leak: float = 0.0,
         tt_rate_hz: float = 0.0,
         tt_delay_frames: int = 1,
@@ -775,8 +912,35 @@ class AOBatchRunner:
         write_eval_uncorrected_fits: bool = True,
         # If False, skip computing/accumulating uncorrected off-axis PSFs (speed).
         eval_accumulate_uncorrected: bool = True,
-    ) -> Dict[str, object]:
+
+        # PSF recording backend:
+        #   - "fits": current streaming FITS writer (lowest temporary disk usage)
+        #   - "memmap": write to a temporary raw memmap during the run, then
+        #              convert to FITS once at the end (often steadier FPS on Windows).
+        record_psfs_backend: str = "memmap",
+        # Only used when record_psfs_backend="memmap"
+        record_psfs_memmap_async: bool = True,
+        record_psfs_memmap_dtype: str = "float32",  # "float16" or "float32"
+        record_psfs_memmap_queue_chunks: int = 8,
+        record_psfs_memmap_keep: bool = False,  # if True, keep .mmap temp files after FITS conversion
+
+        ) -> Dict[str, object]:
         n_frames = int(n_frames)
+
+        record_backend = str(record_psfs_backend or "fits").strip().lower()
+        if record_backend not in ("fits", "memmap"):
+            raise ValueError(f"record_psfs_backend must be 'fits' or 'memmap', got {record_psfs_backend!r}")
+
+        _mm_dtype_s = str(record_psfs_memmap_dtype or "float16").strip().lower()
+        if _mm_dtype_s in ("float16", "f16", "16"):
+            mm_dtype = np.float16
+            mm_cp_dtype = cp.float16
+        elif _mm_dtype_s in ("float32", "f32", "32"):
+            mm_dtype = np.float32
+            mm_cp_dtype = cp.float32
+        else:
+            raise ValueError(f"record_psfs_memmap_dtype must be 'float16' or 'float32', got {record_psfs_memmap_dtype!r}")
+
         patch_M = int(getattr(self, "patch_M", getattr(self.sensors[0], "grid_size", self.pupil.shape[0])))
         if fft_pad is None:
             fft_pad = patch_M // 2
@@ -934,32 +1098,56 @@ class AOBatchRunner:
 
 
         os.makedirs(out_dir, exist_ok=True)
+
+        # Per-frame PSF recording (optional)
         rec_corr = None
         rec_unc = None
         rec_corr_tt = None
 
-        # Per-frame PSF recording (optional)
+        mm_corr = None
+        mm_unc = None
+        mm_corr_tt = None
+        mm_corr_path = None
+        mm_unc_path = None
+        mm_corr_tt_path = None
+
         if record_psfs:
-            # Stream per-frame PSFs to FITS (multiple IMAGE extensions), float32.
             hdr = {
                 "DT": float(dt_s),
                 "LAMSCI": float(lam_sci),
                 "ROI": int(psf_roi),
                 "CHUNK": int(chunk_frames),
                 "TTMODE": str(self.psf_tt_mode),
+                "BACKEND": str(record_backend),
             }
-            rec_corr = PsfFITSRecorder(
-                out_path=os.path.join(out_dir, "psf_corrected.fits"),
-                psf_shape=(psf_roi, psf_roi),
-                extra_header=hdr,
-                extname_chunks="PSF",
-            )
-            rec_unc = PsfFITSRecorder(
-                out_path=os.path.join(out_dir, "psf_uncorrected.fits"),
-                psf_shape=(psf_roi, psf_roi),
-                extra_header=hdr,
-                extname_chunks="PSF",
-            )
+
+            if record_backend == "fits":
+                # Stream per-frame PSFs to FITS (multiple IMAGE extensions)
+                rec_corr = PsfFITSRecorder(
+                    out_path=os.path.join(out_dir, "psf_corrected.fits"),
+                    psf_shape=(psf_roi, psf_roi),
+                    extra_header=hdr,
+                    extname_chunks="PSF",
+                )
+                rec_unc = PsfFITSRecorder(
+                    out_path=os.path.join(out_dir, "psf_uncorrected.fits"),
+                    psf_shape=(psf_roi, psf_roi),
+                    extra_header=hdr,
+                    extname_chunks="PSF",
+                )
+            else:
+                # Write to temporary memmaps during the run, then convert to FITS at the end.
+                mm_corr_path = os.path.join(out_dir, "psf_corrected.mmap")
+                mm_unc_path = os.path.join(out_dir, "psf_uncorrected.mmap")
+                sink_corr = PsfMemmapRecorder(mm_corr_path, n_frames=n_frames, psf_shape=(psf_roi, psf_roi), dtype=mm_dtype)
+                sink_unc = PsfMemmapRecorder(mm_unc_path, n_frames=n_frames, psf_shape=(psf_roi, psf_roi), dtype=mm_dtype)
+
+                if record_psfs_memmap_async:
+                    mm_corr = AsyncMemmapWriter(sink_corr, max_queue_chunks=int(record_psfs_memmap_queue_chunks))
+                    mm_unc = AsyncMemmapWriter(sink_unc, max_queue_chunks=int(record_psfs_memmap_queue_chunks))
+                else:
+                    mm_corr = sink_corr
+                    mm_unc = sink_unc
 
         # Optional: record TT-removed corrected PSFs (hybrid mode only)
         if record_psfs_ttremoved and self.psf_tt_mode == "hybrid":
@@ -970,15 +1158,24 @@ class AOBatchRunner:
                 "CHUNK": int(chunk_frames),
                 "TTMODE": "hybrid",
                 "TTREM": True,
+                "BACKEND": str(record_backend),
             }
-            rec_corr_tt = PsfFITSRecorder(
-                out_path=os.path.join(out_dir, "psf_corrected_ttremoved.fits"),
-                psf_shape=(psf_roi, psf_roi),
-                extra_header=hdr_tt,
-                extname_chunks="PSF",
-            )
+            if record_backend == "fits":
+                rec_corr_tt = PsfFITSRecorder(
+                    out_path=os.path.join(out_dir, "psf_corrected_ttremoved.fits"),
+                    psf_shape=(psf_roi, psf_roi),
+                    extra_header=hdr_tt,
+                    extname_chunks="PSF",
+                )
+            else:
+                mm_corr_tt_path = os.path.join(out_dir, "psf_corrected_ttremoved.mmap")
+                sink_tt = PsfMemmapRecorder(mm_corr_tt_path, n_frames=n_frames, psf_shape=(psf_roi, psf_roi), dtype=mm_dtype)
+                if record_psfs_memmap_async:
+                    mm_corr_tt = AsyncMemmapWriter(sink_tt, max_queue_chunks=int(record_psfs_memmap_queue_chunks))
+                else:
+                    mm_corr_tt = sink_tt
 
-        # Accumulators
+# Accumulators
         dx_m = float(self.params.get("telescope_diameter")) / float(patch_M)
         sf = StructureFunctionAccumulator(self.pupil, dx_m=dx_m, lags_px=structure_lags_px)
 
@@ -1328,7 +1525,7 @@ class AOBatchRunner:
                     # TT-removed corrected PSFs via phase-ramp compensation.
                     # If recording TT-removed PSFs, compute full chunk; otherwise
                     # compute only used frames for stats.
-                    if rec_corr_tt is not None:
+                    if (rec_corr_tt is not None) or (mm_corr_tt is not None):
                         Icorr_tt = _phase_to_psf_batch(
                             buf_corr[:B],
                             self.pupil,
@@ -1342,7 +1539,15 @@ class AOBatchRunner:
                         )
                         if B_used > 0:
                             sum_psf_corr_tt += cp.sum(Icorr_tt[off_used:], axis=0)
-                        rec_corr_tt.write_chunk(Icorr_tt)
+                        if record_backend == "fits":
+                            rec_corr_tt.write_chunk(Icorr_tt)
+                        else:
+                            if mm_cp_dtype == cp.float16:
+                                tt_np = cp.asnumpy(Icorr_tt.astype(cp.float16))
+                            else:
+                                tt_np = cp.asnumpy(Icorr_tt)
+                            mm_corr_tt.write_chunk_np(tt_np)
+
                     elif B_used > 0:
                         Icorr_tt = _phase_to_psf_batch(
                             buf_corr[off_used:B],
@@ -1357,10 +1562,21 @@ class AOBatchRunner:
                         )
                         sum_psf_corr_tt += cp.sum(Icorr_tt, axis=0)
 
+                
                 if record_psfs:
                     # When recording PSFs, Icorr/Iunc are always full-chunk.
-                    rec_corr.write_chunk(Icorr)
-                    rec_unc.write_chunk(Iunc)
+                    if record_backend == "fits":
+                        rec_corr.write_chunk(Icorr)
+                        rec_unc.write_chunk(Iunc)
+                    else:
+                        if mm_cp_dtype == cp.float16:
+                            corr_np = cp.asnumpy(Icorr.astype(cp.float16))
+                            unc_np = cp.asnumpy(Iunc.astype(cp.float16))
+                        else:
+                            corr_np = cp.asnumpy(Icorr)
+                            unc_np = cp.asnumpy(Iunc)
+                        mm_corr.write_chunk_np(corr_np)
+                        mm_unc.write_chunk_np(unc_np)
                 b = 0
 
                 # Progress callback (rate-limited)
@@ -1456,27 +1672,130 @@ class AOBatchRunner:
                         append_image_hdu(f, cp.asnumpy(psf_long_unc_eval[k]), extname="LONGEXP", extver=1)
                     eval_long_unc_fits.append(fpath_u)
 
-        # Append LONGEXP extensions into the per-frame PSF FITS files
-        if record_psfs and rec_corr is not None and rec_unc is not None:
+        
+        # Per-frame PSF outputs:
+        #   - fits backend: stream during the run, then append LONGEXP and close
+        #   - memmap backend: write temporary .mmap during the run, then convert once here
+        if record_psfs and record_backend == "fits" and rec_corr is not None and rec_unc is not None:
             try:
                 rec_corr.write_longexp(psf_long_corr, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
                 rec_unc.write_longexp(psf_long_unc, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
             except Exception:
                 pass
-        if rec_corr_tt is not None and psf_long_corr_tt is not None:
+
+        if record_backend == "fits" and rec_corr_tt is not None and psf_long_corr_tt is not None:
             try:
                 rec_corr_tt.write_longexp(psf_long_corr_tt, extname="LONGEXP", extra_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)})
             except Exception:
                 pass
 
-        # Finalize recorders
-        if record_psfs and rec_corr is not None and rec_unc is not None:
+        # Finalize fits recorders
+        if record_psfs and record_backend == "fits" and rec_corr is not None and rec_unc is not None:
             rec_corr.close()
             rec_unc.close()
-        if rec_corr_tt is not None:
+        if record_backend == "fits" and rec_corr_tt is not None:
             rec_corr_tt.close()
 
-        # FWHM estimates via Gaussian fit (uses GPU LM fit)
+        # Convert memmaps -> FITS (and optionally delete temp files)
+        if record_psfs and record_backend == "memmap":
+            def _close_mm(w):
+                if w is None:
+                    return
+                if isinstance(w, AsyncMemmapWriter):
+                    w.flush_and_close()
+                else:
+                    w.flush()
+                    w.close()
+
+            # Close writers before conversion
+            _close_mm(mm_corr)
+            _close_mm(mm_unc)
+            _close_mm(mm_corr_tt)
+
+            # Determine valid frame count (be conservative if something went odd)
+            n_rec = int(n_done)
+            try:
+                if mm_corr is not None:
+                    n_rec = min(n_rec, int(mm_corr.frames_written))
+                if mm_unc is not None:
+                    n_rec = min(n_rec, int(mm_unc.frames_written))
+                if mm_corr_tt is not None:
+                    n_rec = min(n_rec, int(mm_corr_tt.frames_written))
+            except Exception:
+                pass
+
+            # Write FITS files matching the "fits" backend filenames
+            if mm_corr_path is not None and mm_unc_path is not None:
+                write_psf_fits_from_memmap(
+                    memmap_path=mm_corr_path,
+                    fits_path=os.path.join(out_dir, "psf_corrected.fits"),
+                    n_frames_valid=n_rec,
+                    psf_shape=(psf_roi, psf_roi),
+                    dtype=mm_dtype,
+                    chunk_frames=chunk_frames,
+                    primary_header={
+                        "DT": float(dt_s),
+                        "LAMSCI": float(lam_sci),
+                        "ROI": int(psf_roi),
+                        "CHUNK": int(chunk_frames),
+                        "TTMODE": str(self.psf_tt_mode),
+                        "BACKEND": "memmap",
+                    },
+                    longexp=cp.asnumpy(psf_long_corr),
+                    longexp_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)},
+                )
+                write_psf_fits_from_memmap(
+                    memmap_path=mm_unc_path,
+                    fits_path=os.path.join(out_dir, "psf_uncorrected.fits"),
+                    n_frames_valid=n_rec,
+                    psf_shape=(psf_roi, psf_roi),
+                    dtype=mm_dtype,
+                    chunk_frames=chunk_frames,
+                    primary_header={
+                        "DT": float(dt_s),
+                        "LAMSCI": float(lam_sci),
+                        "ROI": int(psf_roi),
+                        "CHUNK": int(chunk_frames),
+                        "TTMODE": str(self.psf_tt_mode),
+                        "BACKEND": "memmap",
+                    },
+                    longexp=cp.asnumpy(psf_long_unc),
+                    longexp_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)},
+                )
+
+                if not bool(record_psfs_memmap_keep):
+                    for p in (mm_corr_path, mm_unc_path):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+
+            if mm_corr_tt_path is not None and psf_long_corr_tt is not None:
+                write_psf_fits_from_memmap(
+                    memmap_path=mm_corr_tt_path,
+                    fits_path=os.path.join(out_dir, "psf_corrected_ttremoved.fits"),
+                    n_frames_valid=n_rec,
+                    psf_shape=(psf_roi, psf_roi),
+                    dtype=mm_dtype,
+                    chunk_frames=chunk_frames,
+                    primary_header={
+                        "DT": float(dt_s),
+                        "LAMSCI": float(lam_sci),
+                        "ROI": int(psf_roi),
+                        "CHUNK": int(chunk_frames),
+                        "TTMODE": "hybrid",
+                        "TTREM": True,
+                        "BACKEND": "memmap",
+                    },
+                    longexp=cp.asnumpy(psf_long_corr_tt),
+                    longexp_header={"USED": int(n_used), "DISCARD": int(discard_first_frames)},
+                )
+                if not bool(record_psfs_memmap_keep):
+                    try:
+                        os.remove(mm_corr_tt_path)
+                    except Exception:
+                        pass
+# FWHM estimates via Gaussian fit (uses GPU LM fit)
         zoom = int(self.params.get("fwhm_zoom", 2))
         fitter = Gaussian2DFitter(roi_half=int(self.params.get("fwhm_roi_half", 32)))
 

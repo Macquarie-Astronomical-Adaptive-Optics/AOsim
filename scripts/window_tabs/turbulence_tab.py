@@ -20,6 +20,7 @@ from scripts.phase_screen.infinite_vonkarman import LayeredInfinitePhaseScreen
 from scripts.schedulerGPU import SimWorker
 from scripts.utilities import Pupil_tools
 from scripts.widgets.config_table import Config_table
+from scripts.core.config_store import ConfigStore
 from scripts.widgets.dual_list_selector import DualListSelector
 from scripts.widgets.loading_label import DotLoadingLabel
 from scripts.widgets.pgcanvas import PGCanvas
@@ -42,23 +43,39 @@ class Turbulence_tab(QWidget):
     req_emit_overview = Signal()
     req_visible_sensor = Signal(int)
 
-    def __init__(self, config_dict: dict, sensors: dict):
+    def __init__(self, config_dict: dict | ConfigStore, sensors: dict):
         super().__init__()
 
-        self.params = config_dict
+        self.config_store = config_dict if isinstance(config_dict, ConfigStore) else ConfigStore(dict(config_dict))
+        self.params = self.config_store.data
         self.sensors = sensors
         self.initDone = False
 
         self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
-        self.turbulence_screens = self._load_turbulence_configs()
+        self._ensure_turbulence_profiles()
 
-        # pick first config for now
-        screen = self.turbulence_screens[0]
-        data = screen["data"]
+        # Active profile is stored in config as a name.
+        profiles: Dict[str, Dict[str, Any]] = self.params.get("turbulence_profiles", {})
+        if not profiles:
+            raise FileNotFoundError(
+                "No turbulence profiles available. Provide params['turbulence_profiles'] or add turbulence/*.json."
+            )
+        self.active_profile_name = str(self.params.get("turbulence_active") or (next(iter(profiles.keys())) if profiles else ""))
+        if not self.active_profile_name or self.active_profile_name not in profiles:
+            # Fallback to any available profile
+            self.active_profile_name = next(iter(profiles.keys()))
+            self.params["turbulence_active"] = self.active_profile_name
+
+        data = profiles[self.active_profile_name]
+        fn_name = data.get("function")
+        if fn_name not in self.available_funcs:
+            raise KeyError(f"Unknown turbulence screen function: {fn_name!r} in profile {self.active_profile_name!r}")
+        screen_func = self.available_funcs[fn_name]
 
         # split base kwargs vs layer list (IMPORTANT: avoids double-adding layers)
-        layers = list(data.get("layers", []))
-        base_kwargs = {k: v for k, v in data.items() if k != "layers"}
+        # Keep the *same* list object from config so edits/save/load stay in sync.
+        layers = data.setdefault("layers", [])
+        base_kwargs = {k: v for k, v in data.items() if k not in ("layers", "function")}
         N = int(base_kwargs["N"])
 
         self.turbWidgets: Dict[int, TurbulenceWidget] = {}
@@ -67,7 +84,9 @@ class Turbulence_tab(QWidget):
         # build widgets from layer configs (GUI side only)
         for i, layer in enumerate(layers):
             name = f"Layer {i+1}"
-            self.turbWidgets[i] = TurbulenceWidget(name, screen["function"], layer)
+            if isinstance(layer, dict) and "name" not in layer:
+                layer["name"] = name
+            self.turbWidgets[i] = TurbulenceWidget(name, screen_func, layer, config_store=self.config_store)
 
         # sensors -> angles (radians) (used for debug output)
         thetas = [s.field_angle for s in self.sensors.values()]  # list of (theta_x, theta_y) rad
@@ -178,7 +197,7 @@ class Turbulence_tab(QWidget):
 
         logger.info("Building Turbulence Screen Generator")
         self.scheduler = SimWorker(
-            sim_factory=screen["function"],
+            sim_factory=screen_func,
             sim_kwargs=base_kwargs,
             layers=layers,
             pupil_mask=Pupil_tools.generate_pupil(N, self.params.get("telescope_center_obscuration")),
@@ -236,7 +255,7 @@ class Turbulence_tab(QWidget):
         # worker emits stacks
         self.overview_tab = SensorView_tab(
             sensors,
-            config_dict,
+            self.params,
             layers,
             N,
             self.params.get("telescope_diameter") / N,
@@ -254,54 +273,102 @@ class Turbulence_tab(QWidget):
         self.req_overview_enabled.emit(True)
         self.req_emit_overview.emit()
 
-        self.reconstructor_tab = Reconstructor_tab(config_dict, self.scheduler)
+        self.reconstructor_tab = Reconstructor_tab(self.params, self.scheduler)
         self.scheduler.reconstructed_ready.connect(self.reconstructor_tab.update_view)
         self.scheduler.recon_matr_ready.connect(self.reconstructor_tab.update_mat_view)
 
-    def _load_turbulence_configs(self) -> List[Dict[str, Any]]:
+        # Keep layer tables in sync on load.
+        self.config_store.changed.connect(self._on_store_changed)
+
+    def _on_store_changed(self) -> None:
+        """Best-effort refresh when the central config is loaded."""
+        try:
+            # Update label if r0 changed etc (worker will also emit new values when running).
+            pass
+        except Exception:
+            pass
+
+    def _load_turbulence_profiles_from_disk(self) -> Dict[str, Dict[str, Any]]:
+        """Load legacy turbulence/*.json profiles from disk.
+
+        These get migrated into params["turbulence_profiles"].
+        """
         screen_directory = Path(__file__).parent.parent.parent / "turbulence"
 
-        configs: List[Dict[str, Any]] = []
+        profiles: Dict[str, Dict[str, Any]] = {}
+        if not screen_directory.exists():
+            return profiles
+
         for file_path in sorted(screen_directory.iterdir()):
             if not (file_path.is_file() and file_path.suffix.lower() == ".json"):
                 continue
             with file_path.open("r", encoding="utf-8") as f:
                 content = json.load(f)
+            if not isinstance(content, dict):
+                continue
+            profiles[file_path.stem] = content
 
-            fn_name = content.get("function")
-            if fn_name not in self.available_funcs:
-                raise KeyError(f"Unknown turbulence screen function: {fn_name!r} in {file_path.name}")
+        return profiles
 
-            content_name = file_path.stem
-            content_data = {k: v for k, v in content.items() if k != "function"}
-            configs.append(
-                {
-                    "name": content_name,
-                    "data": content_data,
-                    "function": self.available_funcs[fn_name],
-                }
-            )
+    def _ensure_turbulence_profiles(self) -> None:
+        """Ensure turbulence configs live in the central config file.
 
-        if not configs:
-            raise FileNotFoundError(f"No turbulence configs found in {screen_directory}")
+        Migrates the legacy turbulence/*.json files into params["turbulence_profiles"].
+        """
+        profiles = self.params.get("turbulence_profiles")
+        if isinstance(profiles, dict) and profiles:
+            return
 
-        return configs
+        migrated = self._load_turbulence_profiles_from_disk()
+        if migrated:
+            self.params["turbulence_profiles"] = migrated
+            if "turbulence_active" not in self.params:
+                self.params["turbulence_active"] = next(iter(migrated.keys()))
+            try:
+                self.config_store.changed.emit()
+            except Exception:
+                pass
 
     def add_layer(self) -> None:
-        layer_params = self.turbulence_screens[0]["data"]["layers"][0].copy()
+        profiles: Dict[str, Dict[str, Any]] = self.params.get("turbulence_profiles", {})
+        data = profiles[self.active_profile_name]
+        layers = data.setdefault("layers", [])
+        fn_name = data.get("function")
+        screen_func = self.available_funcs[fn_name]
+
+        # Template from first layer if available
+        if layers:
+            template = dict(layers[0])
+        else:
+            template = {
+                "name": "Layer 1",
+                "altitude_m": 0.0,
+                "r0": 0.25,
+                "L0": 25.0,
+                "wind": [0.0, 0.0],
+                "seed_offset": 1,
+            }
 
         i = len(self.turbWidgets)
         name = f"Layer {i+1}"
-        layer_params["name"] = name
-        layer_params["seed_offset"] = i + 1
+        new_layer = dict(template)
+        new_layer["name"] = name
+        new_layer["seed_offset"] = int(template.get("seed_offset", 0)) + i + 1
+        layers.append(new_layer)
 
-        self.req_add_layer.emit(layer_params)
+        # Notify worker + UI
+        self.req_add_layer.emit(new_layer)
 
-        turbWidget = TurbulenceWidget(name, self.turbulence_screens[0]["function"], layer_params)
+        turbWidget = TurbulenceWidget(name, screen_func, new_layer, config_store=self.config_store)
         self.turbWidgets[i] = turbWidget
         self.layer_selector._add_item(self.layer_selector.available_list, turbWidget)
         self.tab_widget.addTab(turbWidget, name)
         turbWidget.screen_params_changed.connect(lambda p, idx=i: self.scheduler.apply_layer_params(idx, p))
+
+        try:
+            self.config_store.changed.emit()
+        except Exception:
+            pass
 
     def active_change(self, items, active) -> None:
         self.scheduler.set_active([turbWidg.title for turbWidg in items], active)
@@ -383,7 +450,7 @@ class Turbulence_tab(QWidget):
 class TurbulenceWidget(QWidget):
     screen_params_changed = Signal(dict)
 
-    def __init__(self, title: str, function, params: dict, parent=None):
+    def __init__(self, title: str, function, params: dict, parent=None, *, config_store: ConfigStore | None = None):
         super().__init__(parent)
         self.title = title
         self.function = function
@@ -397,7 +464,7 @@ class TurbulenceWidget(QWidget):
         self.turb_canvas.set_colorbar(label="phase", units="rad")
         tab_layout.addWidget(self.turb_canvas)
 
-        self.config_table = Config_table(list(self.params.keys()), self.params)
+        self.config_table = Config_table(list(self.params.keys()), self.params, config_store=config_store)
         tab_layout.addWidget(self.config_table)
         self.config_table.params_changed.connect(self._on_params_changed)
 
@@ -407,8 +474,12 @@ class TurbulenceWidget(QWidget):
 
     @Slot(dict)
     def _on_params_changed(self, pc: dict) -> None:
-        self.params = pc
-        self.screen_params_changed.emit(pc)
+        # Config_table emits a snapshot dict; keep our backing mapping object.
+        try:
+            self.params.update(pc)
+        except Exception:
+            pass
+        self.screen_params_changed.emit(dict(self.params))
 
     @Slot(object)
     def update_screen(self, new_screen) -> None:

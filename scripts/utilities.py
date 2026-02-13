@@ -1177,6 +1177,31 @@ class WFSensor_tools:
     ARCSEC2RAD = cp.pi / (180.0 * 3600.0)
     RAD2ARCSEC = (180.0 * 3600.0) / cp.pi
 
+    @staticmethod
+    def _to_float_or_inf(x):
+        """Convert JSON-y values to a float, defaulting to +inf.
+
+        JSON cannot represent NaN/Inf; configs commonly encode these as
+        null/"inf"/"infinity". We interpret any non-finite / non-numeric
+        value as +inf.
+        """
+        if x is None:
+            return float("inf")
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in {"", "none", "null", "inf", "+inf", "infinity", "+infinity", "nan"}:
+                return float("inf")
+            try:
+                xf = float(s)
+            except Exception:
+                return float("inf")
+            return xf if math.isfinite(xf) else float("inf")
+        try:
+            xf = float(x)
+        except Exception:
+            return float("inf")
+        return xf if math.isfinite(xf) else float("inf")
+
     class ShackHartmann:
         """
         Shack–Hartmann WFS with LGS spot-elongation model.
@@ -1246,8 +1271,9 @@ class WFSensor_tools:
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
             
 
-            # LGS 
-            self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            # LGS
+            # NOTE: gs_range_m may come from JSON (null/"inf"/etc.).
+            self.gs_range_m = WFSensor_tools._to_float_or_inf(gs_range_m)
             self.is_lgs = not (self.gs_range_m == float("inf"))
             self.lgs_thickness_m = float(lgs_thickness_m) if lgs_thickness_m is not None else 0.0
             self.lgs_remove_tt = bool(lgs_remove_tt)
@@ -1388,7 +1414,7 @@ class WFSensor_tools:
             self.sen_angle = float(np.sqrt(self.dx * self.dx + self.dy * self.dy))
 
             if gs_range_m is not None:
-                self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+                self.gs_range_m = WFSensor_tools._to_float_or_inf(gs_range_m)
             if lgs_thickness_m is not None:
                 self.lgs_thickness_m = float(lgs_thickness_m)
             if lgs_remove_tt is not None:
@@ -2283,7 +2309,7 @@ class WFSensor_tools:
             self.grid_size = int(grid_size)
             self.pupil = pupil
 
-            self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+            self.gs_range_m = WFSensor_tools._to_float_or_inf(gs_range_m)
 
             # store angles in radians internally
             self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
@@ -2344,7 +2370,7 @@ class WFSensor_tools:
             if pupil is not None:
                 self.pupil = pupil
             if gs_range_m is not None:
-                self.gs_range_m = float(gs_range_m) if np.isfinite(gs_range_m) else float("inf")
+                self.gs_range_m = WFSensor_tools._to_float_or_inf(gs_range_m)
             if dx is not None:
                 self.dx = float(dx) * WFSensor_tools.ARCSEC2RAD
             if dy is not None:

@@ -958,11 +958,9 @@ class SimWorker(QObject):
             dx_world_m=float(self.sim.dx),
             M=self.patch_M,                             # your pupil grid
             slopes_aggregation="stack",  
-            slope_weight_mode="pupil",    # <-- important
-            slope_weight_threshold=0.20,  # ignore very partial subaps
-            slope_weight_power=2.0,        
+            slope_weight_mode="none",    # <-- important
             reg_alpha=1e-2,
-            reg_beta=1e-2,
+            reg_beta=10e-2,
         )
 
         self.R.build_interaction_matrix(chunk_modes=64, sensor_method="southwell")

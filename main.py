@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from scripts.utilities import set_params
+from scripts.core.config_store import ConfigStore
 from scripts.widgets.wrap_tab import DetachableTabWidget
 from scripts.window_tabs.log_console import add_console
 from scripts.window_tabs.long_run_tab import LongRun_tab
@@ -128,7 +129,10 @@ def init_gpu(use_gpu: bool, device_index: int, logger: Optional[logging.Logger] 
 class MainWindow(QMainWindow):
     def __init__(self, params: Dict[str, Any], *, log_console: bool = False, gpu_device: int = 0):
         super().__init__()
-        self.params = dict(params)
+        # Central shared config store. We keep one dict instance alive and mutate it
+        # in-place on load, so all tabs/widgets stay in sync.
+        self.config_store = ConfigStore(dict(params))
+        self.params = self.config_store.data
 
         self.setWindowTitle('AOsim')
 
@@ -146,10 +150,10 @@ class MainWindow(QMainWindow):
         tabs.setMovable(True)
 
         # --- Tabs ---
-        poke = Poke_tab(self.params)
+        poke = Poke_tab(self.config_store)
         tabs.addTab(poke, 'Poke Diagnostics')
 
-        turb = Turbulence_tab(self.params, poke.wfsensors)
+        turb = Turbulence_tab(self.config_store, poke.wfsensors)
         tabs.addTab(turb, 'Turbulence')
 
         sensview = turb.overview_tab
@@ -158,9 +162,9 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(turb.reconstructor_tab, 'Reconstructor')
 
-        tabs.addTab(Loop_tab(self.params, turb.scheduler), 'Loop')
+        tabs.addTab(Loop_tab(self.config_store, turb.scheduler), 'Loop')
 
-        tabs.addTab(LongRun_tab(self.params, turb.scheduler), 'Long Run')
+        tabs.addTab(LongRun_tab(self.config_store, turb.scheduler), 'Long Run')
 
         self.setCentralWidget(tabs)
 

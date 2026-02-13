@@ -21,5 +21,367 @@
     "tt_measure_average": true,
     "wfs_photons_per_subap": 0,
     "wfs_read_noise_e": 0.0,
-    "wfs_centroid_window_px": 0
+    "wfs_centroid_window_px": 0,
+    "sensors": {
+        "science": {
+            "type": "ScienceImager",
+            "wavelength": 2.15e-06,
+            "grid_size": 512
+        },
+        "LGS_NE": {
+            "type": "ShackHartmann",
+            "gs_range_m": 90000,
+            "sub_apertures": 40,
+            "dx": 169.67999999999998,
+            "dy": 169.67999999999998,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 10000.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_NW": {
+            "type": "ShackHartmann",
+            "gs_range_m": 90000,
+            "sub_apertures": 40,
+            "dx": -169.67999999999998,
+            "dy": 169.67999999999998,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 10000.0,
+            "lgs_launch_offset_px": [
+                -0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_SE": {
+            "type": "ShackHartmann",
+            "gs_range_m": 90000,
+            "sub_apertures": 40,
+            "dx": 169.67999999999998,
+            "dy": -169.67999999999998,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 10000.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_SW": {
+            "type": "ShackHartmann",
+            "gs_range_m": 90000,
+            "sub_apertures": 40,
+            "dx": -169.67999999999998,
+            "dy": -169.67999999999998,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 10000.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                -0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "NGS": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": 0.0,
+            "dy": 0.0,
+            "wfs_lambda": 1.65e-06
+        }
+    },
+    "turbulence_profiles": {
+        "InfVonKarman": {
+            "function": "InfVonKarman",
+            "N": 512,
+            "dx": 0.015625,
+            "seed": 12,
+            "layers": [
+                {
+                    "name": "Layer 1",
+                    "altitude_m": 1e-05,
+                    "r0": 0.18697,
+                    "L0": 25.0,
+                    "wind": [
+                        10.0,
+                        0.0
+                    ],
+                    "seed_offset": 1
+                },
+                {
+                    "name": "Layer 2",
+                    "altitude_m": 5000.0,
+                    "r0": 0.34873,
+                    "L0": 25.0,
+                    "wind": [
+                        7.87846,
+                        1.38919
+                    ],
+                    "seed_offset": 2
+                },
+                {
+                    "name": "Layer 3",
+                    "altitude_m": 10000.0,
+                    "r0": 0.65716,
+                    "L0": 25.0,
+                    "wind": [
+                        18.79385,
+                        6.8404
+                    ],
+                    "seed_offset": 3
+                },
+                {
+                    "name": "Layer 4",
+                    "altitude_m": 15000.0,
+                    "r0": 0.99606,
+                    "L0": 25.0,
+                    "wind": [
+                        11.25833,
+                        6.5
+                    ],
+                    "seed_offset": 4
+                }
+            ]
+        },
+        "MK": {
+            "function": "InfVonKarman",
+            "N": 512,
+            "dx": 0.015625,
+            "seed": 12,
+            "layers": [
+                {
+                    "name": "MK Layer 1",
+                    "altitude_m": 1e-05,
+                    "r0": 0.282927,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 1
+                },
+                {
+                    "name": "MK Layer 2",
+                    "altitude_m": 15.0,
+                    "r0": 0.422114,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 2
+                },
+                {
+                    "name": "MK Layer 3",
+                    "altitude_m": 30.0,
+                    "r0": 0.934382,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 3
+                },
+                {
+                    "name": "MK Layer 4",
+                    "altitude_m": 45.0,
+                    "r0": 6.02229,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 4
+                },
+                {
+                    "name": "MK Layer 5",
+                    "altitude_m": 120.0,
+                    "r0": 1.393248,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 5
+                },
+                {
+                    "name": "MK Layer 6",
+                    "altitude_m": 200.0,
+                    "r0": 2.156576,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 6
+                },
+                {
+                    "name": "MK Layer 7",
+                    "altitude_m": 280.0,
+                    "r0": 2.413311,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 7
+                },
+                {
+                    "name": "MK Layer 8",
+                    "altitude_m": 360.0,
+                    "r0": 3.146619,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 8
+                },
+                {
+                    "name": "MK Layer 9",
+                    "altitude_m": 440.0,
+                    "r0": 7.821297,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 9
+                },
+                {
+                    "name": "MK Layer 10 (FA)",
+                    "altitude_m": 8000.0,
+                    "r0": 0.240642,
+                    "L0": 50.0,
+                    "wind": [
+                        0.0,
+                        0.0
+                    ],
+                    "seed_offset": 10
+                }
+            ]
+        },
+        "Paranal": {
+            "function": "InfVonKarman",
+            "N": 512,
+            "dx": 0.015625,
+            "seed": 12,
+            "layers": [
+                {
+                "name": "Paranal (Fusco2020) Layer 1",
+                "altitude_m": 1e-05,
+                "r0": 0.17338839209825782,
+                "L0": 20.0,
+                "wind": [
+                    6.201971297186995,
+                    2.2573329459494134
+                ],
+                "seed_offset": 21
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 2",
+                "altitude_m": 100.0,
+                "r0": 1.3210316682821794,
+                "L0": 20.0,
+                "wind": [
+                    4.8329970613050515,
+                    3.3841009744711714
+                ],
+                "seed_offset": 22
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 3",
+                "altitude_m": 300.0,
+                "r0": 0.8715558683399249,
+                "L0": 20.0,
+                "wind": [
+                    3.2782168094013504,
+                    3.9068266599067876
+                ],
+                "seed_offset": 23
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 4",
+                "altitude_m": 600.0,
+                "r0": 0.6833457158085746,
+                "L0": 20.0,
+                "wind": [
+                    1.9017821778331474,
+                    4.078385041664925
+                ],
+                "seed_offset": 24
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 5",
+                "altitude_m": 1100.0,
+                "r0": 1.035758422104963,
+                "L0": 20.0,
+                "wind": [
+                    0.885605706101345,
+                    5.022519540362261
+                ],
+                "seed_offset": 25
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 6",
+                "altitude_m": 2300.0,
+                "r0": 1.035758422104963,
+                "L0": 20.0,
+                "wind": [
+                    -1.4412798746355215,
+                    8.173904350001328
+                ],
+                "seed_offset": 26
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 7",
+                "altitude_m": 4500.0,
+                "r0": 0.5357790409963813,
+                "L0": 20.0,
+                "wind": [
+                    -8.149999999999997,
+                    14.116214081686351
+                ],
+                "seed_offset": 27
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 8",
+                "altitude_m": 7800.0,
+                "r0": 0.8715558683399249,
+                "L0": 20.0,
+                "wind": [
+                    -24.738391737527554,
+                    17.322008377801584
+                ],
+                "seed_offset": 28
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 9",
+                "altitude_m": 11000.0,
+                "r0": 0.7623409054124598,
+                "L0": 20.0,
+                "wind": [
+                    -33.77890592831873,
+                    5.956132493975707
+                ],
+                "seed_offset": 29
+                },
+                {
+                "name": "Paranal (Fusco2020) Layer 10",
+                "altitude_m": 14000.0,
+                "r0": 0.7623409054124598,
+                "L0": 20.0,
+                "wind": [
+                    -15.155444566227672,
+                    -8.75
+                ],
+                "seed_offset": 30
+                }
+            ]
+        }
+    },
+    "turbulence_active": "Paranal"
 }

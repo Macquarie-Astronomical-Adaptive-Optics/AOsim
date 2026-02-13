@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from scripts.widgets.pgcanvas import PGCanvas
+from scripts.core.config_store import ConfigStore
 
 RAD2ARCSEC = (180.0 * 3600.0) / np.pi
 
@@ -38,9 +39,10 @@ class LongRun_tab(QWidget):
     req_long_run = Signal(dict)
     req_cancel_long_run = Signal()
 
-    def __init__(self, params: dict, scheduler, parent=None):
+    def __init__(self, params: dict | ConfigStore, scheduler, parent=None):
         super().__init__(parent)
-        self.params = params
+        self.config_store = params if isinstance(params, ConfigStore) else ConfigStore(dict(params))
+        self.params = self.config_store.data
         self.scheduler = scheduler
 
         # ---- UI ----
@@ -108,7 +110,7 @@ class LongRun_tab(QWidget):
         self.spin_roi = QSpinBox()
         self.spin_roi.setRange(16, 512)
         self.spin_roi.setSingleStep(16)
-        self.spin_roi.setValue(128)
+        self.spin_roi.setValue(64)
         grid.addWidget(self.spin_roi, row, 1)
 
         grid.addWidget(QLabel("TT removal"), row, 2)
