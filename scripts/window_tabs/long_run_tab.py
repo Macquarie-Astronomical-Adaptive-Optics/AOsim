@@ -110,7 +110,7 @@ class LongRun_tab(QWidget):
         self.spin_roi = QSpinBox()
         self.spin_roi.setRange(16, 512)
         self.spin_roi.setSingleStep(16)
-        self.spin_roi.setValue(64)
+        self.spin_roi.setValue(128)
         grid.addWidget(self.spin_roi, row, 1)
 
         grid.addWidget(QLabel("TT removal"), row, 2)

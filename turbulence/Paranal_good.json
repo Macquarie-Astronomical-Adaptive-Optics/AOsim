@@ -1,0 +1,118 @@
+{
+    "function": "InfVonKarman",
+    "N": 512,
+    "dx": 0.015625,
+    "seed": 12,
+    "layers": [
+        {
+            "name": "Paranal Layer 1",
+            "altitude_m": 1e-05,
+            "r0": 0.2926928571428572,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 21
+        },
+        {
+            "name": "Paranal Layer 2",
+            "altitude_m": 200.0,
+            "r0": 0.514767142857143,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 22
+        },
+        {
+            "name": "Paranal Layer 3",
+            "altitude_m": 600.0,
+            "r0": 0.6824700000000001,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 23
+        },
+        {
+            "name": "Paranal Layer 4",
+            "altitude_m": 1200.0,
+            "r0": 0.7270057142857145,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 24
+        },
+        {
+            "name": "Paranal Layer 5",
+            "altitude_m": 3000.0,
+            "r0": 0.7802414285714288,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 25
+        },
+        {
+            "name": "Paranal Layer 6",
+            "altitude_m": 4700.0,
+            "r0": 1.0344300000000002,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 26
+        },
+        {
+            "name": "Paranal Layer 7",
+            "altitude_m": 7300.0,
+            "r0": 1.101934285714286,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 27
+        },
+        {
+            "name": "Paranal Layer 8",
+            "altitude_m": 8500.0,
+            "r0": 1.2812757142857145,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 28
+        },
+        {
+            "name": "Paranal Layer 9",
+            "altitude_m": 9700.0,
+            "r0": 1.792524285714286,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 29
+        },
+        {
+            "name": "Paranal Layer 10",
+            "altitude_m": 11000.0,
+            "r0": 2.7169600000000007,
+            "L0": 50.0,
+            "wind": [
+                0.0,
+                0.0
+            ],
+            "seed_offset": 30
+        }
+    ]
+}

@@ -52,21 +52,13 @@ class Turbulence_tab(QWidget):
         self.initDone = False
 
         self.available_funcs = {"InfVonKarman": LayeredInfinitePhaseScreen}
-        self._ensure_turbulence_profiles()
 
-        # Active profile is stored in config as a name.
-        profiles: Dict[str, Dict[str, Any]] = self.params.get("turbulence_profiles", {})
-        if not profiles:
-            raise FileNotFoundError(
-                "No turbulence profiles available. Provide params['turbulence_profiles'] or add turbulence/*.json."
-            )
-        self.active_profile_name = str(self.params.get("turbulence_active") or (next(iter(profiles.keys())) if profiles else ""))
-        if not self.active_profile_name or self.active_profile_name not in profiles:
-            # Fallback to any available profile
-            self.active_profile_name = next(iter(profiles.keys()))
-            self.params["turbulence_active"] = self.active_profile_name
+        # Active turbulence profile is stored as either:
+        #   - inline: params["turbulence"]["profile"]
+        #   - file ref: params["turbulence"]["file"] (relative to project root)
+        self.active_profile_name, data, self._turb_source = self._load_active_turbulence_profile()
+        self._active_profile_data = data
 
-        data = profiles[self.active_profile_name]
         fn_name = data.get("function")
         if fn_name not in self.available_funcs:
             raise KeyError(f"Unknown turbulence screen function: {fn_name!r} in profile {self.active_profile_name!r}")
@@ -205,7 +197,7 @@ class Turbulence_tab(QWidget):
             ranges_m=ranges_m,
             patch_size_px=N,
             patch_M=N,
-            dt_s=0.001,
+            dt_s=(1/self.params.get("frame_rate")),
             emit_psf=True,
             params=self.params,
         )
@@ -248,7 +240,7 @@ class Turbulence_tab(QWidget):
 
         # layer editor changes => apply safely in worker thread
         for i, w in self.turbWidgets.items():
-            w.screen_params_changed.connect(lambda p, idx=i: self.scheduler.apply_layer_params(idx, p))
+            w.screen_params_changed.connect(lambda p, idx=i: self._on_layer_params_changed(idx, p))
 
         self.scheduler_thread.start()
 
@@ -287,6 +279,133 @@ class Turbulence_tab(QWidget):
             pass
         except Exception:
             pass
+
+
+    def _project_root(self) -> Path:
+        # turbulence_tab.py -> window_tabs -> scripts -> <project root>
+        return Path(__file__).resolve().parent.parent.parent
+
+    def _resolve_turbulence_file(self, file_ref: str) -> Path:
+        root = self._project_root()
+        p = Path(str(file_ref))
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        return p
+
+    def _scan_turbulence_folder(self) -> List[Path]:
+        folder = self._project_root() / "turbulence"
+        if not folder.exists():
+            return []
+        return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".json"])
+
+    def _load_active_turbulence_profile(self) -> tuple[str, Dict[str, Any], str]:
+        """Load the active turbulence profile.
+
+        Config schema (active only):
+            params["turbulence"] = {
+                "source": "file", "file": "turbulence/Paranal.json", "name": "Paranal"
+            }
+        or:
+            params["turbulence"] = {
+                "source": "inline", "name": "Custom", "profile": {...}
+            }
+
+        Back-compat:
+            params["turbulence_profiles"] + params["turbulence_active"]
+        """
+
+        # Back-compat migration (legacy multi-profile schema).
+        if not isinstance(self.params.get("turbulence"), dict):
+            profiles = self.params.get("turbulence_profiles")
+            if isinstance(profiles, dict) and profiles:
+                active = self.params.get("turbulence_active")
+                if not isinstance(active, str) or active not in profiles:
+                    active = next(iter(profiles.keys()))
+                prof = profiles.get(active)
+                if not isinstance(prof, dict):
+                    prof = {}
+                self.params["turbulence"] = {"source": "inline", "name": active, "profile": prof}
+                self.params.pop("turbulence_profiles", None)
+                self.params.pop("turbulence_active", None)
+            else:
+                self.params["turbulence"] = {}
+
+        tcfg = self.params.get("turbulence")
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+            self.params["turbulence"] = tcfg
+
+        source = str(tcfg.get("source") or "").strip().lower()
+
+        # Inline profile
+        prof_inline = tcfg.get("profile")
+        if source == "inline" and isinstance(prof_inline, dict):
+            name = str(tcfg.get("name") or "Inline")
+            tcfg.setdefault("name", name)
+            return name, prof_inline, "inline"
+
+        # File reference profile
+        file_ref = tcfg.get("file") or tcfg.get("path")
+        if isinstance(file_ref, str) and file_ref.strip():
+            path = self._resolve_turbulence_file(file_ref)
+            if not path.exists():
+                raise FileNotFoundError(f"Turbulence profile file not found: {path}")
+            with path.open("r", encoding="utf-8") as f:
+                prof = json.load(f)
+            if not isinstance(prof, dict):
+                raise TypeError(f"Turbulence profile JSON must be an object, got {type(prof)} in {path}")
+            name = str(tcfg.get("name") or path.stem)
+            # keep config normalized
+            tcfg["source"] = "file"
+            tcfg["file"] = str(file_ref)
+            tcfg.setdefault("name", name)
+            return name, prof, "file"
+
+        # Fallback: first JSON in turbulence folder
+        files = self._scan_turbulence_folder()
+        if not files:
+            raise FileNotFoundError(
+                "No active turbulence profile configured and no turbulence/*.json files found."
+            )
+        path = files[0]
+        # store a relative reference by default
+        try:
+            rel = str(path.relative_to(self._project_root()))
+        except Exception:
+            rel = str(path)
+        tcfg["source"] = "file"
+        tcfg["file"] = rel
+        tcfg["name"] = path.stem
+
+        with path.open("r", encoding="utf-8") as f:
+            prof = json.load(f)
+        if not isinstance(prof, dict):
+            prof = {}
+        return path.stem, prof, "file"
+
+    def _ensure_inline_turbulence(self) -> None:
+        """If the active profile is file-backed, materialize it inline so edits persist in config.json."""
+        tcfg = self.params.get("turbulence")
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+            self.params["turbulence"] = tcfg
+
+        if str(tcfg.get("source") or "").strip().lower() == "inline":
+            return
+
+        # Store the *same* dict object currently used by the UI/worker so future edits persist.
+        tcfg.clear()
+        tcfg.update({"source": "inline", "name": self.active_profile_name, "profile": self._active_profile_data})
+        self._turb_source = "inline"
+        try:
+            self.config_store.changed.emit()
+        except Exception:
+            pass
+
+    def _on_layer_params_changed(self, idx: int, params: dict) -> None:
+        # Any edit should persist in the main config; switch to inline if needed.
+        self._ensure_inline_turbulence()
+        self.scheduler.apply_layer_params(idx, params)
 
     def _load_turbulence_profiles_from_disk(self) -> Dict[str, Dict[str, Any]]:
         """Load legacy turbulence/*.json profiles from disk.
@@ -330,8 +449,8 @@ class Turbulence_tab(QWidget):
                 pass
 
     def add_layer(self) -> None:
-        profiles: Dict[str, Dict[str, Any]] = self.params.get("turbulence_profiles", {})
-        data = profiles[self.active_profile_name]
+        self._ensure_inline_turbulence()
+        data = self._active_profile_data
         layers = data.setdefault("layers", [])
         fn_name = data.get("function")
         screen_func = self.available_funcs[fn_name]

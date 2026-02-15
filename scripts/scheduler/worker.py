@@ -958,9 +958,11 @@ class SimWorker(QObject):
             dx_world_m=float(self.sim.dx),
             M=self.patch_M,                             # your pupil grid
             slopes_aggregation="stack",  
-            slope_weight_mode="none",    # <-- important
+            slope_weight_mode="pupil",    # <-- important
+            slope_weight_threshold=0.20,  # ignore very partial subaps
+            slope_weight_power=2.0,        
             reg_alpha=1e-2,
-            reg_beta=10e-2,
+            reg_beta=1e-2,
         )
 
         self.R.build_interaction_matrix(chunk_modes=64, sensor_method="southwell")
@@ -1833,18 +1835,18 @@ class SimWorker(QObject):
         phi_res_perf -= cp.mean(phi_res_perf[m])
         phi_res_perf = remove_tt(phi_res_perf, self.pupil_mask)
 
-        surf_m = Pupil_tools.dm_surface_from_commands(
-            commands=-xhat,
-            pupil=self.pupil_mask,
-            grid_size=self.patch_M,
-            sigma=None,
-            dtype=cp.float32,
-        )
+        # surf_m = Pupil_tools.dm_surface_from_commands(
+        #     commands=-xhat,
+        #     pupil=self.pupil_mask,
+        #     grid_size=self.patch_M,
+        #     sigma=None,
+        #     dtype=cp.float32,
+        # )
 
         self.reconstructed_ready.emit(
             cp.asnumpy(phase0 * self._pupil_mask_patch),
             cp.asnumpy(rec_phase),
-            cp.asnumpy(surf_m),
+            cp.asnumpy(rec_phase),
             cp.asnumpy(phi_res_perf),
         )
 

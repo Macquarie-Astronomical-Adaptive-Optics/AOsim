@@ -54,6 +54,37 @@ def _dict_replace_inplace(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = sv
 
 
+def _migrate_turbulence_schema_inplace(cfg: Dict[str, Any]) -> None:
+    """Normalize turbulence config to store only the active profile.
+
+    New schema (active only):
+        cfg["turbulence"] = {"source": "inline", "name": <name>, "profile": <dict>}
+        or {"source": "file", "name": <name>, "file": <path>}
+
+    Legacy schema:
+        cfg["turbulence_profiles"] = {name: profile_dict, ...}
+        cfg["turbulence_active"] = name
+    """
+    if isinstance(cfg.get("turbulence"), dict):
+        return
+
+    profiles = cfg.get("turbulence_profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        return
+
+    active = cfg.get("turbulence_active")
+    if not isinstance(active, str) or active not in profiles:
+        active = next(iter(profiles.keys()))
+
+    profile = profiles.get(active)
+    if not isinstance(profile, dict):
+        profile = {}
+
+    cfg["turbulence"] = {"source": "inline", "name": active, "profile": profile}
+    cfg.pop("turbulence_profiles", None)
+    cfg.pop("turbulence_active", None)
+
+
 class ConfigStore(QObject):
     """Central, shared configuration store.
 
@@ -81,6 +112,7 @@ class ConfigStore(QObject):
             raise TypeError(f"Config root must be a JSON object/dict, got {type(loaded)}")
 
         _dict_replace_inplace(self.data, loaded)
+        _migrate_turbulence_schema_inplace(self.data)
         self.changed.emit()
 
 

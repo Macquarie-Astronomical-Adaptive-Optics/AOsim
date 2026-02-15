@@ -3,11 +3,11 @@
     "telescope_center_obscuration": 0.14,
     "wfs_lambda": 5e-07,
     "science_lambda": 2.15e-06,
-    "actuators": 42,
+    "actuators": 36,
     "grid_size": 512,
     "field_padding": 4,
     "poke_amplitude": 1e-06,
-    "frame_rate": 1000,
+    "frame_rate": 500,
     "use_gpu": true,
     "data_path": "data/",
     "loop_gain": 0.25,
@@ -15,8 +15,8 @@
     "dm_delay_frames": 2,
     "tt_enabled": true,
     "tt_gain": 0.1,
-    "tt_leak": 0.05,
-    "tt_rate_hz": 1000,
+    "tt_leak": 0.2,
+    "tt_rate_hz": 250,
     "tt_delay_frames": 1,
     "tt_measure_average": true,
     "wfs_photons_per_subap": 0,
@@ -28,12 +28,12 @@
             "wavelength": 2.15e-06,
             "grid_size": 512
         },
-        "LGS_NE": {
+        "LGS_N": {
             "type": "ShackHartmann",
             "gs_range_m": 90000,
-            "sub_apertures": 40,
-            "dx": 169.67999999999998,
-            "dy": 169.67999999999998,
+            "sub_apertures": 32,
+            "dx": 0.0,
+            "dy": 600.0,
             "wfs_lambda": 5.89e-07,
             "lgs_thickness_m": 10000.0,
             "lgs_launch_offset_px": [
@@ -42,12 +42,12 @@
             ],
             "lgs_remove_tt": true
         },
-        "LGS_NW": {
+        "LGS_S": {
             "type": "ShackHartmann",
             "gs_range_m": 90000,
-            "sub_apertures": 40,
-            "dx": -169.67999999999998,
-            "dy": 169.67999999999998,
+            "sub_apertures": 32,
+            "dx": 0.0,
+            "dy": -600.0,
             "wfs_lambda": 5.89e-07,
             "lgs_thickness_m": 10000.0,
             "lgs_launch_offset_px": [
@@ -56,12 +56,12 @@
             ],
             "lgs_remove_tt": true
         },
-        "LGS_SE": {
+        "LGS_E": {
             "type": "ShackHartmann",
             "gs_range_m": 90000,
-            "sub_apertures": 40,
-            "dx": 169.67999999999998,
-            "dy": -169.67999999999998,
+            "sub_apertures": 32,
+            "dx": 600.0,
+            "dy": 0.0,
             "wfs_lambda": 5.89e-07,
             "lgs_thickness_m": 10000.0,
             "lgs_launch_offset_px": [
@@ -70,12 +70,12 @@
             ],
             "lgs_remove_tt": true
         },
-        "LGS_SW": {
+        "LGS_W": {
             "type": "ShackHartmann",
             "gs_range_m": 90000,
-            "sub_apertures": 40,
-            "dx": -169.67999999999998,
-            "dy": -169.67999999999998,
+            "sub_apertures": 32,
+            "dx": -600.0,
+            "dy": 0.0,
             "wfs_lambda": 5.89e-07,
             "lgs_thickness_m": 10000.0,
             "lgs_launch_offset_px": [
@@ -84,18 +84,42 @@
             ],
             "lgs_remove_tt": true
         },
-        "NGS": {
+        "NGS_NE": {
             "type": "ShackHartmann",
             "gs_range_m": "inf",
             "sub_apertures": 2,
-            "dx": 0.0,
-            "dy": 0.0,
+            "dx": 297.0,
+            "dy": 297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_NW": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": -297.0,
+            "dy": 297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_SE": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": 297.0,
+            "dy": -297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_SW": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": -297.0,
+            "dy": -297.0,
             "wfs_lambda": 1.65e-06
         }
     },
     "turbulence": {
         "source": "file",
-        "file": "turbulence/Paranal_bad.json",
+        "file": "turbulence/MaunaKea_bad.json",
         "name": "InfVonKarman"
     }
 }

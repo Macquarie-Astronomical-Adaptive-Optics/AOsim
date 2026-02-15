@@ -33,7 +33,7 @@ from scripts.window_tabs.loop_tab import Loop_tab
 from scripts.window_tabs.poke_tab import Poke_tab
 from scripts.window_tabs.turbulence_tab import Turbulence_tab
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config_default.json")
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config_copy.json")
 
 
 
