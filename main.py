@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from scripts.utilities import set_params
@@ -33,7 +34,7 @@ from scripts.window_tabs.loop_tab import Loop_tab
 from scripts.window_tabs.poke_tab import Poke_tab
 from scripts.window_tabs.turbulence_tab import Turbulence_tab
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config_copy.json")
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config_ultimate.json")
 
 
 
@@ -67,7 +68,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         '--config',
         type=str,
         default=str(DEFAULT_CONFIG_PATH),
-        help='Path to a config JSON file (default: config_default.json)',
+        help='Path to a config JSON file (default: config_ultimate.json)',
     )
 
     # Common overrides
@@ -146,6 +147,22 @@ class MainWindow(QMainWindow):
 
         init_gpu(bool(self.params.get('use_gpu', False)), gpu_device, self.logger)
 
+        # Keep references so we can fully rebuild the UI when a new config.json is loaded.
+        self._tabs_widget: DetachableTabWidget | None = None
+        self._poke_tab: Poke_tab | None = None
+        self._turb_tab: Turbulence_tab | None = None
+        self._rebuild_pending = False
+
+        # When a new config is loaded from disk, rebuild everything so all derived
+        # components (sensors, turbulence, reconstructor, etc.) recompute from the
+        # new configuration.
+        if hasattr(self.config_store, "loaded"):
+            self.config_store.loaded.connect(self._on_config_loaded)
+
+        self._build_tabs()
+
+    def _build_tabs(self) -> None:
+        """(Re)create all tabs from the current config_store."""
         tabs = DetachableTabWidget()
         tabs.setMovable(True)
 
@@ -153,7 +170,19 @@ class MainWindow(QMainWindow):
         poke = Poke_tab(self.config_store)
         tabs.addTab(poke, 'Poke Diagnostics')
 
+        # If core AO geometry changes (diameter/actuators/grid), rebuild the
+        # turbulence + reconstructor pipeline so dimensions stay consistent.
+        try:
+            poke.hard_geometry_changed.connect(self._on_hard_geometry_changed)
+        except Exception:
+            pass
+
         turb = Turbulence_tab(self.config_store, poke.wfsensors)
+        # Keep turbulence in sync if sensors are replaced (e.g. after config load).
+        try:
+            poke.sensors_changed.connect(turb.sensor_update)
+        except Exception:
+            pass
         tabs.addTab(turb, 'Turbulence')
 
         sensview = turb.overview_tab
@@ -161,12 +190,104 @@ class MainWindow(QMainWindow):
         poke.pupil_changed.connect(sensview.updateLayerGrid)
 
         tabs.addTab(turb.reconstructor_tab, 'Reconstructor')
-
         tabs.addTab(Loop_tab(self.config_store, turb.scheduler), 'Loop')
-
         tabs.addTab(LongRun_tab(self.config_store, turb.scheduler), 'Long Run')
 
+        # Swap into the window.
+        old = self.centralWidget()
         self.setCentralWidget(tabs)
+        if old is not None:
+            old.deleteLater()
+
+        # Update refs.
+        self._tabs_widget = tabs
+        self._poke_tab = poke
+        self._turb_tab = turb
+
+    @Slot(dict)
+    def _on_hard_geometry_changed(self, info: dict) -> None:
+        # Avoid re-entrancy if multiple changes happen quickly.
+        if self._rebuild_pending:
+            return
+        self._rebuild_pending = True
+
+        # Ensure module-level defaults update (some code still reads scripts.utilities.params).
+        set_params(self.params)
+
+        def _do():
+            try:
+                self._close_all_popouts()
+                self._shutdown_workers()
+            finally:
+                self._build_tabs()
+                self._rebuild_pending = False
+
+        QTimer.singleShot(0, _do)
+
+    def _shutdown_workers(self) -> None:
+        """Best-effort shutdown for worker threads/timers before rebuilding."""
+        turb = self._turb_tab
+        if turb is None:
+            return
+        try:
+            if getattr(turb, "scheduler", None) is not None:
+                turb.scheduler.stop()
+        except Exception:
+            pass
+
+    def _close_all_popouts(self) -> None:
+        """Close any detached (popped-out) tab windows before rebuilding UI."""
+        root = getattr(self, "_tabs_widget", None)
+        turb = self._turb_tab
+        if root is None:
+            return
+
+        try:
+            # Close popouts on the root tab widget first.
+            if isinstance(root, DetachableTabWidget):
+                root.close_popouts()
+        except Exception:
+            pass
+
+        # Also close popouts on any nested detachable tab widgets (e.g. sensor pages).
+        try:
+            for tw in root.findChildren(DetachableTabWidget):
+                try:
+                    tw.close_popouts()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            th = getattr(turb, "scheduler_thread", None)
+            if th is not None:
+                th.quit()
+                th.wait(3000)
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _on_config_loaded(self, path: str) -> None:
+        # Avoid re-entrancy if multiple loads fire quickly.
+        if self._rebuild_pending:
+            return
+        self._rebuild_pending = True
+
+        # Ensure module-level defaults update (some code still reads scripts.utilities.params).
+        set_params(self.params)
+
+        # Defer the heavy UI rebuild to the next event loop tick so we don't
+        # rebuild while a file dialog / slot stack is still unwinding.
+        def _do():
+            try:
+                # Ensure detached windows don't keep old widgets/threads alive.
+                self._close_all_popouts()
+                self._shutdown_workers()
+            finally:
+                self._build_tabs()
+                self._rebuild_pending = False
+
+        QTimer.singleShot(0, _do)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

@@ -91,6 +91,53 @@ class SimWorker(QObject):
     long_run_finished = Signal(object)
     long_run_failed = Signal(object)
 
+    # ------------------ sensor ordering helpers ------------------
+    @staticmethod
+    def _is_science_sensor(s) -> bool:
+        """Heuristic: science channel should be index 0 (not a WFS)."""
+        try:
+            if bool(getattr(s, "is_science_sensor", False)):
+                return True
+        except Exception:
+            pass
+        # Common names/labels
+        try:
+            name = str(getattr(s, "name", "")).lower()
+            if name == "science" or "science" in name:
+                return True
+        except Exception:
+            pass
+        return s.__class__.__name__.lower() == "scienceimager"
+
+    @classmethod
+    def _reorder_sensors_science_first(cls, sensors: Dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Return (keys, list) with science sensor first if present."""
+        if not isinstance(sensors, dict) or not sensors:
+            return ([], [])
+        keys = list(sensors.keys())
+        sci = [k for k in keys if str(k).lower() == "science" or cls._is_science_sensor(sensors.get(k))]
+        rest = [k for k in keys if k not in sci]
+        ordered_keys = (sci[:1] + rest) if sci else keys
+        return ordered_keys, [sensors[k] for k in ordered_keys]
+
+    def _sensor_geom_signature(self) -> tuple:
+        """Signature for WFS geometry (subapertures/active subaps) used to rebuild reconstructor."""
+        sig = []
+        # WFS sensors are expected to be sensors[1:] (science at index 0).
+        for k, s in zip(getattr(self, "_sensor_keys", []), getattr(self, "_sensor_list", [])):
+            if self._is_science_sensor(s) or str(k).lower() == "science":
+                continue
+            try:
+                n_sub = int(getattr(s, "n_sub", getattr(s, "sub_apertures", 0)) or 0)
+            except Exception:
+                n_sub = 0
+            try:
+                n_active = int(len(getattr(s, "sub_aps_idx")))
+            except Exception:
+                n_active = 0
+            sig.append((str(k), s.__class__.__name__, n_sub, n_active))
+        return tuple(sig)
+
     def __init__(
         self,
         sim_factory,
@@ -166,24 +213,30 @@ class SimWorker(QObject):
         self.fps_cap = int(fps_cap)
 
         # AO geometry
-        self.sensors = sensors
-        self._sensor_list = list(self.sensors.values())
+        # Ensure the science imager is at index 0 (the pipeline assumes WFS are sensors[1:]).
+        sensors = sensors if isinstance(sensors, dict) else {}
+        ordered_keys, ordered_list = self._reorder_sensors_science_first(dict(sensors))
+        self.sensors = {k: sensors[k] for k in ordered_keys} if ordered_keys else dict(sensors)
         self._sensor_keys = list(self.sensors.keys())
+        self._sensor_list = list(self.sensors.values())
 
-        self.thetas_gpu = cp.asarray([s.field_angle for s in self._sensor_list], dtype=cp.float32)  # (S,2)
-        S = int(self.thetas_gpu.shape[0])
+        # Initial static pointing/ranges (later updated for dynamic thetas).
+        thetas = []
+        ranges = []
+        for s in self._sensor_list:
+            try:
+                thetas.append(getattr(s, "field_angle"))
+            except Exception:
+                thetas.append((float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0))))
+            try:
+                ranges.append(float(getattr(s, "gs_range_m", float("inf"))))
+            except Exception:
+                ranges.append(float("inf"))
+        self.thetas_gpu = cp.asarray(thetas, dtype=cp.float32)  # (S,2)
+        self.ranges_gpu = cp.asarray(ranges, dtype=cp.float32)
 
-        if ranges_m is None:
-            self.ranges_gpu = cp.full((S,), cp.inf, dtype=cp.float32)
-        else:
-            r = cp.asarray(ranges_m, dtype=cp.float32)
-            if r.ndim != 1:
-                r = r.reshape(-1)
-            if r.size == 1:
-                r = cp.full((S,), float(r.item()), dtype=cp.float32)
-            elif r.size != S:
-                raise ValueError(f"ranges_m must be scalar or shape (S,), got {tuple(r.shape)} for S={S}")
-            self.ranges_gpu = r
+        # Track WFS-geometry signature for reconstructor rebuilds.
+        self._recon_sig = self._sensor_geom_signature()
 
         self.patch_size_px = float(patch_size_px)
         self.patch_M = int(patch_M)
@@ -623,7 +676,11 @@ class SimWorker(QObject):
         return phases, self._frame_layers_M
 
     def _measure_wfs_slopes(self, phases_wfs):
-        """Measure slopes for sensors[1:] on provided phase maps (S-1,M,M)."""
+        """Measure slopes for sensors[1:] on provided phase maps (S-1,M,M).
+
+        Returns:
+            list of slope arrays, or None if any sensor fails to produce slopes.
+        """
         if phases_wfs is None:
             return []
 
@@ -636,8 +693,21 @@ class SimWorker(QObject):
                 kwargs["assume_radians"] = True
             if acc.get("method", False):
                 kwargs["method"] = self.sensor_method
-            _, sl, _ = s0.measure(**kwargs)
-            out.append(sl[0])  # (n_sub_active, 2) [sy, sx]
+
+            try:
+                _, sl, _ = s0.measure(**kwargs)
+            except Exception:
+                return None
+
+            if sl is None:
+                return None
+            try:
+                sl0 = sl[0]
+            except Exception:
+                return None
+            if sl0 is None:
+                return None
+            out.append(sl0)  # (n_sub_active, 2) [sy, sx]
 
         return out
 
@@ -779,6 +849,70 @@ class SimWorker(QObject):
         return self._slopes_meas_vec
 
     # ------------------ lifecycle ------------------
+
+    def _build_tomographic_reconstructor(self) -> None:
+        """(Re)build the tomographic reconstructor from current sim + WFS sensors."""
+        if self.sim is None:
+            self.R = None
+            return
+
+        wfs_list = [s for s in (self._sensor_list or [])[1:] if not self._is_science_sensor(s)]
+        if not wfs_list:
+            self.R = None
+            return
+
+        self.status.emit("Building tomographic reconstructor")
+        self.R = GLAOConjugateIM_CuPy(
+            sensors=wfs_list,
+            conjugation_height_m=0.0,
+            dx_world_m=float(getattr(self.sim, "dx", 1.0)),
+            M=self.patch_M,
+            slopes_aggregation="stack",
+            slope_weight_mode="pupil",
+            slope_weight_threshold=0.20,
+            slope_weight_power=2.0,
+            reg_alpha=1e-2,
+            reg_beta=1e-2,
+        )
+
+        self.R.build_interaction_matrix(chunk_modes=64, sensor_method="southwell")
+        self.R.prepare_runtime()
+        self.R.factorize(rcond=8e-2)
+
+        self.status_log.emit("Tomographic reconstructor initialized!")
+
+        # Optional diagnostic: explicit reconstruction matrix.
+        try:
+            At = self.R._At
+            V = self.R._eig_V
+            inv = self.R._eig_inv
+            tmp = (V.T @ At) * inv[:, None]
+            Rmat = V @ tmp
+
+            A = self.R.A.astype(cp.float32)
+            H0 = A.T @ A
+            d_H0 = cp.mean(cp.diag(H0))
+            d_beta = cp.mean(cp.diag(self.R.reg_beta * self.R.G)) if (self.R.G is not None) else 0
+            d_alpha = (self.R.reg_alpha ** 2)
+
+            self.status_log.emit("Reconstruction Matrix: ")
+            self.status_log.emit(f"  mean diag(A^T A): {float(d_H0.get())}")
+            self.status_log.emit(f"  mean diag(beta*G): {float(d_beta.get())}")
+            self.status_log.emit(f"  alpha^2: {d_alpha}")
+            self.status_log.emit(f"  beta*G / A^T A: {float((d_beta / (d_H0+1e-12)).get())}")
+            self.status_log.emit(f"  alpha^2 / A^T A: {float((d_alpha / (d_H0+1e-12)).get())}")
+            self.status_log.emit("")
+
+            self.recon_matr_ready.emit(cp.asnumpy(self.R.A), cp.asnumpy(Rmat))
+            self.status_log.emit(f"  Rmatrix min/max {cp.min(self.R.A)}, {cp.max(self.R.A)}")
+            self.status_log.emit(f"  Rinv    min/max {cp.min(Rmat)}, {cp.max(Rmat)}")
+        except Exception:
+            pass
+
+    # Backwards-compatible name (older code paths call build_reconstructor()).
+    def build_reconstructor(self) -> None:
+        self._build_tomographic_reconstructor()
+
     @Slot()
     def build_sim(self):
         if self.sim is not None:
@@ -952,50 +1086,7 @@ class SimWorker(QObject):
         self._emit_once()
         self._emit_visible_layer()
 
-        self.R = GLAOConjugateIM_CuPy(
-            sensors=wfs_list,                 # your SH sensors
-            conjugation_height_m=0.0,          # e.g. 0.0 for ground, or 200.0, 500.0, ...
-            dx_world_m=float(self.sim.dx),
-            M=self.patch_M,                             # your pupil grid
-            slopes_aggregation="stack",  
-            slope_weight_mode="pupil",    # <-- important
-            slope_weight_threshold=0.20,  # ignore very partial subaps
-            slope_weight_power=2.0,        
-            reg_alpha=1e-2,
-            reg_beta=1e-2,
-        )
-
-        self.R.build_interaction_matrix(chunk_modes=64, sensor_method="southwell")
-        self.R.prepare_runtime()
-        self.R.factorize(rcond=8e-2)
-
-
-        self.status_log.emit("Tomographic reconstructor initialized!")
-
-
-        At = self.R._At              # (n_modes, n_slopes)
-        V = self.R._eig_V            # (n_modes, k)
-        inv = self.R._eig_inv        # (k,)
-
-        tmp = (V.T @ At) * inv[:, None]
-        Rmat = V @ tmp
-
-        A = self.R.A.astype(cp.float32)
-        H0 = A.T @ A
-        d_H0 = cp.mean(cp.diag(H0))
-        d_beta = cp.mean(cp.diag(self.R.reg_beta * self.R.G)) if (self.R.G is not None) else 0
-        d_alpha = (self.R.reg_alpha**2)
-
-        self.status_log.emit("Reconstruction Matrix: ")
-        self.status_log.emit(f"  mean diag(A^T A): {float(d_H0.get())}")
-        self.status_log.emit(f"  mean diag(beta*G): {float(d_beta.get())}")
-        self.status_log.emit(f"  alpha^2: {d_alpha}")
-        self.status_log.emit(f"  beta*G / A^T A: {float((d_beta / (d_H0+1e-12)).get())}")
-        self.status_log.emit(f"  alpha^2 / A^T A: {float((d_alpha / (d_H0+1e-12)).get())}")
-        self.status_log.emit("")
-        self.recon_matr_ready.emit(cp.asnumpy(self.R.A), cp.asnumpy(Rmat))
-        self.status_log.emit(f"  Rmatrix min/max {cp.min(self.R.A)}, {cp.max(self.R.A)}")
-        self.status_log.emit(f"  Rinv    min/max {cp.min(Rmat)}, {cp.max(Rmat)}")
+        self._build_tomographic_reconstructor()
 
         self.status.emit("Sim ready")
 
@@ -1098,9 +1189,15 @@ class SimWorker(QObject):
 
     @Slot(dict)
     def sensor_update(self, sensors):
-        self.sensors = sensors
-        self._sensor_list = list(self.sensors.values())
+        sensors = sensors if isinstance(sensors, dict) else {}
+        ordered_keys, _ = self._reorder_sensors_science_first(dict(sensors))
+        self.sensors = {k: sensors[k] for k in ordered_keys} if ordered_keys else dict(sensors)
         self._sensor_keys = list(self.sensors.keys())
+        self._sensor_list = list(self.sensors.values())
+
+        new_sig = self._sensor_geom_signature()
+        sig_changed = (new_sig != getattr(self, "_recon_sig", None))
+        self._recon_sig = new_sig
 
         # --- dynamic pointing support ---
         self._dynamic_thetas = any(getattr(s, "field_angle_fn", None) is not None for s in (self._sensor_list or []))
@@ -1129,7 +1226,7 @@ class SimWorker(QObject):
 
         if self.sim is not None:
             # If fast sampler is enabled and the geometry is fixed, rebuild the sampler.
-            if (not self._dynamic_thetas) and self.fast_sampler and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
+            if (not self._dynamic_thetas) and hasattr(self.sim, "build_patch_sampler") and hasattr(self.sim, "sample_patches_from_sampler"):
                 try:
                     self._patch_sampler = self.sim.build_patch_sampler(
                         thetas_xy_rad=self.thetas_gpu,
@@ -1159,6 +1256,38 @@ class SimWorker(QObject):
                     self._wfs_measure_accepts.append({"assume_radians": False, "method": False, "return_image": False})
 
         self._invalidate_frame_cache()
+
+        # If WFS geometry changed (e.g. subapertures / active subaps), the
+        # reconstructor must be rebuilt to match dimensions.
+        if (self.sim is not None) and sig_changed:
+            was_running = self.timer.isActive() if hasattr(self, "timer") else False
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+
+            # Drop slope-dependent caches.
+            self._s_ref = None
+            self._slopes_meas_vec = None
+            self._slopes_err_vec = None
+            self._slopes_sub_vec = None
+
+            try:
+                self._build_tomographic_reconstructor()
+            except Exception as e:
+                self.status_log.emit(f"Reconstructor rebuild failed after sensor_update: {e}")
+
+            # Reset loop state since dimensions changed.
+            try:
+                self.reset()
+            except Exception:
+                self._emit_once()
+
+            if was_running:
+                try:
+                    self.start()
+                except Exception:
+                    pass
 
     @Slot()
     def reset(self):
@@ -1800,6 +1929,11 @@ class SimWorker(QObject):
 
         # --- slopes from non-science sensors (measure on residual) ---
         slopes_list = self._measure_wfs_slopes(phases_res[1:])
+        if slopes_list is None:
+            # This can happen during/after live reconfiguration (e.g. changing subaps).
+            self.status_log.emit("Warning: WFS measurement returned no slopes; skipping this tick.")
+            self._emit_visible_sensor_products_from_cache()
+            return
 
         # --- reference slopes (flat) ---
         if self._s_ref is None:
@@ -1816,7 +1950,16 @@ class SimWorker(QObject):
                 if acc.get("method", False):
                     kwargs["method"] = self.sensor_method
                 _, sl0, _ = s0.measure(**kwargs)
-                self._s_ref.append(sl0[0].copy())
+                if sl0 is None:
+                    self._s_ref = None
+                    self.status_log.emit("Warning: WFS reference measurement returned no slopes; will retry.")
+                    return
+                try:
+                    self._s_ref.append(sl0[0].copy())
+                except Exception:
+                    self._s_ref = None
+                    self.status_log.emit("Warning: WFS reference slopes malformed; will retry.")
+                    return
 
         # display recon: subtract s_ref (TT removal is display-only)
         slopes_sub = [sl - ref for sl, ref in zip(slopes_list, self._s_ref)]
@@ -1835,18 +1978,18 @@ class SimWorker(QObject):
         phi_res_perf -= cp.mean(phi_res_perf[m])
         phi_res_perf = remove_tt(phi_res_perf, self.pupil_mask)
 
-        # surf_m = Pupil_tools.dm_surface_from_commands(
-        #     commands=-xhat,
-        #     pupil=self.pupil_mask,
-        #     grid_size=self.patch_M,
-        #     sigma=None,
-        #     dtype=cp.float32,
-        # )
+        surf_m = Pupil_tools.dm_surface_from_commands(
+            commands=-xhat,
+            pupil=self.pupil_mask,
+            grid_size=self.patch_M,
+            sigma=None,
+            dtype=cp.float32,
+        )
 
         self.reconstructed_ready.emit(
             cp.asnumpy(phase0 * self._pupil_mask_patch),
             cp.asnumpy(rec_phase),
-            cp.asnumpy(rec_phase),
+            cp.asnumpy(surf_m),
             cp.asnumpy(phi_res_perf),
         )
 

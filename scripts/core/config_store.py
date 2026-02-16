@@ -92,7 +92,12 @@ class ConfigStore(QObject):
     references into the config (including nested dicts/lists) stay valid.
     """
 
+    # Emitted for any in-place config mutation (including load).
     changed = Signal()
+
+    # Emitted specifically after a full config.json has been loaded from disk.
+    # Carries the loaded path for logging/debugging.
+    loaded = Signal(str)
 
     def __init__(self, data: Dict[str, Any]):
         super().__init__()
@@ -114,6 +119,7 @@ class ConfigStore(QObject):
         _dict_replace_inplace(self.data, loaded)
         _migrate_turbulence_schema_inplace(self.data)
         self.changed.emit()
+        self.loaded.emit(str(p))
 
 
 __all__ = ["ConfigStore"]

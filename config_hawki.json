@@ -95,7 +95,7 @@
     },
     "turbulence": {
         "source": "file",
-        "file": "turbulence/Paranal_bad.json",
+        "file": "turbulence/Paranal_good.json",
         "name": "InfVonKarman"
     }
 }

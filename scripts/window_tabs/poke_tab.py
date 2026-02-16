@@ -20,6 +20,8 @@ class Poke_tab(QWidget):
     update_request = Signal(int, int)
     sensors_changed = Signal(dict)
     pupil_changed = Signal(float)
+    # Global geometry changed (requires turbulence + reconstructor rebuild).
+    hard_geometry_changed = Signal(dict)
 
     def __init__(self, config_dict: dict | ConfigStore):
         super().__init__()
@@ -80,6 +82,9 @@ class Poke_tab(QWidget):
         sensor_selector_h.addWidget(sensor_tabs)
 
         self.config_table.params_changed.connect(self.update_tabs)
+
+        # Track signature of geometry knobs that require a pipeline rebuild.
+        self._hard_sig = self._compute_hard_sig(dict(self.params))
 
         # Refresh tables if the central config is loaded from disk.
         self.config_store.changed.connect(self._on_store_changed)
@@ -142,8 +147,45 @@ class Poke_tab(QWidget):
     def update_tabs(self, params: dict) -> None:
         # also update sensor view tab while we're at it
         self.pupil_changed.emit(params.get("telescope_center_obscuration"))
+
+        # Only request a heavy rebuild when core geometry changed.
+        try:
+            sig = self._compute_hard_sig(params)
+            if sig != getattr(self, "_hard_sig", None):
+                self._hard_sig = sig
+                self.hard_geometry_changed.emit({
+                    "telescope_diameter": params.get("telescope_diameter"),
+                    "telescope_center_obscuration": params.get("telescope_center_obscuration"),
+                    "actuators": params.get("actuators"),
+                    "grid_size": params.get("grid_size"),
+                })
+        except Exception:
+            pass
+
         for tab in self.tab_pages:
             tab.main_params_changed(params)
+
+    @staticmethod
+    def _compute_hard_sig(params: dict) -> tuple:
+        """Signature of geometry params that require a pipeline rebuild."""
+        def _as_int(x, default=0):
+            try:
+                return int(x)
+            except Exception:
+                return int(default)
+
+        def _as_float(x, default=0.0):
+            try:
+                return float(x)
+            except Exception:
+                return float(default)
+
+        return (
+            _as_float(params.get("telescope_diameter"), 0.0),
+            _as_float(params.get("telescope_center_obscuration"), 0.0),
+            _as_int(params.get("actuators"), 0),
+            _as_int(params.get("grid_size"), 0),
+        )
 
     def _on_store_changed(self) -> None:
         # Update global-dependent views.

@@ -131,6 +131,14 @@ class DetachableTabWidget(QTabWidget):
         self.setTabBar(bar)
         self._popouts = {}  # keep track of popped out widgets
 
+    def close_popouts(self) -> None:
+        """Close any popped-out windows and reattach their pages."""
+        for pop in list(self._popouts.values()):
+            try:
+                pop.close()
+            except Exception:
+                pass
+
     @Slot(int)
     def detach_tab(self, index: int):
         if index < 0 or index >= self.count():
@@ -155,6 +163,7 @@ class DetachableTabWidget(QTabWidget):
         pop.show()
 
     def hideEvent(self, event):
-        for w in list(self._popouts.values()):
-               w.close()
+        # When the widget is hidden, close detached windows so they don't keep
+        # old widgets alive after UI rebuilds.
+        self.close_popouts()
         return super().hideEvent(event)

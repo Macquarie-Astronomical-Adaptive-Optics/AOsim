@@ -13,7 +13,7 @@ from typing import Callable, Optional, Tuple
 # -----------------------------
 # Config / parameter management
 # -----------------------------
-_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config_default.json"
+_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config_ultimate.json"
 try:
     with open(_DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
