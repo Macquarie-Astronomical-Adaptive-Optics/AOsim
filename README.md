@@ -1,41 +1,54 @@
-# AOsim
+# Adaptive Optics simulator
 
-A PySide6 + CuPy adaptive optics simulation GUI.
+(WIP) A User Interface / GUI for creating, editing, and running Adaptive Optics simulations
 
-## Quick start
 
-```bash
-# (Recommended) create a venv
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+## Current features
 
-# Install dependencies (you may need the CUDA-specific CuPy build)
-pip install -r requirements.txt
+System setup diagnostics:
+- Poke matrix visualisation
+- WFS editing
+- Sub aperture centroids / images view
+- Reference and Poke matrix Science image view
+- FWHM, Diffraction Limit, Strehl Calculations
+- Parameter config save/load
 
-# Run
-python main.py --log-console
-```
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/1020c745-bfbe-47e9-8f63-e90419ac3839" />
 
-## Config
+Turbulence 
+- Turbulence phase screen generator/editor
+- Layered turbulence viewer
+  - Combined phase map view
+  - Final PSF view
 
-- Default config: `config_default.json`
-- Override any key from the command line, e.g.:
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/22c64c13-0bc7-40c8-8e31-0990e0b21901" />
 
-```bash
-python main.py --grid_size 512 --actuators 35 --no-gpu
-```
+Sensor & Turbulence Overview 
+- Individual Sensor PSF grid
+- Layer-by-layer view for WFS footprint/fov
 
-If you pass `--config path/to/file.json`, that file is loaded instead of the default.
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/252123dc-5056-4898-8046-1c269c007fab" />
 
-## Project layout
+Reconstructor view
+- Reconstruction matrix visualization
+- Phase screen -> reconstructed wavefront -> dm surface -> open-loop DM corrected residuals views
 
-- `main.py`: GUI entrypoint
-- `scripts/`: simulation + GUI tabs/widgets
-- `turbulence/`: example turbulence profiles
-- `data/`: shared dtype/config helpers
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/c9bc4534-4403-40eb-aa44-545e9cb3a12e" />
 
-## Notes
+Closed-Loop simulation
+- Real-time Statistics
+  - PSF
+  - Corrected & Uncorrected FWHM over time
+  - Uncorrected r0 estimate
+  - Wavefront Residuals
+ 
+<img width="1708" height="1105" alt="image" src="https://github.com/user-attachments/assets/bfec8cb2-9a15-46b2-9ae3-fc248e35a0c8" />
 
-- The simulation is GPU-first (CuPy). CPU-only mode is best-effort and mainly intended
-  for development/UI testing.
-- Enable the Qt log console (`--log-console`) to capture `print()` output and exceptions.
+Batched Long-exposure simulation
+- Long-exposure PSF generation
+  - PSF generation for N amount of off-axis points
+  - FWHM estimation via Gaussian/Moffat/Contour fitting
+  - PSF in FITS file format
+
+ <img width="2560" height="1540" alt="image" src="https://github.com/user-attachments/assets/5235d9dc-5a7d-4d41-ae88-67d5f95dea26" />
+
