@@ -75,7 +75,7 @@ class Turbulence_tab(QWidget):
 
         # build widgets from layer configs (GUI side only)
         for i, layer in enumerate(layers):
-            name = f"Layer {i+1}"
+            name = layer.get("name")
             if isinstance(layer, dict) and "name" not in layer:
                 layer["name"] = name
             self.turbWidgets[i] = TurbulenceWidget(name, screen_func, layer, config_store=self.config_store)

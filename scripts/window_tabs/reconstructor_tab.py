@@ -93,6 +93,7 @@ class Reconstructor_tab(QWidget):
         raw = np.asarray(raw)
         reconstructed = np.asarray(reconstructed)
         corrected = np.asarray(corrected)
+        corrected -= np.mean(corrected)
         dm_surf = np.asarray(dm_surf)
 
         abmax = max(self._absmax(raw), self._absmax(reconstructed))
