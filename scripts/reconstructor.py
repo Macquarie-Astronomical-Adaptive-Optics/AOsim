@@ -2,7 +2,7 @@ import math
 import cupy as cp
 import cupyx.scipy.ndimage as cndi
 from typing import Sequence, Optional
-from scripts.utilities import params as default_params, Pupil_tools
+from scripts.utilities import Pupil_tools #params as default_params,
 
 
 # -----------------------------
@@ -39,7 +39,11 @@ class TipTiltReconstructor_CuPy:
         self.pad = int(pad)
         self.calib_slope_amp = float(calib_slope_amp)
 
-        self.params = params if params is not None else default_params
+        #self.params = params if params is not None else default_params
+        if params is None:
+            raise ValueError("TipTiltReconstructor_CuPy requires an explicit params/config dict")
+        self.params = params
+
 
         self.w_norm = []          # list of (n_active,) vectors (sum=1)
         self.k500_yx = []         # list of (2,) gains: measured_mean_500nm / commanded_slope (per axis)
@@ -334,7 +338,10 @@ class TomoOnAxisIM_CuPy:
             self.layer_heights_m = [float(h) for h in layer_heights_m]
         self.dx_world_m = float(dx_world_m)
 
-        self.params = params if params is not None else default_params
+        #self.params = params if params is not None else default_params
+        if params is None:
+            raise ValueError("TomoOnAxisIM_CuPy requires an explicit params/config dict")
+        self.params = params
 
         self.M = int(M if M is not None else self.sensors[0].grid_size)
         self.size_pixels = float(size_pixels if size_pixels is not None else self.M)

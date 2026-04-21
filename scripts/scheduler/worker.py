@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, Qt
 
 from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy, GLAOConjugateIM_CuPy
-from scripts.utilities import Pupil_tools, Analysis, Gaussian2DFitter, params as default_params
+from scripts.utilities import Pupil_tools, Analysis, Gaussian2DFitter #, params as default_params
 from scripts.batch_runner import AOBatchRunner
 
 
@@ -183,8 +183,10 @@ class SimWorker(QObject):
         super().__init__(parent)
 
         # Params
-        self.params = params if params is not None else default_params
-
+        #self.params = params if params is not None else default_params
+        if params is None:
+            raise ValueError("SimWorker requires an explicit params/config dict")
+        self.params = params
 
 
         # ---------------- DM servo lag (frame-delayed actuation) ----------------
@@ -873,6 +875,7 @@ class SimWorker(QObject):
             slope_weight_power=2.0,
             reg_alpha=1e-2,
             reg_beta=1e-2,
+            params=self.params,
         )
 
         self.R.build_interaction_matrix(chunk_modes=64, sensor_method="southwell")
@@ -1978,11 +1981,21 @@ class SimWorker(QObject):
         phi_res_perf -= cp.mean(phi_res_perf[m])
         phi_res_perf = remove_tt(phi_res_perf, self.pupil_mask)
 
+        # surf_m = Pupil_tools.dm_surface_from_commands(
+        #     commands=-xhat,
+        #     pupil=self.pupil_mask,
+        #     grid_size=self.patch_M,
+        #     sigma=None,
+        #     dtype=cp.float32,
+        # )
+
         surf_m = Pupil_tools.dm_surface_from_commands(
-            commands=-xhat,
-            pupil=self.pupil_mask,
-            grid_size=self.patch_M,
-            sigma=None,
+            commands=-xhat,   # or -xhat_disp
+            act_centers=self.R.act_centers_rc,
+            pupil=self.R.pupil,
+            actuators=self.R.actuators,
+            grid_size=self.R.M,
+            poke_amplitude=self.R.poke_amp,
             dtype=cp.float32,
         )
 

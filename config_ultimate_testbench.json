@@ -1,0 +1,125 @@
+{
+    "telescope_diameter": 0.013,
+    "telescope_center_obscuration": 0.0001,
+    "wfs_lambda": 5e-07,
+    "science_lambda": 2.15e-06,
+    "actuators": 11,
+    "grid_size": 512,
+    "field_padding": 4,
+    "poke_amplitude": 1e-06,
+    "frame_rate": 500,
+    "use_gpu": true,
+    "data_path": "data/",
+    "loop_gain": 0.25,
+    "loop_leak": 0.01,
+    "dm_delay_frames": 2,
+    "tt_enabled": true,
+    "tt_gain": 0.1,
+    "tt_leak": 0.2,
+    "tt_rate_hz": 250,
+    "tt_delay_frames": 1,
+    "tt_measure_average": true,
+    "wfs_photons_per_subap": 0,
+    "wfs_read_noise_e": 0.0,
+    "wfs_centroid_window_px": 0,
+    "sensors": {
+        "science": {
+            "type": "ScienceImager",
+            "wavelength": 2.15e-06,
+            "grid_size": 512
+        },
+        "LGS_N": {
+            "type": "ShackHartmann",
+            "gs_range_m": 42,
+            "sub_apertures": 32,
+            "dx": 0.0,
+            "dy": 600.0,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 2.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_S": {
+            "type": "ShackHartmann",
+            "gs_range_m": 42,
+            "sub_apertures": 32,
+            "dx": 0.0,
+            "dy": -600.0,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 2.0,
+            "lgs_launch_offset_px": [
+                -0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_E": {
+            "type": "ShackHartmann",
+            "gs_range_m": 42,
+            "sub_apertures": 32,
+            "dx": 600.0,
+            "dy": 0.0,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 2.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "LGS_W": {
+            "type": "ShackHartmann",
+            "gs_range_m": 42,
+            "sub_apertures": 32,
+            "dx": -600.0,
+            "dy": 0.0,
+            "wfs_lambda": 5.89e-07,
+            "lgs_thickness_m": 2.0,
+            "lgs_launch_offset_px": [
+                0.0,
+                -0.0
+            ],
+            "lgs_remove_tt": true
+        },
+        "NGS_NE": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": 297.0,
+            "dy": 297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_NW": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": -297.0,
+            "dy": 297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_SE": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": 297.0,
+            "dy": -297.0,
+            "wfs_lambda": 1.65e-06
+        },
+        "NGS_SW": {
+            "type": "ShackHartmann",
+            "gs_range_m": "inf",
+            "sub_apertures": 2,
+            "dx": -297.0,
+            "dy": -297.0,
+            "wfs_lambda": 1.65e-06
+        }
+    },
+    "turbulence": {
+        "source": "file",
+        "file": "turbulence/InfVonKarman_testbench.json",
+        "name": "InfVonKarman"
+    }
+}
