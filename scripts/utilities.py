@@ -2,7 +2,6 @@ import aotools
 import cupy as cp
 import numpy as np
 from pathlib import Path
-import json
 import threading
 import math
 import hashlib
@@ -13,16 +12,6 @@ from typing import Callable, Optional, Tuple
 # -----------------------------
 # Config / parameter management
 # -----------------------------
-_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config_ultimate.json"
-try:
-    with open(_DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = json.load(f)
-except FileNotFoundError:
-    # Allow importing utilities in isolation (e.g., unit tests) without the repo config file.
-    config = {}
-except json.JSONDecodeError as e:
-    raise RuntimeError(f"Failed to parse {_DEFAULT_CONFIG_PATH}: {e}") from e
-
 class Params(dict):
     """Lightweight params wrapper (dict-compatible).
 
@@ -48,17 +37,97 @@ class Params(dict):
             return bool(default)
 
 
-params = Params(config)
+# Single module-level params object.
+# It starts empty and must be populated by main.py via set_params(...).
+params = Params()
+
 rootdir = Path(__file__).parent.parent
 
+
 def set_params(new_params):
-    """Update module-level params (used as defaults when explicit args are None)."""
-    global params
+    """Update module-level params in place.
+
+    Important:
+    - We mutate the existing Params object instead of rebinding it.
+    - This keeps any imported aliases (e.g. `from scripts.utilities import params`)
+      pointing at the same live object.
+    """
+    if new_params is None:
+        raise ValueError("set_params(new_params): new_params must not be None")
+
     if isinstance(new_params, Params):
-        params = new_params
+        src = dict(new_params)
     else:
-        # Accept any mapping/dict-like object.
-        params = Params(dict(new_params))
+        src = dict(new_params)
+
+    params.clear()
+    params.update(src)
+    
+# import aotools
+# import cupy as cp
+# import numpy as np
+# from pathlib import Path
+# import json
+# import threading
+# import math
+# import hashlib
+# import logging
+# logger = logging.getLogger(__name__)
+# from typing import Callable, Optional, Tuple
+
+# # -----------------------------
+# # Config / parameter management
+# # -----------------------------
+# _DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config_ultimate_testbench.json" #"config_ultimate.json"
+
+
+# try:
+#     with open(_DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
+#         config = json.load(f)
+# except FileNotFoundError:
+#     # Allow importing utilities in isolation (e.g., unit tests) without the repo config file.
+#     config = {}
+# except json.JSONDecodeError as e:
+#     raise RuntimeError(f"Failed to parse {_DEFAULT_CONFIG_PATH}: {e}") from e
+
+# class Params(dict):
+#     """Lightweight params wrapper (dict-compatible).
+
+#     Adds small typed helpers while staying fully compatible with existing code.
+#     """
+
+#     def get_int(self, key: str, default: int = 0) -> int:
+#         try:
+#             return int(self.get(key, default))
+#         except Exception:
+#             return int(default)
+
+#     def get_float(self, key: str, default: float = 0.0) -> float:
+#         try:
+#             return float(self.get(key, default))
+#         except Exception:
+#             return float(default)
+
+#     def get_bool(self, key: str, default: bool = False) -> bool:
+#         try:
+#             return bool(self.get(key, default))
+#         except Exception:
+#             return bool(default)
+
+
+# params = Params(config)
+
+
+# rootdir = Path(__file__).parent.parent
+
+# def set_params(new_params):
+#     """Update module-level params (used as defaults when explicit args are None)."""
+#     global params
+#     if isinstance(new_params, Params):
+#         params = new_params
+#     else:
+#         # Accept any mapping/dict-like object.
+#         params = Params(dict(new_params))
 
 
 # -----------------------------

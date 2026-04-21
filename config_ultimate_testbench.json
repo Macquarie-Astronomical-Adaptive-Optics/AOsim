@@ -3,7 +3,7 @@
     "telescope_center_obscuration": 0.0001,
     "wfs_lambda": 5e-07,
     "science_lambda": 2.15e-06,
-    "actuators": 12,
+    "actuators": 11,
     "grid_size": 512,
     "field_padding": 4,
     "poke_amplitude": 1e-06,
