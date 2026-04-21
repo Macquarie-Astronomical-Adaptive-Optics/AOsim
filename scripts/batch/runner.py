@@ -12,7 +12,7 @@ import numpy as np
 
 from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy
 from scripts.fits_writer import PsfFITSRecorder
-from scripts.utilities import Analysis, Gaussian2DFitter, params as default_params
+from scripts.utilities import Analysis, Gaussian2DFitter
 from astropy.modeling import models, fitting
 
 
@@ -130,12 +130,15 @@ def _phase_to_psf_batch(
         sx = tt_yx[:, 1][:, None, None]
         phase_batch = phase_batch - (sx * xx[None, :, :] + sy * yy[None, :, :])
 
-    # Build complex field. Avoid materializing scaled phase when possible.
+    # Build complex field.
+    # Use cp.complex64(1j) instead of bare 1j: Python's 1j is complex128, so
+    # `1j * float32_array` silently upcasts to complex128, doubling the intermediate
+    # allocation (~1 GB for chunk_frames=256, M=512) before astype() downcasts it.
+    _1j = cp.complex64(1j)
     if float(ps) == 1.0:
-        E = cp.exp(1j * phase_batch).astype(cp.complex64, copy=False)
+        E = cp.exp(_1j * phase_batch)
     else:
-        # fused multiply inside exp
-        E = cp.exp(1j * (phase_batch * ps)).astype(cp.complex64, copy=False)
+        E = cp.exp(_1j * (phase_batch * cp.float32(ps)))
     E *= P[None, :, :]
 
     F = cp.fft.fft2(E, s=(Nfft, Nfft), axes=(-2, -1))
@@ -537,7 +540,9 @@ class AOBatchRunner:
         params: Optional[Dict[str, Any]] = None,
     ):
         self.sim = sim
-        self.params = params if params is not None else default_params
+        if params is None:
+            raise ValueError("AOBatchRunner requires an explicit params dict — call set_params() before constructing.")
+        self.params = params
         self.sensors = list(sensors)
         self.R = reconstructor
         self.pupil = pupil.astype(cp.float32, copy=False)
@@ -777,6 +782,8 @@ class AOBatchRunner:
         eval_accumulate_uncorrected: bool = True,
     ) -> Dict[str, object]:
         n_frames = int(n_frames)
+        # Release any pooled VRAM blocks from previous runs before allocating new buffers.
+        cp.get_default_memory_pool().free_all_blocks()
         patch_M = int(getattr(self, "patch_M", getattr(self.sensors[0], "grid_size", self.pupil.shape[0])))
         if fft_pad is None:
             fft_pad = patch_M // 2
@@ -828,9 +835,9 @@ class AOBatchRunner:
             eval_xy_rad = np.asarray(eval_points_arcsec, dtype=np.float32) * np.float32(ARCSEC2RAD)
             eval_thetas_gpu = cp.asarray(eval_xy_rad)
             eval_ranges_gpu = cp.full((n_eval,), cp.inf, dtype=cp.float32)
-            sum_psf_corr_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float64)
+            sum_psf_corr_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float32)
             if eval_accumulate_uncorrected:
-                sum_psf_unc_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float64)
+                sum_psf_unc_eval = cp.zeros((n_eval, psf_roi, psf_roi), dtype=cp.float32)
         # --- Off-axis evaluation (fixed field points) performance path ---
         # We only need *long-exposure* off-axis PSFs, so we:
         #   1) sample off-axis phases using the fixed-geometry sampler when possible
@@ -867,19 +874,44 @@ class AOBatchRunner:
             # We estimate an upper bound on B from current free VRAM, leaving headroom for
             # the main on-axis chunk buffers and other simulator state.
             free_b, _total_b = cp.cuda.runtime.memGetInfo()
+
+            # Adaptive chunk_frames: cap so that worst-case on-axis FFT peak fits in VRAM.
+            # cuFFT with s=(Nfft,Nfft) on a (B,M,M) input may allocate three large arrays:
+            #   E (B×M²×8)  +  internal padded copy (B×Nfft²×8)  +  F output (B×Nfft²×8)
+            # We leave 1.5 GB headroom for eval bufs, the two on-axis phase bufs, and pool noise.
+            _bpcf = int(8 * (int(patch_M) ** 2 + 2 * int(Nfft) ** 2))
+            _cf_budget = max(0, int(free_b) - int(1536 * 1024 * 1024))
+            _max_cf = max(16, int(_cf_budget) // max(1, int(_bpcf)))
+            if int(_max_cf) < int(chunk_frames):
+                chunk_frames = int(_max_cf)
+                print(f"[runner] VRAM: auto-reduced chunk_frames to {chunk_frames} "
+                      f"(free={free_b >> 20} MB, Nfft={Nfft})")
+
             # main chunk PSF phase buffers are allocated later; reserve space for them now
             reserve_b = int(2 * int(chunk_frames) * int(patch_M) * int(patch_M) * 4)  # buf_corr + buf_unc
+            # NOTE: do NOT include on-axis FFT workspace here — eval FFT and on-axis FFT
+            # are never live simultaneously, so adding it would falsely deflate free_eff
+            # and force eval_chunk_frames down to 1-2 (causing choppy GPU utilization).
             # plus a safety headroom (avoid going into shared VRAM on 8GB cards)
-            headroom_b = int(192 * 1024 * 1024)
+            headroom_b = int(512 * 1024 * 1024)
             free_eff = max(0, int(free_b) - int(reserve_b) - int(headroom_b))
 
             # bytes per PSF sample (dominant: complex FFT output) for roi path
             bytes_per_sample = int(8 * int(Nfft) * int(Nfft) + 12 * int(patch_M) * int(patch_M) + 4 * int(psf_roi) * int(psf_roi))
-            # allow up to 30% of effective free memory for off-axis PSF temporaries
-            budget_b = max(int(64 * 1024 * 1024), int(0.30 * float(free_eff)))
+            # allow up to 50% of effective free memory for off-axis PSF temporaries
+            budget_b = max(int(64 * 1024 * 1024), int(0.50 * float(free_eff)))
             max_B = max(1, int(budget_b) // max(1, int(bytes_per_sample)))
             max_time_fft = max(1, int(max_B) // max(1, int(n_eval)))
             eval_chunk_frames = int(min(int(chunk_frames), int(max_time_fft)))
+            # Floor: eval FFT pool blocks must be at least as large as on-axis FFT blocks
+            # so the pool can reuse them for the main flush without a new CUDA allocation.
+            _min_ecf = max(1, (int(chunk_frames) + int(n_eval) - 1) // int(n_eval))
+            eval_chunk_frames = max(int(eval_chunk_frames), int(_min_ecf))
+            # Cap: ensure eval live allocations actually fit in the available VRAM budget
+            _bytes_per_eval_cf = int(n_eval) * (int(2 * (int(patch_M) ** 2 + int(Nfft) ** 2)) * 8 + int(patch_M) ** 2 * 8)
+            _vram_budget_eval = max(int(64 * 1024 * 1024), int(free_b) - int(reserve_b) - int(512 * 1024 * 1024))
+            eval_chunk_frames = min(int(eval_chunk_frames), max(1, int(_vram_budget_eval) // max(1, int(_bytes_per_eval_cf))))
+            print(f"[runner] eval_chunk_frames={eval_chunk_frames} (chunk_frames={chunk_frames}, n_eval={n_eval}, free_eff={free_eff >> 20} MB)")
 
             # Flat buffers: (eval_chunk_frames * n_eval, M, M)
             eval_buf_cor = cp.empty((eval_chunk_frames * n_eval, patch_M, patch_M), dtype=cp.float32)
@@ -910,7 +942,8 @@ class AOBatchRunner:
                         norm_inv=psf_norm_inv,
                     )
                     Icorr = Icorr.reshape(int(tstep), int(n_eval), int(psf_roi), int(psf_roi))
-                    cp.add(sum_psf_corr_eval, cp.sum(Icorr, axis=0).astype(cp.float64, copy=False), out=sum_psf_corr_eval)
+                    cp.add(sum_psf_corr_eval, cp.sum(Icorr, axis=0).astype(cp.float32, copy=False), out=sum_psf_corr_eval)
+                    del Icorr
 
                     if eval_accumulate_uncorrected and (sum_psf_unc_eval is not None) and (eval_buf_unc is not None):
                         unc_view = eval_buf_unc[b0:b1]
@@ -926,7 +959,8 @@ class AOBatchRunner:
                             norm_inv=psf_norm_inv,
                         )
                         Iunc = Iunc.reshape(int(tstep), int(n_eval), int(psf_roi), int(psf_roi))
-                        cp.add(sum_psf_unc_eval, cp.sum(Iunc, axis=0).astype(cp.float64, copy=False), out=sum_psf_unc_eval)
+                        cp.add(sum_psf_unc_eval, cp.sum(Iunc, axis=0).astype(cp.float32, copy=False), out=sum_psf_unc_eval)
+                        del Iunc
 
                     t0 += tstep
 
@@ -1361,6 +1395,8 @@ class AOBatchRunner:
                     # When recording PSFs, Icorr/Iunc are always full-chunk.
                     rec_corr.write_chunk(Icorr)
                     rec_unc.write_chunk(Iunc)
+                # Free FFT output arrays back to the pool so the next chunk can reuse them.
+                del Icorr, Iunc
                 b = 0
 
                 # Progress callback (rate-limited)

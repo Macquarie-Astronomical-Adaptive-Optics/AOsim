@@ -776,7 +776,13 @@ class TomoOnAxisIM_CuPy:
     # -----------------------------
     def prepare_runtime(self):
         M = self.M
-        self._basis_flat = cp.stack([b.ravel() for b in self.basis], axis=0).astype(cp.float32, copy=False)
+        # Store as float16 to halve VRAM (~720 MB vs ~1.45 GB for HAWKI at M=512).
+        # Fill row-by-row to avoid materialising a full float32 intermediate.
+        nB_rt = len(self.basis)
+        Msq_rt = M * M
+        self._basis_flat = cp.empty((nB_rt, Msq_rt), dtype=cp.float16)
+        for _i, _b in enumerate(self.basis):
+            self._basis_flat[_i] = _b.ravel().astype(cp.float16)
 
         pup = self.pupil.astype(cp.float32, copy=False)
         self._pupil_flat = pup.ravel()
@@ -849,6 +855,7 @@ class TomoOnAxisIM_CuPy:
         H = H + (self.reg_alpha * self.reg_alpha) * cp.eye(H.shape[0], dtype=H.dtype)
 
         evals, V = cp.linalg.eigh(H)
+        del H
         idx = cp.argsort(evals)[::-1]
         evals = evals[idx]
         V = V[:, idx]
@@ -856,8 +863,9 @@ class TomoOnAxisIM_CuPy:
         e0 = evals[0]
         keep = evals >= (rcond * rcond * e0)
 
-        self._eig_V = V[:, keep]
+        self._eig_V = V[:, keep].copy()   # .copy() so V can be freed
         self._eig_inv = (1.0 / evals[keep]).astype(cp.float32)
+        del evals, V
 
         # Cache A^T and a compact runtime matrix that folds in V^T and the eigenvalue inverse.
         # This reduces per-frame compute from (A^T @ s) + (V^T @ rhs) to a single matmul.
@@ -867,6 +875,7 @@ class TomoOnAxisIM_CuPy:
             self._P = (self._eig_inv[:, None] * VkT_At).astype(cp.float32, copy=False)
         except Exception:
             self._P = None
+        cp.get_default_memory_pool().free_all_blocks()
 
     # -----------------------------
     # solve (with optional hard waffle projection)
@@ -1016,8 +1025,8 @@ class TomoOnAxisIM_CuPy:
         ph_acc.fill(0.0)
 
         for li in range(self.nL):
-            layer_flat = x[li] @ self._basis_flat
-            layer_map = layer_flat.reshape(self.M, self.M).astype(cp.float32, copy=False)
+            layer_flat = (x[li].astype(cp.float16) @ self._basis_flat).astype(cp.float32)
+            layer_map = layer_flat.reshape(self.M, self.M)
 
             Xw = self._Xw_sci[li]
             Yw = self._Yw_sci[li]
@@ -1072,7 +1081,7 @@ class TomoOnAxisIM_CuPy:
     def coeffs_to_onaxis_phase(self, xhat):
         x = cp.asarray(xhat, dtype=cp.float32)
         coeff_sum = cp.sum(x.reshape(self.nL, self.nB), axis=0)
-        phase_flat = coeff_sum @ self._basis_flat
+        phase_flat = (coeff_sum.astype(cp.float16) @ self._basis_flat).astype(cp.float32)
         phase_flat = phase_flat * self._pupil_flat
 
         sel = self._sel

@@ -163,31 +163,41 @@ class InfiniteVonKarmanScreen2D:
         pos_stencil = cp.stack([xs, ys], axis=1) * dx         # (nc*N,2)
         n_stencils = nc * N
 
+        def _cov_block(pos_a, pos_b):
+            """Covariance sub-block without materialising the full (P,P,2) tensor."""
+            d = pos_a[:, None, :] - pos_b[None, :, :]
+            r = cp.sqrt(d[..., 0]**2 + d[..., 1]**2).astype(build_dtype)
+            del d
+            return phase_covariance_vk_cp(r, r0=float(r0_ref), L0=float(L0), dtype=build_dtype)
+
+        # Build cov_zz once — shared between both build_ops calls.
+        cov_zz = _cov_block(pos_stencil, pos_stencil)  # (n_stencils, n_stencils)
+
+        # Regularise for numerical stability with large N.
+        diag_mean = float(cp.mean(cp.diag(cov_zz)))
+        reg = build_dtype(max(1e-5 * diag_mean, 1e-12))
+        cov_zz_reg = cov_zz + reg * cp.eye(n_stencils, dtype=build_dtype)
+
         def build_ops(x_new: float):
             pos_X = cp.stack(
                 [cp.full((N,), x_new, dtype=build_dtype), cp.arange(N, dtype=build_dtype)],
                 axis=1
             ) * dx                                             # (N,2)
 
-            pos = cp.concatenate([pos_stencil, pos_X], axis=0) # (P,2)
-            d = pos[:, None, :] - pos[None, :, :]
-            r = cp.sqrt(d[..., 0]**2 + d[..., 1]**2).astype(build_dtype)
+            # Compute sub-blocks separately — peak is max(n_stencils², N·n_stencils, N²)
+            # instead of the full (n_stencils+N)² matrix.
+            cov_xz = _cov_block(pos_X, pos_stencil)   # (N, n_stencils)
+            cov_zx = cov_xz.T                          # view
+            cov_xx = _cov_block(pos_X, pos_X)          # (N, N)
 
-            cov = phase_covariance_vk_cp(r, r0=float(r0_ref), L0=float(L0), dtype=build_dtype)
-
-            cov_zz = cov[:n_stencils, :n_stencils]
-            cov_xx = cov[n_stencils:, n_stencils:]
-            cov_zx = cov[:n_stencils, n_stencils:]
-            cov_xz = cov[n_stencils:, :n_stencils]
-
-            A = cp.linalg.solve(cov_zz.T, cov_xz.T).T
+            A = cp.linalg.solve(cov_zz_reg.T, cov_xz.T).T
             BBt = cov_xx - A @ cov_zx
 
-            jitter = (build_dtype(1e-6) * cp.trace(BBt) / build_dtype(N))
-            Lchol = cp.linalg.cholesky(BBt + jitter * cp.eye(N, dtype=build_dtype))
-            B = Lchol
+            jitter = float(build_dtype(1e-6) * cp.trace(BBt) / build_dtype(N))
+            jitter = max(jitter, 1e-10 * diag_mean)
+            Lchol = cp.linalg.cholesky(BBt + build_dtype(jitter) * cp.eye(N, dtype=build_dtype))
 
-            return A.astype(self.dtype), B.astype(self.dtype)
+            return A.astype(self.dtype), Lchol.astype(self.dtype)
 
         # prepend: new row *before* stencil
         A_pre, B_pre = build_ops(x_new=-1.0)
