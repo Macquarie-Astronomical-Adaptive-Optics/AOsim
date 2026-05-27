@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 from dataclasses import dataclass
 from collections import deque
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -14,6 +15,338 @@ from scripts.reconstructor import TomoOnAxisIM_CuPy, TipTiltReconstructor_CuPy
 from scripts.fits_writer import PsfFITSRecorder
 from scripts.utilities import Analysis, Gaussian2DFitter
 from astropy.modeling import models, fitting
+
+
+class TelemetryRecorder:
+    """Lightweight GPU-buffered telemetry recorder for headless AO runs.
+
+    This records observable AO telemetry needed for PSF-reconstruction research
+    without storing full phase-screen cubes. Arrays are buffered on the GPU during
+    the run and copied once to ``telemetry.npz`` at finalization.
+
+    Channel conventions
+    -------------------
+    slopes_err_vec : packed WFS residual/error slopes used by the reconstructor.
+    dm_cmd         : modal DM/ASM command vector after the controller update
+                     (kept for backward compatibility; same as dm_cmd_new).
+    dm_cmd_new     : modal DM/ASM command vector newly computed at this frame.
+    dm_cmd_applied : delayed modal DM/ASM command that was actually applied to
+                     the phase for this frame.
+    xhat           : reconstructed modal estimate from the current WFS slopes.
+    tt_cmd_yx      : TT controller command/state [sy, sx] in 500 nm-ref rad/pixel.
+    tt_meas_yx     : TT measurement [sy, sx]; NaN when not updated/not available.
+    wfe_rms        : [uncorrected, corrected] pupil-RMS phase in 500 nm-ref radians.
+    dm_phi_rms     : RMS of the active delayed DM phase map in 500 nm-ref radians.
+    truth_modal_atm_total      : optional diagnostic projection of true total
+                                 uncorrected science phase onto the DM basis.
+    truth_layer_modal_atm      : optional layer-wise diagnostic projection of
+                                 true uncorrected science phase onto the DM basis;
+                                 shape [n_sample, n_layer, n_mode].
+    truth_modal_residual_total : optional diagnostic projection of true total
+                                 corrected science phase onto the DM basis.
+    truth_modal_dm_applied    : optional diagnostic projection of active delayed
+                                 DM phase onto the DM basis.
+
+    The truth modal channels are simulator-only validation products. They are not
+    observable telemetry and should not be used as inputs to a deployable PSF-R
+    algorithm.
+    """
+
+    DEFAULT_CHANNELS = (
+        "slopes_err_vec",
+        "dm_cmd",
+        "xhat",
+        "tt_cmd_yx",
+        "tt_meas_yx",
+        "wfe_rms",
+        "dm_phi_rms",
+    )
+
+    ALIASES = {
+        "slopes_err": "slopes_err_vec",
+        "slopes": "slopes_err_vec",
+        "commands": "dm_cmd",
+        "dm": "dm_cmd",
+        "dm_cmd_new": "dm_cmd_new",
+        "dm_new": "dm_cmd_new",
+        "dm_cmd_applied": "dm_cmd_applied",
+        "dm_applied": "dm_cmd_applied",
+        "modes": "xhat",
+        "recon": "xhat",
+        "tt_cmd": "tt_cmd_yx",
+        "tt_meas": "tt_meas_yx",
+        "wfe": "wfe_rms",
+        "truth_atm": "truth_modal_atm_total",
+        "truth_modal_atm": "truth_modal_atm_total",
+        "true_modal_atm": "truth_modal_atm_total",
+        "truth_atm_total": "truth_modal_atm_total",
+        "truth_layers": "truth_layer_modal_atm",
+        "truth_layer_atm": "truth_layer_modal_atm",
+        "truth_layer_modal_atm": "truth_layer_modal_atm",
+        "truth_residual": "truth_modal_residual_total",
+        "truth_modal_residual": "truth_modal_residual_total",
+        "true_modal_residual": "truth_modal_residual_total",
+        "truth_residual_total": "truth_modal_residual_total",
+        "truth_dm": "truth_modal_dm_applied",
+        "truth_modal_dm": "truth_modal_dm_applied",
+        "true_modal_dm": "truth_modal_dm_applied",
+        "truth_dm_applied": "truth_modal_dm_applied",
+    }
+
+    def __init__(
+        self,
+        *,
+        out_dir: str,
+        n_frames: int,
+        stride: int = 1,
+        channels: Optional[Sequence[str]] = None,
+        n_slopes: int = 0,
+        n_modes: int = 0,
+        n_layers: int = 0,
+        max_samples: Optional[int] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ):
+        self.out_dir = str(out_dir)
+        self.stride = max(1, int(stride))
+        raw_channels = list(channels) if channels is not None else list(self.DEFAULT_CHANNELS)
+        self.channels = []
+        for c in raw_channels:
+            cc = self.ALIASES.get(str(c).strip().lower(), str(c).strip().lower())
+            if cc not in self.channels:
+                self.channels.append(cc)
+
+        n_possible = (int(n_frames) + self.stride - 1) // self.stride
+        if max_samples is not None:
+            n_possible = min(n_possible, max(0, int(max_samples)))
+        self.n_max = int(n_possible)
+        self.n = 0
+        self.frame_index = np.empty((self.n_max,), dtype=np.int32)
+        self.data: Dict[str, cp.ndarray] = {}
+
+        if self.n_max <= 0:
+            return
+
+        if "slopes_err_vec" in self.channels and int(n_slopes) > 0:
+            self.data["slopes_err_vec"] = cp.empty((self.n_max, int(n_slopes)), dtype=cp.float32)
+        if "dm_cmd" in self.channels and int(n_modes) > 0:
+            self.data["dm_cmd"] = cp.empty((self.n_max, int(n_modes)), dtype=cp.float32)
+        if "dm_cmd_new" in self.channels and int(n_modes) > 0:
+            self.data["dm_cmd_new"] = cp.empty((self.n_max, int(n_modes)), dtype=cp.float32)
+        if "dm_cmd_applied" in self.channels and int(n_modes) > 0:
+            self.data["dm_cmd_applied"] = cp.empty((self.n_max, int(n_modes)), dtype=cp.float32)
+        if "xhat" in self.channels and int(n_modes) > 0:
+            self.data["xhat"] = cp.empty((self.n_max, int(n_modes)), dtype=cp.float32)
+        if "tt_cmd_yx" in self.channels:
+            self.data["tt_cmd_yx"] = cp.empty((self.n_max, 2), dtype=cp.float32)
+        if "tt_meas_yx" in self.channels:
+            self.data["tt_meas_yx"] = cp.empty((self.n_max, 2), dtype=cp.float32)
+        if "wfe_rms" in self.channels:
+            self.data["wfe_rms"] = cp.empty((self.n_max, 2), dtype=cp.float32)
+        if "dm_phi_rms" in self.channels:
+            self.data["dm_phi_rms"] = cp.empty((self.n_max,), dtype=cp.float32)
+        for _name in ("truth_modal_atm_total", "truth_modal_residual_total", "truth_modal_dm_applied"):
+            if _name in self.channels and int(n_modes) > 0:
+                self.data[_name] = cp.empty((self.n_max, int(n_modes)), dtype=cp.float32)
+        if "truth_layer_modal_atm" in self.channels and int(n_layers) > 0 and int(n_modes) > 0:
+            self.data["truth_layer_modal_atm"] = cp.empty(
+                (self.n_max, int(n_layers), int(n_modes)), dtype=cp.float32
+            )
+
+        self.extra_meta = dict(extra_meta or {})
+
+    def wants(self, frame_index: int) -> bool:
+        return self.n < self.n_max and (int(frame_index) % self.stride) == 0
+
+    def record(
+        self,
+        frame_index: int,
+        *,
+        slopes_err_vec: Optional[cp.ndarray] = None,
+        dm_cmd: Optional[cp.ndarray] = None,
+        dm_cmd_new: Optional[cp.ndarray] = None,
+        dm_cmd_applied: Optional[cp.ndarray] = None,
+        xhat: Optional[cp.ndarray] = None,
+        tt_cmd_yx: Optional[cp.ndarray] = None,
+        tt_meas_yx: Optional[cp.ndarray] = None,
+        wfe_rms: Optional[cp.ndarray] = None,
+        dm_phi_rms: Optional[cp.ndarray] = None,
+        truth_modal_atm_total: Optional[cp.ndarray] = None,
+        truth_layer_modal_atm: Optional[cp.ndarray] = None,
+        truth_modal_residual_total: Optional[cp.ndarray] = None,
+        truth_modal_dm_applied: Optional[cp.ndarray] = None,
+    ) -> None:
+        if self.n >= self.n_max:
+            return
+        k = self.n
+        self.frame_index[k] = int(frame_index)
+
+        if "slopes_err_vec" in self.data and slopes_err_vec is not None:
+            cp.copyto(self.data["slopes_err_vec"][k], slopes_err_vec.astype(cp.float32, copy=False))
+        if "dm_cmd" in self.data and dm_cmd is not None:
+            cp.copyto(self.data["dm_cmd"][k], dm_cmd.astype(cp.float32, copy=False))
+        if "dm_cmd_new" in self.data and dm_cmd_new is not None:
+            cp.copyto(self.data["dm_cmd_new"][k], dm_cmd_new.astype(cp.float32, copy=False))
+        if "dm_cmd_applied" in self.data and dm_cmd_applied is not None:
+            cp.copyto(self.data["dm_cmd_applied"][k], dm_cmd_applied.astype(cp.float32, copy=False))
+        if "xhat" in self.data and xhat is not None:
+            cp.copyto(self.data["xhat"][k], xhat.astype(cp.float32, copy=False))
+        if "tt_cmd_yx" in self.data and tt_cmd_yx is not None:
+            cp.copyto(self.data["tt_cmd_yx"][k], tt_cmd_yx.astype(cp.float32, copy=False))
+        if "tt_meas_yx" in self.data and tt_meas_yx is not None:
+            cp.copyto(self.data["tt_meas_yx"][k], tt_meas_yx.astype(cp.float32, copy=False))
+        if "wfe_rms" in self.data and wfe_rms is not None:
+            cp.copyto(self.data["wfe_rms"][k], wfe_rms.astype(cp.float32, copy=False))
+        if "dm_phi_rms" in self.data and dm_phi_rms is not None:
+            self.data["dm_phi_rms"][k] = dm_phi_rms
+        if "truth_modal_atm_total" in self.data and truth_modal_atm_total is not None:
+            cp.copyto(self.data["truth_modal_atm_total"][k], truth_modal_atm_total.astype(cp.float32, copy=False))
+        if "truth_layer_modal_atm" in self.data and truth_layer_modal_atm is not None:
+            cp.copyto(self.data["truth_layer_modal_atm"][k], truth_layer_modal_atm.astype(cp.float32, copy=False))
+        if "truth_modal_residual_total" in self.data and truth_modal_residual_total is not None:
+            cp.copyto(self.data["truth_modal_residual_total"][k], truth_modal_residual_total.astype(cp.float32, copy=False))
+        if "truth_modal_dm_applied" in self.data and truth_modal_dm_applied is not None:
+            cp.copyto(self.data["truth_modal_dm_applied"][k], truth_modal_dm_applied.astype(cp.float32, copy=False))
+
+        self.n += 1
+
+    def finalize(self) -> Dict[str, Any]:
+        os.makedirs(self.out_dir, exist_ok=True)
+        npz_path = os.path.join(self.out_dir, "telemetry.npz")
+        meta_path = os.path.join(self.out_dir, "telemetry_summary.json")
+
+        arrays: Dict[str, np.ndarray] = {"frame_index": self.frame_index[: self.n].copy()}
+        for name, arr in self.data.items():
+            arrays[name] = cp.asnumpy(arr[: self.n])
+
+        # Use uncompressed NPZ for speed. Compress later only for archiving/sharing.
+        np.savez(npz_path, **arrays)
+
+        meta = dict(self.extra_meta)
+        meta.update(
+            {
+                "telemetry_npz": npz_path,
+                "n_samples": int(self.n),
+                "stride": int(self.stride),
+                "channels_requested": list(self.channels),
+                "channels_written": list(self.data.keys()),
+                "arrays": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in arrays.items()},
+            }
+        )
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+        return {
+            "telemetry_npz": npz_path,
+            "telemetry_summary_json": meta_path,
+            "telemetry_n_samples": int(self.n),
+            "telemetry_channels_written": list(self.data.keys()),
+        }
+
+
+class ModalTruthProjector:
+    """Cheap diagnostic projector from pupil phase maps to the DM modal basis.
+
+    This is intended for simulator-truth sanity checks, not for production
+    reconstruction. It uses a diagonal inner-product projection onto the current
+    reconstructor basis:
+
+        c_i ~= <B_i, phi> / <B_i, B_i>
+
+    The basis functions are not strictly orthogonal, so this is not an exact
+    least-squares modal decomposition. It is intentionally lightweight and
+    chunked to avoid large GPU allocations during telemetry recording.
+    """
+
+    def __init__(self, R, pupil: cp.ndarray, *, chunk_modes: int = 64, eps: float = 1e-20):
+        if not hasattr(R, "_basis_flat") or R._basis_flat is None:
+            raise RuntimeError("Reconstructor runtime basis is unavailable; call R.prepare_runtime() first.")
+        self.R = R
+        self.basis_flat = R._basis_flat
+        self.pupil_flat = cp.asarray(pupil, dtype=cp.float32).ravel()
+        self.n_basis = int(self.basis_flat.shape[0])
+        self.n_modes = int(getattr(R, "n_modes", self.n_basis))
+        self.chunk_modes = max(1, int(chunk_modes))
+        self.eps = cp.float32(float(eps))
+
+        self._denom = cp.empty((self.n_basis,), dtype=cp.float32)
+        for i0 in range(0, self.n_basis, self.chunk_modes):
+            i1 = min(self.n_basis, i0 + self.chunk_modes)
+            b = self.basis_flat[i0:i1].astype(cp.float32, copy=False)
+            bp = b * self.pupil_flat[None, :]
+            self._denom[i0:i1] = cp.sum(bp * bp, axis=1).astype(cp.float32, copy=False)
+        self._denom = cp.maximum(self._denom, self.eps)
+
+    def project(self, phi: cp.ndarray) -> cp.ndarray:
+        v = (cp.asarray(phi, dtype=cp.float32).ravel() * self.pupil_flat).astype(cp.float32, copy=False)
+        coeff = cp.zeros((self.n_modes,), dtype=cp.float32)
+        n_out = min(self.n_basis, self.n_modes)
+        for i0 in range(0, n_out, self.chunk_modes):
+            i1 = min(n_out, i0 + self.chunk_modes)
+            b = self.basis_flat[i0:i1].astype(cp.float32, copy=False)
+            coeff[i0:i1] = (b @ v) / self._denom[i0:i1]
+        return coeff
+
+    def project_stack(self, phi_stack: cp.ndarray) -> cp.ndarray:
+        """Project a stack of phase maps with shape (K, N, N) to (K, n_modes)."""
+        phi_stack = cp.asarray(phi_stack, dtype=cp.float32)
+        if phi_stack.ndim != 3:
+            raise ValueError("phi_stack must have shape (K, N, N)")
+        K = int(phi_stack.shape[0])
+        coeff = cp.zeros((K, self.n_modes), dtype=cp.float32)
+        if K == 0:
+            return coeff
+        v = phi_stack.reshape(K, -1) * self.pupil_flat[None, :]
+        n_out = min(self.n_basis, self.n_modes)
+        for i0 in range(0, n_out, self.chunk_modes):
+            i1 = min(n_out, i0 + self.chunk_modes)
+            b = self.basis_flat[i0:i1].astype(cp.float32, copy=False)
+            coeff[:, i0:i1] = (v @ b.T) / self._denom[i0:i1][None, :]
+        return coeff
+
+
+def _layer_metadata_from_sim(sim) -> Dict[str, Any]:
+    """Return JSON-serializable turbulence-layer metadata for telemetry summaries."""
+    layers = list(getattr(sim, "layers", []) or [])
+    names = []
+    altitude_m = []
+    r0_m = []
+    L0_m = []
+    vx_mps = []
+    vy_mps = []
+    active = []
+    weight = []
+
+    for i, L in enumerate(layers):
+        names.append(str(L.get("name", f"layer_{i}")))
+        altitude_m.append(float(L.get("h", L.get("altitude_m", 0.0))))
+        r0_m.append(float(L.get("r0", np.nan)))
+        L0_m.append(float(L.get("L0", np.nan)))
+        vx = float(L.get("vx", 0.0))
+        vy = float(L.get("vy", 0.0))
+        vx_mps.append(vx)
+        vy_mps.append(vy)
+        active.append(bool(L.get("active", True)))
+        weight.append(float(L.get("w", np.nan)))
+
+    vx_arr = np.asarray(vx_mps, dtype=float)
+    vy_arr = np.asarray(vy_mps, dtype=float)
+    wind_speed = np.sqrt(vx_arr * vx_arr + vy_arr * vy_arr)
+    wind_dir_deg = np.degrees(np.arctan2(vy_arr, vx_arr))
+
+    return {
+        "n_layers": int(len(layers)),
+        "layer_name": names,
+        "layer_altitude_m": altitude_m,
+        "layer_r0_m": r0_m,
+        "layer_L0_m": L0_m,
+        "layer_weight": weight,
+        "layer_vx_mps": vx_mps,
+        "layer_vy_mps": vy_mps,
+        "layer_wind_speed_mps": wind_speed.tolist(),
+        "layer_wind_dir_deg": wind_dir_deg.tolist(),
+        "layer_active": active,
+        "r0_total_m": float(getattr(sim, "r0_total", np.nan)),
+    }
 
 
 class TTPlaneRemover:
@@ -729,10 +1062,14 @@ class AOBatchRunner:
 
         # DM state
         self.dm_cmd = cp.zeros((self.R.n_modes,), dtype=cp.float32)
+        self.dm_cmd_new = self.dm_cmd
+        self.dm_cmd_applied = cp.zeros_like(self.dm_cmd)
         self.dm_phi = cp.zeros((patch_M, patch_M), dtype=cp.float32)
         # FIFO pipeline: command computed at tick t becomes active at tick t+dm_delay_frames
         self._dm_phi_pipeline = deque([cp.zeros((patch_M, patch_M), dtype=cp.float32) for _ in range(self.dm_delay_frames)])
+        self._dm_cmd_pipeline = deque([cp.zeros_like(self.dm_cmd) for _ in range(self.dm_delay_frames)])
         self.dm_phi = self._dm_phi_pipeline[0]
+        self.dm_cmd_applied = self._dm_cmd_pipeline[0]
 
         # Separate NGS-based tip-tilt loop state
         self.tt_cmd_yx = cp.zeros((2,), dtype=cp.float32)  # (sy, sx) in 500nm-reference rad/pixel
@@ -780,6 +1117,11 @@ class AOBatchRunner:
         write_eval_uncorrected_fits: bool = True,
         # If False, skip computing/accumulating uncorrected off-axis PSFs (speed).
         eval_accumulate_uncorrected: bool = True,
+        # Optional AO telemetry recording for PSF-reconstruction research.
+        save_telemetry: bool = False,
+        telemetry_stride: int = 1,
+        telemetry_channels: Optional[Sequence[str]] = None,
+        telemetry_max_samples: Optional[int] = None,
     ) -> Dict[str, object]:
         n_frames = int(n_frames)
         # Release any pooled VRAM blocks from previous runs before allocating new buffers.
@@ -1039,6 +1381,58 @@ class AOBatchRunner:
         cancelled = False
         wfs_phase_buf = cp.empty((self.n_wfs, patch_M, patch_M), dtype=cp.float32)
         tt_acc = cp.zeros((2,), dtype=cp.float32) if self.psf_tt_mode == "hybrid" else None
+
+        # Optional telemetry recorder. This records observables needed for PSF-R
+        # development, not the large truth phase cubes.
+        telem = None
+        pupil_sum = cp.maximum(cp.sum(self.pupil), cp.float32(1e-20))
+        tt_meas_nan = cp.full((2,), cp.nan, dtype=cp.float32)
+        if bool(save_telemetry):
+            layer_meta = _layer_metadata_from_sim(self.sim)
+            telem = TelemetryRecorder(
+                out_dir=out_dir,
+                n_frames=n_frames,
+                stride=int(telemetry_stride),
+                channels=telemetry_channels,
+                n_slopes=int(getattr(self, "_slopes_total_len", 0)),
+                n_modes=int(getattr(self.R, "n_modes", 0)),
+                n_layers=int(layer_meta.get("n_layers", 0)),
+                max_samples=telemetry_max_samples,
+                extra_meta={
+                    "dt_s": float(self.dt_s),
+                    "n_frames_requested": int(n_frames),
+                    "discard_first_frames": int(discard_first_frames),
+                    "psf_tt_mode": str(self.psf_tt_mode),
+                    "n_wfs": int(self.n_wfs),
+                    "n_slopes": int(getattr(self, "_slopes_total_len", 0)),
+                    "n_modes": int(getattr(self.R, "n_modes", 0)),
+                    "tt_enabled": bool(self.tt_enabled),
+                    "gain": float(self.gain),
+                    "leak": float(self.leak),
+                    "dm_delay_frames": int(getattr(self, "dm_delay_frames", 1)),
+                    **layer_meta,
+                },
+            )
+
+        truth_modal_projector = None
+        if telem is not None and any(
+            name in telem.data
+            for name in (
+                "truth_modal_atm_total",
+                "truth_layer_modal_atm",
+                "truth_modal_residual_total",
+                "truth_modal_dm_applied",
+            )
+        ):
+            truth_modal_projector = ModalTruthProjector(self.R, self.pupil, chunk_modes=64)
+            telem.extra_meta.update({
+                "truth_modal_projection": "diagonal_inner_product_on_dm_basis",
+                "truth_modal_projection_note": (
+                    "Simulator-only diagnostic. Basis functions are non-orthogonal; "
+                    "use for sanity checks, not as an exact LS modal truth."
+                ),
+            })
+
         t0 = time.perf_counter()
         last_prog = 0
 
@@ -1085,10 +1479,12 @@ class AOBatchRunner:
                 )
             # 3) Science residual phase (DM from previous tick is conjugate to ground)
             phi_unc = phases_atm[0]
+            dm_phi_applied_frame = self.dm_phi
+            dm_cmd_applied_frame = self.dm_cmd_applied
             if self.tt_enabled:
-                phi_cor = phi_unc - self.dm_phi - self.tt_phi
+                phi_cor = phi_unc - dm_phi_applied_frame - self.tt_phi
             else:
-                phi_cor = phi_unc - self.dm_phi
+                phi_cor = phi_unc - dm_phi_applied_frame
 
             if self.psf_tt_mode == "fit" and self._tt_remover is not None:
                 self._tt_remover.remove_inplace(phi_unc)
@@ -1124,9 +1520,9 @@ class AOBatchRunner:
 
                 # Corrected: subtract current DM and global TT (apply to all eval points)
                 if self.tt_enabled:
-                    cp.subtract(eval_phi_unc, (self.dm_phi + self.tt_phi)[None, :, :], out=eval_buf_cor[j0:j1])
+                    cp.subtract(eval_phi_unc, (dm_phi_applied_frame + self.tt_phi)[None, :, :], out=eval_buf_cor[j0:j1])
                 else:
-                    cp.subtract(eval_phi_unc, self.dm_phi[None, :, :], out=eval_buf_cor[j0:j1])
+                    cp.subtract(eval_phi_unc, dm_phi_applied_frame[None, :, :], out=eval_buf_cor[j0:j1])
 
                 eval_buf_t += 1
                 if eval_buf_t == eval_chunk_frames:
@@ -1136,7 +1532,7 @@ class AOBatchRunner:
             # 4) Measure slopes on WFS phases (batched by geometry) and pack a slope-error vector.
             # Reuse buffers to avoid per-frame allocations.
             cp.copyto(wfs_phase_buf, phases_atm[1:])
-            wfs_phase_buf -= self.dm_phi[None, :, :]
+            wfs_phase_buf -= dm_phi_applied_frame[None, :, :]
             if self.tt_enabled:
                 wfs_phase_buf -= self.tt_phi[None, :, :]
 
@@ -1153,6 +1549,7 @@ class AOBatchRunner:
                 and (self.tt_period_frames > 0)
                 and ((t % int(self.tt_period_frames)) == 0)
             )
+            tt_meas_yx_frame = tt_meas_nan
             if do_tt_update:
                 tt_ctrl_acc = cp.zeros((2,), dtype=cp.float32)  # (sy, sx)
                 tt_ctrl_n = 0
@@ -1224,6 +1621,7 @@ class AOBatchRunner:
                     tt_meas_yx = tt_ctrl_acc / cp.float32(tt_ctrl_n)
                 else:
                     tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+                tt_meas_yx_frame = tt_meas_yx
 
                 # Guard against NaNs/Infs (e.g., if a WFS measurement returns non-finite slopes)
                 try:
@@ -1231,6 +1629,7 @@ class AOBatchRunner:
                         tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
                 except Exception:
                     tt_meas_yx = cp.zeros((2,), dtype=cp.float32)
+                tt_meas_yx_frame = tt_meas_yx
 
                 # Integrator with optional leak
                 self.tt_cmd_yx = (1.0 - cp.float32(self.tt_leak)) * self.tt_cmd_yx + cp.float32(self.tt_gain) * tt_meas_yx
@@ -1270,6 +1669,7 @@ class AOBatchRunner:
             # 5) Reconstruct + controller
             xhat = self.R.solve_coeffs_stack(self._slopes_err_vec)
             self.dm_cmd = (1.0 - self.leak) * self.dm_cmd - self.gain * xhat
+            self.dm_cmd_new = self.dm_cmd
             dm_phi_new = -self.R.coeffs_to_onaxis_phase(self.dm_cmd)
             dm_phi_new = (dm_phi_new - cp.mean(dm_phi_new)) * self.pupil
 
@@ -1280,10 +1680,83 @@ class AOBatchRunner:
             # DM servo-lag FIFO: command computed at tick t becomes active at tick t+dm_delay_frames.
             if getattr(self, "_dm_phi_pipeline", None) is None:
                 self._dm_phi_pipeline = deque([cp.zeros_like(dm_phi_new) for _ in range(max(1, int(getattr(self, "dm_delay_frames", 1))))])
+            if getattr(self, "_dm_cmd_pipeline", None) is None:
+                self._dm_cmd_pipeline = deque([cp.zeros_like(self.dm_cmd) for _ in range(max(1, int(getattr(self, "dm_delay_frames", 1))))])
             self._dm_phi_pipeline.append(dm_phi_new)
+            self._dm_cmd_pipeline.append(self.dm_cmd.copy())
             if len(self._dm_phi_pipeline) > int(getattr(self, "dm_delay_frames", 1)):
                 self._dm_phi_pipeline.popleft()
+            if len(self._dm_cmd_pipeline) > int(getattr(self, "dm_delay_frames", 1)):
+                self._dm_cmd_pipeline.popleft()
             self.dm_phi = self._dm_phi_pipeline[0]
+            self.dm_cmd_applied = self._dm_cmd_pipeline[0]
+
+            # Optional AO telemetry sample. Store current-frame observables and
+            # lightweight truth scalars; avoid full phase cubes by default.
+            if telem is not None and telem.wants(t):
+                wfe_rms = None
+                dm_phi_rms = None
+                if "wfe_rms" in telem.data:
+                    w_unc = cp.sqrt(cp.sum((phi_unc * self.pupil) ** 2) / pupil_sum)
+                    w_cor = cp.sqrt(cp.sum((phi_cor * self.pupil) ** 2) / pupil_sum)
+                    wfe_rms = cp.stack([w_unc, w_cor]).astype(cp.float32, copy=False)
+                if "dm_phi_rms" in telem.data:
+                    dm_phi_rms = cp.sqrt(cp.sum((dm_phi_applied_frame * self.pupil) ** 2) / pupil_sum).astype(cp.float32, copy=False)
+
+                truth_modal_atm_total = None
+                truth_layer_modal_atm = None
+                truth_modal_residual_total = None
+                truth_modal_dm_applied = None
+                if truth_modal_projector is not None:
+                    if "truth_modal_atm_total" in telem.data:
+                        truth_modal_atm_total = truth_modal_projector.project(phi_unc)
+                    if "truth_modal_residual_total" in telem.data:
+                        truth_modal_residual_total = truth_modal_projector.project(phi_cor)
+                    if "truth_modal_dm_applied" in telem.data:
+                        truth_modal_dm_applied = truth_modal_projector.project(dm_phi_applied_frame)
+                    if "truth_layer_modal_atm" in telem.data:
+                        # Sample and retain all individual atmospheric layers for
+                        # future frozen-flow/layer-reconstruction validation. This
+                        # is intentionally simulator-truth-only and can be collapsed
+                        # in post-processing into ground/free-atmosphere components.
+                        if self.sampler is not None:
+                            layer_patches = self.sim.sample_patches_from_sampler(
+                                self.sampler,
+                                remove_piston=True,
+                                return_gpu=True,
+                                return_per_layer=True,
+                                layer_first=True,
+                            )  # (n_layer, n_sensor, M, M)
+                        else:
+                            layer_patches = self.sim.sample_patches_batched(
+                                thetas_xy_rad=self._thetas_gpu,
+                                ranges_m=self._ranges_gpu,
+                                size_pixels=float(patch_M),
+                                M=int(patch_M),
+                                angle_deg=0.0,
+                                remove_piston=True,
+                                return_gpu=True,
+                                return_per_layer=True,
+                                layer_first=True,
+                            )  # (n_layer, n_sensor, M, M)
+                        truth_layer_modal_atm = truth_modal_projector.project_stack(layer_patches[:, 0, :, :])
+
+                telem.record(
+                    t,
+                    slopes_err_vec=self._slopes_err_vec,
+                    dm_cmd=self.dm_cmd,
+                    dm_cmd_new=self.dm_cmd_new,
+                    dm_cmd_applied=dm_cmd_applied_frame,
+                    xhat=xhat,
+                    tt_cmd_yx=self.tt_cmd_yx,
+                    tt_meas_yx=tt_meas_yx_frame,
+                    wfe_rms=wfe_rms,
+                    dm_phi_rms=dm_phi_rms,
+                    truth_modal_atm_total=truth_modal_atm_total,
+                    truth_layer_modal_atm=truth_layer_modal_atm,
+                    truth_modal_residual_total=truth_modal_residual_total,
+                    truth_modal_dm_applied=truth_modal_dm_applied,
+                )
 
             # 6) Record structure function stats (cheap; no FFT)
             # (Apply discard window only to final statistics.)
@@ -1854,6 +2327,9 @@ class AOBatchRunner:
             "n_frames_used": int(n_used),
             "cancelled": bool(cancelled),
         }
+        if telem is not None:
+            out.update(telem.finalize())
+
         if psf_long_corr_tt is not None:
             out.update(
                 {

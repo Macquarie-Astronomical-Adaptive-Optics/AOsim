@@ -728,7 +728,8 @@ def run_headless_longrun(
         record_psfs, record_psfs_ttremoved, save_tt_series, psf_roi,
         chunk_frames, eval_offaxis_arcsec, write_eval_fits,
         write_eval_uncorrected_fits, eval_accumulate_uncorrected,
-        progress_every.
+        save_telemetry, telemetry_stride, telemetry_channels,
+        telemetry_max_samples, progress_every.
     """
     cfg = dict(batch_cfg or {})
     system = make_headless_system(
@@ -772,6 +773,10 @@ def run_headless_longrun(
         write_eval_fits=bool(cfg.get("write_eval_fits", True)),
         write_eval_uncorrected_fits=bool(cfg.get("write_eval_uncorrected_fits", True)),
         eval_accumulate_uncorrected=bool(cfg.get("eval_accumulate_uncorrected", True)),
+        save_telemetry=bool(cfg.get("save_telemetry", False)),
+        telemetry_stride=int(cfg.get("telemetry_stride", 1)),
+        telemetry_channels=cfg.get("telemetry_channels", None),
+        telemetry_max_samples=cfg.get("telemetry_max_samples", None),
         progress_cb=progress_cb if progress else None,
         should_stop=None,
         progress_every=int(cfg.get("progress_every", max(256, int(cfg.get("chunk_frames", 256))))),

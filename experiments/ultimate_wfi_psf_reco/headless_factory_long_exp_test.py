@@ -26,38 +26,62 @@ telemetry products, encircled-energy metrics, field-uniformity diagnostics, and
 a clearer separation between observable telemetry and simulator-truth products.
 """
 
+#from scripts.core.headless_factory import run_headless_longrun
+from pathlib import Path
+import os
+import sys
+
+# Make the script runnable directly from anywhere, e.g.
+#   python experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+#
+# File is in:
+#   AOsim/experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+# so parents[2] is the AOsim repository root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+os.chdir(REPO_ROOT)
+
 from scripts.core.headless_factory import run_headless_longrun
 
 result = run_headless_longrun(
     "config_ultimate.json",
     {
-        "n_frames": 5000,
+        "n_frames": 5000,          # 10 s at 500 Hz
         "discard_first_s": 1.0,
-        "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+        "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
         "timestamped": True,
 
-        # Do not record every on-axis PSF for this field-map test.
         "record_psfs": False,
         "record_psfs_ttremoved": False,
-        "save_tt_series": True,
+        "save_tt_series": False,
 
-        # Write long-exposure off-axis PSFs.
-        "write_eval_fits": True,
-        "write_eval_uncorrected_fits": True,
-        "eval_accumulate_uncorrected": True,
+        # Telemetry validation only: no PSF field grid for this run.
+        "write_eval_fits": False,
+        "write_eval_uncorrected_fits": False,
+        "eval_accumulate_uncorrected": False,
 
-        "eval_offaxis_arcsec": [
-            (-420, -420), (0, -420), (420, -420),
-            (-420,    0), (0,    0), (420,    0),
-            (-420,  420), (0,  420), (420,  420),
-        ],
-
-        # Important: force smaller off-axis FFT batches.
-        "chunk_frames": 4,
-
-        "psf_roi": 256,
+        "chunk_frames": 50,
+        "psf_roi": 128,
         "progress_every": 500,
         "psf_tt_mode": "none",
+
+        "save_telemetry": True,
+        "telemetry_stride": 5,
+        "telemetry_channels": [
+            "slopes_err_vec",
+            "dm_cmd",
+            "dm_cmd_new",
+            "dm_cmd_applied",
+            "xhat",
+            "tt_cmd_yx",
+            "tt_meas_yx",
+            "wfe_rms",
+            "dm_phi_rms",
+            "truth_modal_atm_total",
+            "truth_layer_modal_atm",
+            "truth_modal_residual_total",
+            "truth_modal_dm_applied",
+        ],
     },
     build_reconstructor_kwargs={
         "chunk_modes": 32,
@@ -67,3 +91,136 @@ result = run_headless_longrun(
 
 print("Run directory:", result["out_dir"])
 print("Summary JSON:", result["headless_summary_json"])
+
+
+# result = run_headless_longrun(
+#     "config_ultimate.json",
+#     {
+#         "n_frames": 200,
+#         "discard_first_s": 0.05,
+#         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
+#         "timestamped": True,
+
+#         "record_psfs": False,
+#         "record_psfs_ttremoved": False,
+#         "save_tt_series": False,
+
+#         "write_eval_fits": False,
+#         "write_eval_uncorrected_fits": False,
+#         "eval_accumulate_uncorrected": False,
+
+#         "chunk_frames": 20,
+#         "psf_roi": 128,
+#         "progress_every": 50,
+#         "psf_tt_mode": "none",
+
+#         "save_telemetry": True,
+#         "telemetry_stride": 1,
+#         "telemetry_channels": [
+#             "slopes_err_vec",
+#             "dm_cmd",
+#             "dm_cmd_new",
+#             "dm_cmd_applied",
+#             "xhat",
+#             "tt_cmd_yx",
+#             "tt_meas_yx",
+#             "wfe_rms",
+#             "dm_phi_rms",
+
+#             # Simulator-truth validation products:
+#             "truth_modal_atm_total",
+#             "truth_layer_modal_atm",
+#             "truth_modal_residual_total",
+#             "truth_modal_dm_applied",
+#         ],
+#     },
+#     build_reconstructor_kwargs={
+#         "chunk_modes": 32,
+#         "rcond": 8e-2,
+#     },
+# )
+
+
+# print("Run directory:", result["out_dir"])
+# print("Summary JSON:", result["headless_summary_json"])
+
+
+# # result = run_headless_longrun(
+# #     "config_ultimate.json",
+# #     {
+# #         "n_frames": 200,
+# #         "discard_first_s": 0.05,
+# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_smoke",
+# #         "timestamped": True,
+
+# #         "record_psfs": False,
+# #         "record_psfs_ttremoved": False,
+# #         "save_tt_series": False,
+
+# #         # Keep the telemetry smoke test minimal.
+# #         "write_eval_fits": False,
+# #         "write_eval_uncorrected_fits": False,
+# #         "eval_accumulate_uncorrected": False,
+
+# #         "chunk_frames": 20,
+# #         "psf_roi": 128,
+# #         "progress_every": 50,
+# #         "psf_tt_mode": "none",
+
+# #         "save_telemetry": True,
+# #         "telemetry_stride": 1,
+# #         "telemetry_channels": [
+# #             "slopes_err_vec",
+# #             "dm_cmd",
+# #             "xhat",
+# #             "tt_cmd_yx",
+# #             "tt_meas_yx",
+# #             "wfe_rms",
+# #             "dm_phi_rms",
+# #         ],
+# #     },
+# #     build_reconstructor_kwargs={
+# #         "chunk_modes": 32,
+# #         "rcond": 8e-2,
+# #     },
+# # )
+
+# # # result = run_headless_longrun(
+# # #     "config_ultimate.json",
+# # #     {
+# # #         "n_frames": 5000,
+# # #         "discard_first_s": 1.0,
+# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+# # #         "timestamped": True,
+
+# # #         # Do not record every on-axis PSF for this field-map test.
+# # #         "record_psfs": False,
+# # #         "record_psfs_ttremoved": False,
+# # #         "save_tt_series": True,
+
+# # #         # Write long-exposure off-axis PSFs.
+# # #         "write_eval_fits": True,
+# # #         "write_eval_uncorrected_fits": True,
+# # #         "eval_accumulate_uncorrected": True,
+
+# # #         "eval_offaxis_arcsec": [
+# # #             (-420, -420), (0, -420), (420, -420),
+# # #             (-420,    0), (0,    0), (420,    0),
+# # #             (-420,  420), (0,  420), (420,  420),
+# # #         ],
+
+# # #         # Important: force smaller off-axis FFT batches.
+# # #         "chunk_frames": 4,
+
+# # #         "psf_roi": 256,
+# # #         "progress_every": 500,
+# # #         "psf_tt_mode": "none",
+# # #     },
+# # #     build_reconstructor_kwargs={
+# # #         "chunk_modes": 32,
+# # #         "rcond": 8e-2,
+# # #     },
+# # # )
+
+# # print("Run directory:", result["out_dir"])
+# # print("Summary JSON:", result["headless_summary_json"])
