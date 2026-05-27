@@ -1,11 +1,11 @@
 {
     "telescope_diameter": 0.013,
-    "telescope_center_obscuration": 0.0001,
-    "wfs_lambda": 5e-07,
+    "telescope_center_obscuration": 0.000,
+    "wfs_lambda": 5.89e-07,
     "science_lambda": 2.15e-06,
     "actuators": 11,
     "grid_size": 512,
-    "field_padding": 4,
+    "field_padding": 8,
     "poke_amplitude": 1e-06,
     "frame_rate": 500,
     "use_gpu": true,
@@ -119,7 +119,7 @@
     },
     "turbulence": {
         "source": "file",
-        "file": "turbulence/InfVonKarman_testbench.json",
+        "file": "turbulence/brad_TB.json",
         "name": "InfVonKarman"
     }
 }

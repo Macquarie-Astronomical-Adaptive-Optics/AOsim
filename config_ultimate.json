@@ -119,7 +119,7 @@
     },
     "turbulence": {
         "source": "file",
-        "file": "turbulence/MaunaKea_good.json",
+        "file": "turbulence/MaunaKea_median.json",
         "name": "InfVonKarman"
     }
 }
