@@ -867,14 +867,14 @@ class SimWorker(QObject):
         self.R = GLAOConjugateIM_CuPy(
             sensors=wfs_list,
             conjugation_height_m=0.0,
-            dx_world_m=float(getattr(self.sim, "dx", 1.0)),
+            dx_world_m=float(getattr(self.sim, "dx", None)),
             M=self.patch_M,
             slopes_aggregation="stack",
             slope_weight_mode="pupil",
             slope_weight_threshold=0.20,
             slope_weight_power=2.0,
-            reg_alpha=1e-2,
-            reg_beta=1e-2,
+            reg_alpha=1e-5,
+            reg_beta=1e-5,
             params=self.params,
         )
 
