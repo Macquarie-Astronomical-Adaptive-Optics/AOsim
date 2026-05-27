@@ -6,6 +6,7 @@ pyqtgraph>=0.13
 
 aotools>=1.0
 astropy
+pytest
 # GPU
 # Install the CUDA-matched build for your system, e.g.:
 #   pip install cupy-cuda12x
