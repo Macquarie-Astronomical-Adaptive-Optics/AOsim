@@ -673,7 +673,7 @@ result = run_headless_longrun(
         "save_control_bundle": True,
         "control_bundle_include_matrices": True,
         "control_bundle_include_pupil": True,
-        "control_bundle_include_basis": False,
+        "control_bundle_include_basis": True,
         "control_bundle_include_gram": True,
         "control_bundle_gram_chunk_modes": 64,
 
