@@ -662,50 +662,43 @@ from scripts.core.headless_factory import run_headless_longrun
 
 result = run_headless_longrun(
     "config_ultimate.json",
-    {
-        "n_frames": 5000,          # 10 s at 500 Hz
-        "discard_first_s": 1.0,
-        
-        "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s",
-        "timestamped": True,
+    {"n_frames": 5000,
+"discard_first_s": 1.0,
+"out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
+"timestamped": True,
 
-        "record_psfs": False,
-        "record_psfs_ttremoved": False,
-        "save_tt_series": False,
+"write_eval_fits": False,
+"write_eval_uncorrected_fits": False,
+"eval_accumulate_uncorrected": False,
 
-        "write_eval_fits": True,
-        "write_eval_uncorrected_fits": True,
-        "eval_accumulate_uncorrected": True,
+"chunk_frames": 50,
+"psf_roi": 128,
+"progress_every": 500,
+"psf_tt_mode": "none",
 
-        "eval_offaxis_arcsec": [
-            (-420, -420), (0, -420), (420, -420),
-            (-420,    0), (0,    0), (420,    0),
-            (-420,  420), (0,  420), (420,  420),
-        ],
+"save_telemetry": True,
+"telemetry_stride": 1,
 
-        "chunk_frames": 4,
-        "psf_roi": 256,
+"save_control_bundle": True,
+"control_bundle_include_matrices": True,
+"control_bundle_include_pupil": True,
+"control_bundle_include_basis": False,
 
-        "progress_every": 500,
-        "psf_tt_mode": "none",
-
-        "save_telemetry": True,
-        "telemetry_stride": 5,
-        "telemetry_channels": [
-            "slopes_err_vec",
-            "dm_cmd",
-            "dm_cmd_new",
-            "dm_cmd_applied",
-            "xhat",
-            "tt_cmd_yx",
-            "tt_meas_yx",
-            "wfe_rms",
-            "dm_phi_rms",
-            "truth_modal_atm_total",
-            "truth_layer_modal_atm",
-            "truth_modal_residual_total",
-            "truth_modal_dm_applied",
-        ],
+"telemetry_channels": [
+    "slopes_err_vec",
+    "dm_cmd",
+    "dm_cmd_new",
+    "dm_cmd_applied",
+    "xhat",
+    "tt_cmd_yx",
+    "tt_meas_yx",
+    "wfe_rms",
+    "dm_phi_rms",
+    "truth_modal_atm_total",
+    "truth_layer_modal_atm",
+    "truth_modal_residual_total",
+    "truth_modal_dm_applied",
+],
     },
     build_reconstructor_kwargs={
         "chunk_modes": 32,
@@ -717,56 +710,106 @@ print("Run directory:", result["out_dir"])
 print("Summary JSON:", result["headless_summary_json"])
 
 
-# result = run_headless_longrun(
-#     "config_ultimate.json",
-#     {
-#         "n_frames": 200,
-#         "discard_first_s": 0.05,
-#         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
-#         "timestamped": True,
-
-#         "record_psfs": False,
-#         "record_psfs_ttremoved": False,
-#         "save_tt_series": False,
-
-#         "write_eval_fits": False,
-#         "write_eval_uncorrected_fits": False,
-#         "eval_accumulate_uncorrected": False,
-
-#         "chunk_frames": 20,
-#         "psf_roi": 128,
-#         "progress_every": 50,
-#         "psf_tt_mode": "none",
-
-#         "save_telemetry": True,
-#         "telemetry_stride": 1,
-#         "telemetry_channels": [
-#             "slopes_err_vec",
-#             "dm_cmd",
-#             "dm_cmd_new",
-#             "dm_cmd_applied",
-#             "xhat",
-#             "tt_cmd_yx",
-#             "tt_meas_yx",
-#             "wfe_rms",
-#             "dm_phi_rms",
-
-#             # Simulator-truth validation products:
-#             "truth_modal_atm_total",
-#             "truth_layer_modal_atm",
-#             "truth_modal_residual_total",
-#             "truth_modal_dm_applied",
-#         ],
-#     },
-#     build_reconstructor_kwargs={
-#         "chunk_modes": 32,
-#         "rcond": 8e-2,
-#     },
-# )
 
 
-# print("Run directory:", result["out_dir"])
-# print("Summary JSON:", result["headless_summary_json"])
+
+
+
+
+        
+        
+
+# "n_frames": 200,
+# "discard_first_s": 0.05,
+# "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
+# "timestamped": True,
+
+# "write_eval_fits": False,
+# "write_eval_uncorrected_fits": False,
+# "eval_accumulate_uncorrected": False,
+
+# "chunk_frames": 20,
+# "psf_roi": 128,
+# "progress_every": 50,
+# "psf_tt_mode": "none",
+
+# "save_telemetry": True,
+# "telemetry_stride": 1,
+# # Static AO control/calibration bundle for PSF-R post-processing.
+# "save_control_bundle": True,
+# "control_bundle_include_matrices": True,
+# "control_bundle_include_pupil": True,
+# "control_bundle_include_basis": False,
+
+# "telemetry_channels": [
+#     "slopes_err_vec",
+#     "dm_cmd",
+#     "dm_cmd_new",
+#     "dm_cmd_applied",
+#     "xhat",
+#     "tt_cmd_yx",
+#     "tt_meas_yx",
+#     "wfe_rms",
+#     "dm_phi_rms",
+#     "truth_modal_atm_total",
+#     "truth_layer_modal_atm",
+#     "truth_modal_residual_total",
+#     "truth_modal_dm_applied",
+# ],
+
+# # run_headless_longrun(
+# #     "config_ultimate.json",
+# #     {
+# #         "n_frames": 5000,          # 10 s at 500 Hz
+# #         "discard_first_s": 1.0,
+        
+# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s",
+# #         "timestamped": True,
+
+# #         "record_psfs": False,
+# #         "record_psfs_ttremoved": False,
+# #         "save_tt_series": False,
+
+# #         "write_eval_fits": True,
+# #         "write_eval_uncorrected_fits": True,
+# #         "eval_accumulate_uncorrected": True,
+
+# #         "eval_offaxis_arcsec": [
+# #             (-420, -420), (0, -420), (420, -420),
+# #             (-420,    0), (0,    0), (420,    0),
+# #             (-420,  420), (0,  420), (420,  420),
+# #         ],
+
+# #         "chunk_frames": 4,
+# #         "psf_roi": 256,
+
+# #         "progress_every": 500,
+# #         "psf_tt_mode": "none",
+
+# #         "save_telemetry": True,
+# #         "telemetry_stride": 5,
+# #         "telemetry_channels": [
+# #             "slopes_err_vec",
+# #             "dm_cmd",
+# #             "dm_cmd_new",
+# #             "dm_cmd_applied",
+# #             "xhat",
+# #             "tt_cmd_yx",
+# #             "tt_meas_yx",
+# #             "wfe_rms",
+# #             "dm_phi_rms",
+# #             "truth_modal_atm_total",
+# #             "truth_layer_modal_atm",
+# #             "truth_modal_residual_total",
+# #             "truth_modal_dm_applied",
+# #         ],
+# #     },
+# #     build_reconstructor_kwargs={
+# #         "chunk_modes": 32,
+# #         "rcond": 8e-2,
+# #     },
+# # )
+
 
 
 # # result = run_headless_longrun(
@@ -774,14 +817,13 @@ print("Summary JSON:", result["headless_summary_json"])
 # #     {
 # #         "n_frames": 200,
 # #         "discard_first_s": 0.05,
-# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_smoke",
+# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
 # #         "timestamped": True,
 
 # #         "record_psfs": False,
 # #         "record_psfs_ttremoved": False,
 # #         "save_tt_series": False,
 
-# #         # Keep the telemetry smoke test minimal.
 # #         "write_eval_fits": False,
 # #         "write_eval_uncorrected_fits": False,
 # #         "eval_accumulate_uncorrected": False,
@@ -796,11 +838,19 @@ print("Summary JSON:", result["headless_summary_json"])
 # #         "telemetry_channels": [
 # #             "slopes_err_vec",
 # #             "dm_cmd",
+# #             "dm_cmd_new",
+# #             "dm_cmd_applied",
 # #             "xhat",
 # #             "tt_cmd_yx",
 # #             "tt_meas_yx",
 # #             "wfe_rms",
 # #             "dm_phi_rms",
+
+# #             # Simulator-truth validation products:
+# #             "truth_modal_atm_total",
+# #             "truth_layer_modal_atm",
+# #             "truth_modal_residual_total",
+# #             "truth_modal_dm_applied",
 # #         ],
 # #     },
 # #     build_reconstructor_kwargs={
@@ -809,36 +859,44 @@ print("Summary JSON:", result["headless_summary_json"])
 # #     },
 # # )
 
+
+# # print("Run directory:", result["out_dir"])
+# # print("Summary JSON:", result["headless_summary_json"])
+
+
 # # # result = run_headless_longrun(
 # # #     "config_ultimate.json",
 # # #     {
-# # #         "n_frames": 5000,
-# # #         "discard_first_s": 1.0,
-# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+# # #         "n_frames": 200,
+# # #         "discard_first_s": 0.05,
+# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_smoke",
 # # #         "timestamped": True,
 
-# # #         # Do not record every on-axis PSF for this field-map test.
 # # #         "record_psfs": False,
 # # #         "record_psfs_ttremoved": False,
-# # #         "save_tt_series": True,
+# # #         "save_tt_series": False,
 
-# # #         # Write long-exposure off-axis PSFs.
-# # #         "write_eval_fits": True,
-# # #         "write_eval_uncorrected_fits": True,
-# # #         "eval_accumulate_uncorrected": True,
+# # #         # Keep the telemetry smoke test minimal.
+# # #         "write_eval_fits": False,
+# # #         "write_eval_uncorrected_fits": False,
+# # #         "eval_accumulate_uncorrected": False,
 
-# # #         "eval_offaxis_arcsec": [
-# # #             (-420, -420), (0, -420), (420, -420),
-# # #             (-420,    0), (0,    0), (420,    0),
-# # #             (-420,  420), (0,  420), (420,  420),
-# # #         ],
-
-# # #         # Important: force smaller off-axis FFT batches.
-# # #         "chunk_frames": 4,
-
-# # #         "psf_roi": 256,
-# # #         "progress_every": 500,
+# # #         "chunk_frames": 20,
+# # #         "psf_roi": 128,
+# # #         "progress_every": 50,
 # # #         "psf_tt_mode": "none",
+
+# # #         "save_telemetry": True,
+# # #         "telemetry_stride": 1,
+# # #         "telemetry_channels": [
+# # #             "slopes_err_vec",
+# # #             "dm_cmd",
+# # #             "xhat",
+# # #             "tt_cmd_yx",
+# # #             "tt_meas_yx",
+# # #             "wfe_rms",
+# # #             "dm_phi_rms",
+# # #         ],
 # # #     },
 # # #     build_reconstructor_kwargs={
 # # #         "chunk_modes": 32,
@@ -846,5 +904,42 @@ print("Summary JSON:", result["headless_summary_json"])
 # # #     },
 # # # )
 
-# # print("Run directory:", result["out_dir"])
-# # print("Summary JSON:", result["headless_summary_json"])
+# # # # result = run_headless_longrun(
+# # # #     "config_ultimate.json",
+# # # #     {
+# # # #         "n_frames": 5000,
+# # # #         "discard_first_s": 1.0,
+# # # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+# # # #         "timestamped": True,
+
+# # # #         # Do not record every on-axis PSF for this field-map test.
+# # # #         "record_psfs": False,
+# # # #         "record_psfs_ttremoved": False,
+# # # #         "save_tt_series": True,
+
+# # # #         # Write long-exposure off-axis PSFs.
+# # # #         "write_eval_fits": True,
+# # # #         "write_eval_uncorrected_fits": True,
+# # # #         "eval_accumulate_uncorrected": True,
+
+# # # #         "eval_offaxis_arcsec": [
+# # # #             (-420, -420), (0, -420), (420, -420),
+# # # #             (-420,    0), (0,    0), (420,    0),
+# # # #             (-420,  420), (0,  420), (420,  420),
+# # # #         ],
+
+# # # #         # Important: force smaller off-axis FFT batches.
+# # # #         "chunk_frames": 4,
+
+# # # #         "psf_roi": 256,
+# # # #         "progress_every": 500,
+# # # #         "psf_tt_mode": "none",
+# # # #     },
+# # # #     build_reconstructor_kwargs={
+# # # #         "chunk_modes": 32,
+# # # #         "rcond": 8e-2,
+# # # #     },
+# # # # )
+
+# # # print("Run directory:", result["out_dir"])
+# # # print("Summary JSON:", result["headless_summary_json"])

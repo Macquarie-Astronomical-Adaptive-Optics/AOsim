@@ -349,6 +349,203 @@ def _layer_metadata_from_sim(sim) -> Dict[str, Any]:
     }
 
 
+def _cp_to_np_optional(x, *, dtype=None):
+    """Convert a CuPy/NumPy array-like object to NumPy, or return None."""
+    if x is None:
+        return None
+    try:
+        arr = cp.asnumpy(x)
+    except Exception:
+        try:
+            arr = np.asarray(x)
+        except Exception:
+            return None
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
+
+def _add_array_if_present(arrays: Dict[str, np.ndarray], name: str, value: Any, *, dtype=None) -> None:
+    arr = _cp_to_np_optional(value, dtype=dtype)
+    if arr is not None:
+        arrays[name] = arr
+
+
+def _save_control_bundle(
+    *,
+    out_dir: str,
+    runner: "AOBatchRunner",
+    include_matrices: bool = True,
+    include_pupil: bool = True,
+    include_basis: bool = False,
+) -> Dict[str, Any]:
+    """Write the fixed AO control/calibration products needed by PSF-R.
+
+    The per-frame telemetry file records what happened during the run.  This
+    bundle records the static mapping that explains the telemetry: interaction
+    matrix, regularization/factorization state, slope weights/reference slopes,
+    slope-vector layout, guide-star geometry, actuator ordering, and optional
+    effective modal transfer matrices.
+
+    Notes
+    -----
+    ``R.A`` is the interaction matrix after slope weighting if slope weighting
+    was enabled.  ``R_slope_to_mode_raw`` maps the raw packed slope-error vector
+    used by ``TelemetryRecorder.slopes_err_vec`` to modal coefficients, including
+    the same slope weights applied at runtime.  ``T_mode_to_mode_pre_waffle`` is
+    the modal transfer operator implied by the regularized least-squares solve
+    before optional hard waffle projection.  If hard waffle removal is enabled,
+    ``T_mode_to_mode`` includes that final projection.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    R = runner.R
+    arrays: Dict[str, np.ndarray] = {}
+
+    # Geometry / basis metadata that is small and safe to save.
+    if include_pupil:
+        _add_array_if_present(arrays, "pupil", getattr(runner, "pupil", None), dtype=np.float32)
+    _add_array_if_present(arrays, "actuator_centers_rc", getattr(R, "act_centers_rc", None), dtype=np.float32)
+    _add_array_if_present(arrays, "actuator_ij", getattr(R, "_ij", None), dtype=np.int32)
+    _add_array_if_present(arrays, "layer_heights_m", getattr(R, "layer_heights_m", None), dtype=np.float32)
+    _add_array_if_present(arrays, "recon_sensor_indices", getattr(R, "recon_sensor_indices", None), dtype=np.int32)
+
+    # Slope-vector layout used by telemetry.npz.
+    _add_array_if_present(arrays, "wfs_n_active", getattr(runner, "_n_active", None), dtype=np.int32)
+    _add_array_if_present(arrays, "wfs_slices", getattr(runner, "_slices", None), dtype=np.int32)
+    _add_array_if_present(arrays, "wfs_is_lgs", getattr(runner, "_wfs_is_lgs", None), dtype=np.bool_)
+    _add_array_if_present(arrays, "wfs_wavelength_m", getattr(runner, "_wfs_wavelengths", None), dtype=np.float64)
+    try:
+        arrays["wfs_field_angle_rad"] = np.asarray(
+            [(float(getattr(s, "dx", 0.0)), float(getattr(s, "dy", 0.0))) for s in runner.wfs_list],
+            dtype=np.float64,
+        )
+        arrays["wfs_range_m"] = np.asarray(
+            [float(getattr(s, "gs_range_m", np.inf)) for s in runner.wfs_list],
+            dtype=np.float64,
+        )
+        arrays["wfs_subapertures"] = np.asarray(
+            [int(getattr(s, "n_sub", -1)) for s in runner.wfs_list],
+            dtype=np.int32,
+        )
+    except Exception:
+        pass
+
+    # Reference slopes and weights.  The packed slope vector convention is per
+    # WFS block [sx_0..sx_N, sy_0..sy_N].
+    _add_array_if_present(arrays, "reference_slopes_stack", getattr(R, "_ref_stack", None), dtype=np.float32)
+    _add_array_if_present(arrays, "reference_slopes_mean", getattr(R, "_ref_mean", None), dtype=np.float32)
+    _add_array_if_present(arrays, "slope_weight_sqrt", getattr(R, "_w_sqrt", None), dtype=np.float32)
+
+    # Reconstructor regularization/factorization diagnostics.
+    _add_array_if_present(arrays, "eigvals_all", getattr(R, "_eigvals_all", None), dtype=np.float32)
+    _add_array_if_present(arrays, "eig_keep_mask", getattr(R, "_eig_keep_mask", None), dtype=np.bool_)
+    _add_array_if_present(arrays, "eigvals_kept", getattr(R, "_eigvals_kept", None), dtype=np.float32)
+    _add_array_if_present(arrays, "eig_inv_kept", getattr(R, "_eig_inv", None), dtype=np.float32)
+    _add_array_if_present(arrays, "eig_vectors_kept", getattr(R, "_eig_V", None), dtype=np.float32)
+    _add_array_if_present(arrays, "waffle_modes", getattr(R, "_W_waffle", None), dtype=np.float32)
+    _add_array_if_present(arrays, "laplacian_G", getattr(R, "G", None), dtype=np.float32)
+    _add_array_if_present(arrays, "laplacian_G_normalized", getattr(R, "Gn", None), dtype=np.float32)
+
+    # Full matrices are bigger, but they are the most useful products for PSF-R
+    # development because they let the post-processing script build a real
+    # reliability map / effective modal transfer operator.
+    if include_matrices:
+        A = _cp_to_np_optional(getattr(R, "A", None), dtype=np.float32)
+        P = _cp_to_np_optional(getattr(R, "_P", None), dtype=np.float32)
+        V = _cp_to_np_optional(getattr(R, "_eig_V", None), dtype=np.float32)
+        w = _cp_to_np_optional(getattr(R, "_w_sqrt", None), dtype=np.float32)
+
+        if A is not None:
+            arrays["A_weighted_slopes_x_modes"] = A
+        if P is not None:
+            arrays["P_compact_weighted"] = P
+        if V is not None and P is not None:
+            R_weighted = (V @ P).astype(np.float32, copy=False)
+            arrays["R_weighted_slope_to_mode"] = R_weighted
+            if w is not None and w.ndim == 1 and w.shape[0] == R_weighted.shape[1]:
+                R_raw = (R_weighted * w[None, :]).astype(np.float32, copy=False)
+            else:
+                R_raw = R_weighted
+            arrays["R_raw_slope_to_mode"] = R_raw
+
+            if A is not None:
+                T_pre = (R_weighted @ A).astype(np.float32, copy=False)
+                arrays["T_mode_to_mode_pre_waffle"] = T_pre
+                T_post = T_pre
+                W = _cp_to_np_optional(getattr(R, "_W_waffle", None), dtype=np.float32)
+                if bool(getattr(R, "remove_waffle_in_solution", False)) and W is not None and W.size > 0:
+                    try:
+                        WT_W_inv = np.linalg.pinv(W.T @ W).astype(np.float32, copy=False)
+                        Pwaffle = (np.eye(W.shape[0], dtype=np.float32) - W @ WT_W_inv @ W.T).astype(np.float32, copy=False)
+                        arrays["P_remove_waffle"] = Pwaffle
+                        T_post = (Pwaffle @ T_pre).astype(np.float32, copy=False)
+                    except Exception:
+                        pass
+                arrays["T_mode_to_mode"] = T_post
+
+    if include_basis:
+        # Disabled by default: for large grids this can be hundreds of MB.
+        _add_array_if_present(arrays, "basis_flat_float16", getattr(R, "_basis_flat", None))
+
+    npz_path = os.path.join(out_dir, "control_bundle.npz")
+    json_path = os.path.join(out_dir, "control_bundle_summary.json")
+    np.savez_compressed(npz_path, **arrays)
+
+    summary = {
+        "control_bundle_npz": npz_path,
+        "control_bundle_summary_json": json_path,
+        "arrays": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in arrays.items()},
+        "notes": {
+            "A_weighted_slopes_x_modes": "Interaction matrix after slope weighting, if slope weighting was enabled.",
+            "R_raw_slope_to_mode": "Maps raw packed slopes_err_vec to modal coefficients, including runtime slope weights.",
+            "T_mode_to_mode": "Effective modal transfer operator implied by the regularized reconstructor; includes hard waffle projection if enabled.",
+        },
+        "reconstructor": {
+            "class": R.__class__.__name__,
+            "n_modes": int(getattr(R, "n_modes", getattr(R, "nModes", 0))),
+            "n_layers": int(getattr(R, "n_layers", getattr(R, "nL", 0))),
+            "n_basis": int(getattr(R, "n_basis", getattr(R, "nB", 0))),
+            "slopes_aggregation": str(getattr(R, "slopes_aggregation", "")),
+            "rcond": getattr(R, "_factorize_rcond", None),
+            "reg_alpha": float(getattr(R, "reg_alpha", np.nan)),
+            "reg_beta": float(getattr(R, "reg_beta", np.nan)),
+            "reg_waffle_gamma": float(getattr(R, "reg_waffle_gamma", np.nan)),
+            "remove_waffle_in_solution": bool(getattr(R, "remove_waffle_in_solution", False)),
+            "slope_weight_mode": str(getattr(R, "slope_weight_mode", "")),
+            "slope_weight_threshold": float(getattr(R, "slope_weight_threshold", np.nan)),
+            "slope_weight_power": float(getattr(R, "slope_weight_power", np.nan)),
+            "use_central_diff": bool(getattr(R, "use_central_diff", False)),
+            "poke_amp": float(getattr(R, "poke_amp", np.nan)),
+            "actuators": int(getattr(R, "actuators", 0)),
+            "M": int(getattr(R, "M", 0)),
+            "dx_world_m": float(getattr(R, "dx_world_m", np.nan)),
+            "conjugation_height_m": getattr(R, "conjugation_height_m", None),
+        },
+        "runner": {
+            "n_wfs": int(getattr(runner, "n_wfs", 0)),
+            "n_slopes": int(getattr(runner, "_slopes_total_len", 0)),
+            "gain": float(getattr(runner, "gain", np.nan)),
+            "leak": float(getattr(runner, "leak", np.nan)),
+            "dm_delay_frames": int(getattr(runner, "dm_delay_frames", 0)),
+            "tt_enabled": bool(getattr(runner, "tt_enabled", False)),
+            "tt_gain": float(getattr(runner, "tt_gain", np.nan)),
+            "tt_leak": float(getattr(runner, "tt_leak", np.nan)),
+            "tt_rate_hz": float(getattr(runner, "tt_rate_hz", np.nan)),
+            "tt_delay_frames": int(getattr(runner, "tt_delay_frames", 0)),
+            "wfs_method": str(getattr(runner, "wfs_method", "")),
+            "strip_tt_lgs": bool(getattr(runner, "strip_tt_lgs", False)),
+        },
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    return {
+        "control_bundle_npz": npz_path,
+        "control_bundle_summary_json": json_path,
+        "control_bundle_arrays_written": list(arrays.keys()),
+    }
+
+
 class TTPlaneRemover:
     """Fast masked least-squares plane (tip/tilt + piston) remover.
 
@@ -1122,6 +1319,11 @@ class AOBatchRunner:
         telemetry_stride: int = 1,
         telemetry_channels: Optional[Sequence[str]] = None,
         telemetry_max_samples: Optional[int] = None,
+        # Optional static calibration/control bundle for PSF-R post-processing.
+        save_control_bundle: bool = False,
+        control_bundle_include_matrices: bool = True,
+        control_bundle_include_pupil: bool = True,
+        control_bundle_include_basis: bool = False,
     ) -> Dict[str, object]:
         n_frames = int(n_frames)
         # Release any pooled VRAM blocks from previous runs before allocating new buffers.
@@ -1412,6 +1614,16 @@ class AOBatchRunner:
                     "dm_delay_frames": int(getattr(self, "dm_delay_frames", 1)),
                     **layer_meta,
                 },
+            )
+
+        control_bundle_result: Dict[str, Any] = {}
+        if bool(save_control_bundle):
+            control_bundle_result = _save_control_bundle(
+                out_dir=out_dir,
+                runner=self,
+                include_matrices=bool(control_bundle_include_matrices),
+                include_pupil=bool(control_bundle_include_pupil),
+                include_basis=bool(control_bundle_include_basis),
             )
 
         truth_modal_projector = None
@@ -2327,6 +2539,8 @@ class AOBatchRunner:
             "n_frames_used": int(n_used),
             "cancelled": bool(cancelled),
         }
+        if control_bundle_result:
+            out.update(control_bundle_result)
         if telem is not None:
             out.update(telem.finalize())
 

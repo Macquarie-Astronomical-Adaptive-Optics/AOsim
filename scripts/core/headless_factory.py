@@ -729,7 +729,8 @@ def run_headless_longrun(
         chunk_frames, eval_offaxis_arcsec, write_eval_fits,
         write_eval_uncorrected_fits, eval_accumulate_uncorrected,
         save_telemetry, telemetry_stride, telemetry_channels,
-        telemetry_max_samples, progress_every.
+        telemetry_max_samples, save_control_bundle,
+        control_bundle_include_matrices, progress_every.
     """
     cfg = dict(batch_cfg or {})
     system = make_headless_system(
@@ -777,6 +778,10 @@ def run_headless_longrun(
         telemetry_stride=int(cfg.get("telemetry_stride", 1)),
         telemetry_channels=cfg.get("telemetry_channels", None),
         telemetry_max_samples=cfg.get("telemetry_max_samples", None),
+        save_control_bundle=bool(cfg.get("save_control_bundle", False)),
+        control_bundle_include_matrices=bool(cfg.get("control_bundle_include_matrices", True)),
+        control_bundle_include_pupil=bool(cfg.get("control_bundle_include_pupil", True)),
+        control_bundle_include_basis=bool(cfg.get("control_bundle_include_basis", False)),
         progress_cb=progress_cb if progress else None,
         should_stop=None,
         progress_every=int(cfg.get("progress_every", max(256, int(cfg.get("chunk_frames", 256))))),

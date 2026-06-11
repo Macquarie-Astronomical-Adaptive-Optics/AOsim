@@ -457,6 +457,15 @@ class TomoOnAxisIM_CuPy:
         self._At = None
         self._P = None  # (k,n_slopes) compact runtime matrix: diag(inv_eigs) @ V^T @ A^T
 
+        # Factorization diagnostics saved by factorize().  These are useful for
+        # PSF-R / telemetry post-processing because they expose exactly which
+        # modal directions were retained, damped, or numerically discarded by the
+        # implemented controller.
+        self._factorize_rcond = None
+        self._eigvals_all = None
+        self._eig_keep_mask = None
+        self._eigvals_kept = None
+
         # science-angle projection cache
         self._Xbase = None
         self._Ybase = None
@@ -862,6 +871,15 @@ class TomoOnAxisIM_CuPy:
 
         e0 = evals[0]
         keep = evals >= (rcond * rcond * e0)
+
+        # Keep lightweight diagnostic copies before discarding the full
+        # factorization.  These arrays are small compared with the interaction
+        # matrix and are essential for reconstructing the effective modal filter
+        # used by the RTC.
+        self._factorize_rcond = float(rcond)
+        self._eigvals_all = evals.astype(cp.float32, copy=True)
+        self._eig_keep_mask = keep.astype(cp.bool_, copy=True)
+        self._eigvals_kept = evals[keep].astype(cp.float32, copy=True)
 
         self._eig_V = V[:, keep].copy()   # .copy() so V can be freed
         self._eig_inv = (1.0 / evals[keep]).astype(cp.float32)
