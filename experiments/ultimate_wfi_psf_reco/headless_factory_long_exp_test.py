@@ -1,3 +1,33 @@
+
+"""
+Headless long-exposure PSF field-map  test for ULTIMATE/WFI.
+
+This script is an early reproducibility test for moving AOsim PSF-reconstruction
+experiments away from the interactive GUI workflow and toward scripted,
+version-controlled, publication-ready runs.
+
+The GUI is useful for development and visual inspection, but PSF reconstruction
+research requires repeatable batch experiments: the same configuration, field
+points, exposure length, reconstruction settings, and output products should be
+runnable from the command line without manual GUI interaction. This script uses
+`scripts.core.headless_factory.run_headless_longrun()` to build the AO system,
+turbulence model, sensors, reconstructor, and batch runner directly from
+`config_ultimate.json`.
+
+The specific experiment here generates a 10 s delivered-PSF test over a 3x3
+grid spanning the nominal 14 arcmin x 14 arcmin WFI field. It writes long-exposure
+corrected and uncorrected off-axis PSFs, together with a JSON summary containing
+FWHM and fitted PSF diagnostics. The run uses `psf_tt_mode="none"` so that the
+reported PSFs correspond to delivered image quality, including residual image
+motion, rather than a tip/tilt-removed diagnostic PSF.
+
+This is intended as a baseline engineering/science sanity check, not yet a final
+validated ULTIMATE performance prediction. Later versions should add richer AO
+telemetry products, encircled-energy metrics, field-uniformity diagnostics, and
+a clearer separation between observable telemetry and simulator-truth products.
+"""
+
+
 """
 Headless long-exposure PSF field-map  test for ULTIMATE/WFI.
 
@@ -613,11 +643,431 @@ os.chdir(REPO_ROOT)
 
 from scripts.core.headless_factory import run_headless_longrun
 
+result = run_headless_longrun(
+    "config_ultimate.json",
+    {
+        "n_frames": 5000,          # 10 s at 500 Hz
+        "discard_first_s": 1.0,
+        "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
+        "timestamped": True,
 
-# result = run_headless_longrun(
-#     "config_ultimate.json",
+        "record_psfs": False,
+        "record_psfs_ttremoved": False,
+        "save_tt_series": False,
+
+        # Telemetry validation only: no PSF field grid for this run.
+        "write_eval_fits": False,
+        "write_eval_uncorrected_fits": False,
+        "eval_accumulate_uncorrected": False,
+
+        "chunk_frames": 50,
+        "psf_roi": 128,
+        "progress_every": 500,
+        "psf_tt_mode": "none",
+
+        "save_telemetry": True,
+        "telemetry_stride": 5,
+
+        # Static AO control/calibration bundle for PSF-R post-processing.
+        # This is written once per run next to telemetry.npz.
+        "save_control_bundle": True,
+        "control_bundle_include_matrices": True,
+        "control_bundle_include_pupil": True,
+        "control_bundle_include_basis": False,
+        "control_bundle_include_gram": True,
+        "control_bundle_gram_chunk_modes": 64,
+
+        "telemetry_channels": [
+            "slopes_err_vec",
+            "dm_cmd",
+            "dm_cmd_new",
+            "dm_cmd_applied",
+            "xhat",
+            "tt_cmd_yx",
+            "tt_meas_yx",
+            "wfe_rms",
+            "dm_phi_rms",
+            "truth_modal_atm_total",
+            "truth_layer_modal_atm",
+            "truth_modal_residual_total",
+            "truth_modal_dm_applied",
+        ],
+    },
+    build_reconstructor_kwargs={
+        "chunk_modes": 32,
+        "rcond": 8e-2,
+    },
+)
+
+print("Run directory:", result["out_dir"])
+print("Summary JSON:", result["headless_summary_json"])
+
+
+
+
+
+# """
+# Headless long-exposure PSF field-map  test for ULTIMATE/WFI.
+
+# This script is an early reproducibility test for moving AOsim PSF-reconstruction
+# experiments away from the interactive GUI workflow and toward scripted,
+# version-controlled, publication-ready runs.
+
+# The GUI is useful for development and visual inspection, but PSF reconstruction
+# research requires repeatable batch experiments: the same configuration, field
+# points, exposure length, reconstruction settings, and output products should be
+# runnable from the command line without manual GUI interaction. This script uses
+# `scripts.core.headless_factory.run_headless_longrun()` to build the AO system,
+# turbulence model, sensors, reconstructor, and batch runner directly from
+# `config_ultimate.json`.
+
+# The specific experiment here generates a 10 s delivered-PSF test over a 3x3
+# grid spanning the nominal 14 arcmin x 14 arcmin WFI field. It writes long-exposure
+# corrected and uncorrected off-axis PSFs, together with a JSON summary containing
+# FWHM and fitted PSF diagnostics. The run uses `psf_tt_mode="none"` so that the
+# reported PSFs correspond to delivered image quality, including residual image
+# motion, rather than a tip/tilt-removed diagnostic PSF.
+
+# This is intended as a baseline engineering/science sanity check, not yet a final
+# validated ULTIMATE performance prediction. Later versions should add richer AO
+# telemetry products, encircled-energy metrics, field-uniformity diagnostics, and
+# a clearer separation between observable telemetry and simulator-truth products.
+
+
+# AOsim / MAAO ULTIMATE WFI headless_factory_long_exp_test.py output reference
+# ================================================================================
+
+# Purpose
+# -------
+
+# This note summarizes the current output options for:
+
+#     experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+
+# The script is a simple, GUI independent experiment driver around:
+
+#     scripts.core.headless_factory.run_headless_longrun()
+
+# It is intended to run ULTIMATE WFI simulations from config_ultimate.json and produce
+# products useful for PSF reconstruction research.
+
+# There are two main product families:
+
+#     1. True simulated PSFs
+#        These are the validation target, or answer key, for PSF reconstruction.
+
+#     2. AO telemetry and simulator truth
+#        Observable telemetry is the input to reconstruction algorithms.
+#        Simulator truth is only used to validate and understand those algorithms.
+
+# The key distinction for PSF reconstruction is:
+
+#     reconstructed PSF  = estimated using telemetry, metadata, TIPTOP/P3, or stars
+#     true PSF           = generated by MAAO from the simulated atmosphere and AO loop
+
+# The MAAO true PSF should not be used as input to the reconstruction algorithm. It is used
+# only to measure reconstruction error.
+
+
+# Typical run location
+# --------------------
+
+# On the AAO server:
+
+#     cd ~/repos/AOsim
+#     source .venv/bin/activate
+
+# Compile check:
+
+#     python -m py_compile experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+
+# Run the script:
+
+#     python3 experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+
+
+# Core function call
+# ------------------
+
+# The script uses:
+
+#     result = run_headless_longrun(
+#         "config_ultimate.json",
+#         {
+#             ...
+#         },
+#         build_reconstructor_kwargs={
+#             "chunk_modes": 32,
+#             "rcond": 8e-2,
+#         },
+#     )
+
+# The first argument is the simulation configuration file.
+
+# The dictionary controls the long run outputs.
+
+# The build_reconstructor_kwargs control reconstructor construction.
+
+
+# Basic output location parameters
+# --------------------------------
+
+#     "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s"
+
+# Base output directory.
+
+#     "timestamped": True
+
+# Creates a unique subdirectory for each run, for example:
+
+#     experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s/longrun_YYYYMMDD_HHMMSS
+
+# Every run should produce:
+
+#     headless_summary.json
+
+# This file contains run metadata, configuration metadata, and PSF metric summaries when PSF
+# evaluation is enabled.
+
+
+# Basic simulation length parameters
+# ----------------------------------
+
+#     "n_frames": 5000
+
+# Number of simulation frames to run. With config_ultimate.json at 500 Hz, this is:
+
+#     5000 frames / 500 Hz = 10 seconds
+
+#     "discard_first_s": 1.0
+
+# Initial simulated time to discard before using outputs. This gives the AO loop time to
+# settle before accumulated PSFs or telemetry products are interpreted.
+
+#     "progress_every": 500
+
+# Print progress every N frames.
+
+
+# Runtime and memory parameters
+# -----------------------------
+
+#     "chunk_frames": 50
+
+# Number of frames grouped in some batch operations. This is suitable for telemetry truth
+# runs where off axis PSF grids are not being computed.
+
+#     "chunk_frames": 4
+
+# Safer value for off axis WFI PSF field map runs. Off axis FFT batches are GPU memory
+# heavy, so smaller chunks reduce the risk of CuPy out of memory errors.
+
+#     "psf_roi": 128
+
+# Output PSF crop size in pixels. This is fine for telemetry truth runs where the PSF image
+# is not the main product.
+
+#     "psf_roi": 256
+
+# Larger PSF crop size. This is better for field map runs and future wing, radial profile,
+# and encircled energy measurements.
+
+
+# PSF tip tilt convention
+# -----------------------
+
+#     "psf_tt_mode": "none"
+
+# Delivered science PSF. Residual image motion is included. This is usually the correct
+# choice for science facing PSF reconstruction.
+
+#     "psf_tt_mode": "fit"
+
+# Tip tilt removed diagnostic PSF. This is useful for AO diagnostics, but it is not the
+# delivered science PSF seen by WFI.
+
+# For PSF reconstruction research, the most important truth product is usually:
+
+#     corrected delivered PSF with psf_tt_mode = "none"
+
+
+# Telemetry output parameters
+# ---------------------------
+
+#     "save_telemetry": True
+
+# Save telemetry products to the run directory. The main output is usually:
+
+#     telemetry.npz
+
+# There may also be a telemetry summary JSON depending on the current runner implementation.
+
+#     "telemetry_stride": 5
+
+# Save telemetry every N simulation frames. It does not change the AO simulation. It only
+# changes how often telemetry is written.
+
+# At 500 Hz:
+
+#     telemetry_stride = 1   saves 500 telemetry samples per second
+#     telemetry_stride = 5   saves 100 telemetry samples per second
+#     telemetry_stride = 10  saves 50 telemetry samples per second
+
+# Use stride 1 for short debugging runs where timing alignment is important.
+# Use stride 5 or 10 for longer runs to reduce file size and overhead.
+
+#     "telemetry_channels": [...]
+
+# List of telemetry channels to save.
+
+# Current recommended channels:
+
+#     "telemetry_channels": [
+#         "slopes_err_vec",
+#         "dm_cmd",
+#         "dm_cmd_new",
+#         "dm_cmd_applied",
+#         "xhat",
+#         "tt_cmd_yx",
+#         "tt_meas_yx",
+#         "wfe_rms",
+#         "dm_phi_rms",
+#         "truth_modal_atm_total",
+#         "truth_layer_modal_atm",
+#         "truth_modal_residual_total",
+#         "truth_modal_dm_applied",
+#     ]
+
+
+# Telemetry channel descriptions
+# ------------------------------
+
+#     slopes_err_vec
+
+# Residual WFS slope vector. This is an observable telemetry product and is a potential
+# input to PSF reconstruction.
+
+#     dm_cmd
+
+# DM command channel retained for compatibility or comparison. Prefer dm_cmd_new and
+# dm_cmd_applied when interpreting timing.
+
+#     dm_cmd_new
+
+# Newly computed controller command at the current frame.
+
+#     dm_cmd_applied
+
+# Delayed DM command actually applied to the current frame. This is important in closed
+# loop because the applied command may lag the newly computed command by the configured
+# DM delay.
+
+#     xhat
+
+# Reconstructed modal estimate. In sanity checks, the pseudo open loop modal candidate:
+
+#     POL approx xhat minus dm_cmd_applied
+
+# correlated strongly with the ground or common atmospheric component.
+
+#     tt_cmd_yx
+
+# Tip tilt command in y,x convention.
+
+#     tt_meas_yx
+
+# Tip tilt measurement in y,x convention.
+
+#     wfe_rms
+
+# Scalar wavefront error diagnostics.
+
+#     dm_phi_rms
+
+# Scalar RMS of applied DM phase.
+
+#     truth_modal_atm_total
+
+# Simulator truth total atmospheric modal coefficients. This is validation truth, not an
+# operational reconstruction input.
+
+#     truth_layer_modal_atm
+
+# Simulator truth atmospheric modal coefficients for each atmospheric layer. This is useful
+# for ground versus free atmosphere decomposition and future frozen flow layer reconstruction
+# studies. This is validation truth, not an operational reconstruction input.
+
+#     truth_modal_residual_total
+
+# Simulator truth total residual modal coefficients after AO correction. This is validation
+# truth.
+
+#     truth_modal_dm_applied
+
+# Simulator truth applied DM modal coefficients. This is validation truth and is useful for
+# sign and delay sanity checks.
+
+
+# PSF output parameters
+# ---------------------
+
+#     "record_psfs": False
+
+# Controls recording or accumulation of on axis PSF products during the run. Usually keep
+# False for the current PSF reconstruction development runs unless explicitly debugging PSFs.
+
+#     "record_psfs_ttremoved": False
+
+# Controls recording of tip tilt removed diagnostic PSF products. Usually False.
+
+#     "save_tt_series": False
+
+# Controls saving of a separate tip tilt time series. The main tip tilt telemetry can still
+# be saved through telemetry_channels.
+
+#     "write_eval_fits": True
+
+# Write corrected long exposure PSF FITS files at requested evaluation field points.
+
+#     "write_eval_uncorrected_fits": True
+
+# Write uncorrected long exposure PSF FITS files at the same evaluation field points.
+
+#     "eval_accumulate_uncorrected": True
+
+# Accumulate the uncorrected PSF during the run. Set this True when
+# write_eval_uncorrected_fits is True.
+
+#     "eval_offaxis_arcsec": [...]
+
+# List of field positions, in arcseconds, where long exposure PSFs should be computed.
+# Example 3 by 3 grid over the nominal 14 arcmin by 14 arcmin WFI field:
+
+#     "eval_offaxis_arcsec": [
+#         (-420, -420), (0, -420), (420, -420),
+#         (-420,    0), (0,    0), (420,    0),
+#         (-420,  420), (0,  420), (420,  420),
+#     ]
+
+# This gives PSF truth at each requested field position. The corrected PSF is the simulated
+# AO delivered PSF. The uncorrected PSF is the seeing limited comparison from the same
+# atmosphere.
+
+
+# Recommended run mode 1: telemetry truth run
+# -------------------------------------------
+
+# Purpose:
+
+#     Validate telemetry products.
+#     Compare telemetry with layer truth.
+#     Test pseudo open loop sign and delay conventions.
+#     Study what the GLAO telemetry is sensitive to.
+
+# Recommended options:
+
 #     {
-#         "n_frames": 5000,          # 10 s at 500 Hz
+#         "n_frames": 5000,
 #         "discard_first_s": 1.0,
 #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
 #         "timestamped": True,
@@ -626,7 +1076,6 @@ from scripts.core.headless_factory import run_headless_longrun
 #         "record_psfs_ttremoved": False,
 #         "save_tt_series": False,
 
-#         # Telemetry validation only: no PSF field grid for this run.
 #         "write_eval_fits": False,
 #         "write_eval_uncorrected_fits": False,
 #         "eval_accumulate_uncorrected": False,
@@ -653,136 +1102,245 @@ from scripts.core.headless_factory import run_headless_longrun
 #             "truth_modal_residual_total",
 #             "truth_modal_dm_applied",
 #         ],
-#     },
-#     build_reconstructor_kwargs={
-#         "chunk_modes": 32,
-#         "rcond": 8e-2,
-#     },
-# )
+#     }
 
-result = run_headless_longrun(
-    "config_ultimate.json",
-    {"n_frames": 5000,
-"discard_first_s": 1.0,
-"out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
-"timestamped": True,
+# Expected outputs:
 
-"write_eval_fits": False,
-"write_eval_uncorrected_fits": False,
-"eval_accumulate_uncorrected": False,
+#     headless_summary.json
+#     telemetry.npz
 
-"chunk_frames": 50,
-"psf_roi": 128,
-"progress_every": 500,
-"psf_tt_mode": "none",
+# Useful plotting command:
 
-"save_telemetry": True,
-"telemetry_stride": 1,
+#     RUN_DIR=$(ls -td experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s/longrun_* | head -1)
 
-"save_control_bundle": True,
-"control_bundle_include_matrices": True,
-"control_bundle_include_pupil": True,
-"control_bundle_include_basis": False,
+#     python3 experiments/ultimate_wfi_psf_reco/plot_telemetry_npz.py \
+#         "$RUN_DIR/telemetry.npz" \
+#         --plot-level standard \
+#         --also-delay-one \
+#         --verbose
 
-"telemetry_channels": [
-    "slopes_err_vec",
-    "dm_cmd",
-    "dm_cmd_new",
-    "dm_cmd_applied",
-    "xhat",
-    "tt_cmd_yx",
-    "tt_meas_yx",
-    "wfe_rms",
-    "dm_phi_rms",
-    "truth_modal_atm_total",
-    "truth_layer_modal_atm",
-    "truth_modal_residual_total",
-    "truth_modal_dm_applied",
-],
-    },
-    build_reconstructor_kwargs={
-        "chunk_modes": 32,
-        "rcond": 8e-2,
-    },
-)
+# How this is used for PSF reconstruction:
 
-print("Run directory:", result["out_dir"])
-print("Summary JSON:", result["headless_summary_json"])
+#     This run tells us what information is present in the AO telemetry. It does not
+#     directly give a reconstructed PSF. It helps determine whether telemetry can recover
+#     the ground or common atmospheric component, how important the free atmosphere is,
+#     and what inputs a reconstruction algorithm could use.
 
 
+# Recommended run mode 2: WFI 3 by 3 PSF truth field map
+# ------------------------------------------------------
+
+# Purpose:
+
+#     Generate simulated true PSFs across the WFI field.
+#     This is the validation target for PSF reconstruction methods.
+
+# Recommended options:
+
+#     {
+#         "n_frames": 5000,
+#         "discard_first_s": 1.0,
+#         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s",
+#         "timestamped": True,
+
+#         "record_psfs": False,
+#         "record_psfs_ttremoved": False,
+#         "save_tt_series": False,
+
+#         "write_eval_fits": True,
+#         "write_eval_uncorrected_fits": True,
+#         "eval_accumulate_uncorrected": True,
+
+#         "eval_offaxis_arcsec": [
+#             (-420, -420), (0, -420), (420, -420),
+#             (-420,    0), (0,    0), (420,    0),
+#             (-420,  420), (0,  420), (420,  420),
+#         ],
+
+#         "chunk_frames": 4,
+#         "psf_roi": 256,
+#         "progress_every": 500,
+#         "psf_tt_mode": "none",
+
+#         "save_telemetry": False,
+#     }
+
+# Expected outputs:
+
+#     headless_summary.json
+#     corrected long exposure PSF FITS files
+#     uncorrected long exposure PSF FITS files
+#     offaxis_metrics in headless_summary.json
+
+# Useful plotting commands:
+
+#     RUN_DIR=$(ls -td experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s/longrun_* | head -1)
+
+#     python3 scripts/plot_fwhm_maps.py \
+#         "$RUN_DIR/headless_summary.json" \
+#         --mode corrected
+
+#     python3 scripts/plot_fwhm_vs_field.py \
+#         "$RUN_DIR/headless_summary.json" \
+#         --mode corrected
+
+# How this is used for PSF reconstruction:
+
+#     The PSF FITS files are the true simulated PSFs. A reconstruction method should
+#     produce an estimated PSF at the same field points using only operational inputs.
+#     The comparison between reconstructed PSF and true PSF gives the PSF reconstruction
+#     error.
 
 
+# Recommended run mode 3: combined field map plus telemetry
+# ---------------------------------------------------------
+
+# Purpose:
+
+#     Generate PSF truth and telemetry in the same run.
+
+# This can be useful, but it is heavier in GPU memory and disk usage. For early work,
+# separate telemetry truth runs and field map PSF truth runs are simpler.
+
+# Use the WFI field map options, but set:
+
+#     "save_telemetry": True
+#     "telemetry_stride": 5
+#     "telemetry_channels": [...]
+
+# Use chunk_frames = 4 if the off axis field grid is enabled.
 
 
+# How the outputs support PSF reconstruction
+# ------------------------------------------
+
+# The minimum PSF reconstruction validation loop is:
+
+#     1. Run MAAO field map
+#        Get true delivered PSFs at WFI field positions.
+
+#     2. Run or construct a PSF reconstruction method
+#        Inputs might include:
+#            AO telemetry
+#            observing metadata
+#            guide star geometry
+#            turbulence profile estimate
+#            TIPTOP or P3 analytical model
+#            focal plane stars
+
+#     3. Produce reconstructed PSFs at the same field positions.
+
+#     4. Compare reconstructed PSFs with MAAO true PSFs.
+
+# Useful comparison metrics:
+
+#     FWHM error
+#     EE50 error
+#     EE80 error
+#     radial profile residual
+#     PSF ellipticity error
+#     aperture correction bias
+#     compact source photometric bias
+#     galaxy morphology bias
+#     centroid or astrometric bias
+
+# Suggested first baselines:
+
+#     1. Constant PSF baseline
+#        Use the centre field true PSF everywhere. This quantifies field variation error.
+
+#     2. Tip tilt or image motion baseline
+#        Use telemetry to estimate an image motion kernel. This tests how much of the
+#        delivered PSF is explained by residual tip tilt.
+
+#     3. TIPTOP or P3 style analytical baseline
+#        Use atmospheric profile, AO parameters, guide star geometry, and telemetry where
+#        possible to predict the PSF.
+
+#     4. Hybrid baseline
+#        Use telemetry or TIPTOP/P3 for the global model, then sparse focal plane stars to
+#        correct residual model errors.
 
 
-        
-        
+# Important caution
+# -----------------
 
-# "n_frames": 200,
-# "discard_first_s": 0.05,
-# "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
-# "timestamped": True,
+# The truth channels and true PSF products are validation products. They should not be used
+# as inputs to a PSF reconstruction algorithm.
 
-# "write_eval_fits": False,
-# "write_eval_uncorrected_fits": False,
-# "eval_accumulate_uncorrected": False,
+# Operationally allowed inputs are things like:
 
-# "chunk_frames": 20,
-# "psf_roi": 128,
-# "progress_every": 50,
-# "psf_tt_mode": "none",
+#     residual WFS slopes
+#     applied DM or ASM commands
+#     reconstructed modes
+#     tip tilt telemetry
+#     observing metadata
+#     guide star geometry
+#     atmospheric profile estimates
+#     science image stars
 
-# "save_telemetry": True,
-# "telemetry_stride": 1,
-# # Static AO control/calibration bundle for PSF-R post-processing.
-# "save_control_bundle": True,
-# "control_bundle_include_matrices": True,
-# "control_bundle_include_pupil": True,
-# "control_bundle_include_basis": False,
+# Validation only products are:
 
-# "telemetry_channels": [
-#     "slopes_err_vec",
-#     "dm_cmd",
-#     "dm_cmd_new",
-#     "dm_cmd_applied",
-#     "xhat",
-#     "tt_cmd_yx",
-#     "tt_meas_yx",
-#     "wfe_rms",
-#     "dm_phi_rms",
-#     "truth_modal_atm_total",
-#     "truth_layer_modal_atm",
-#     "truth_modal_residual_total",
-#     "truth_modal_dm_applied",
-# ],
+#     truth_modal_atm_total
+#     truth_layer_modal_atm
+#     truth_modal_residual_total
+#     truth_modal_dm_applied
+#     true PSF FITS products
 
-# # run_headless_longrun(
+
+# Immediate next research step
+# ----------------------------
+
+# Before simulating a full real sky image, build a PSF comparison script that reads a
+# field map run directory and computes:
+
+#     true PSF metrics
+#     constant PSF baseline errors
+#     eventually tip tilt only errors
+#     eventually TIPTOP or P3 baseline errors
+
+# A real or simulated sky map is useful later, but the PSF level comparison should come
+# first so that PSF reconstruction errors are understood before adding source blending,
+# backgrounds, detector effects, and morphology.
+# """
+
+# #from scripts.core.headless_factory import run_headless_longrun
+# from pathlib import Path
+# import os
+# import sys
+
+# # Make the script runnable directly from anywhere, e.g.
+# #   python experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+# #
+# # File is in:
+# #   AOsim/experiments/ultimate_wfi_psf_reco/headless_factory_long_exp_test.py
+# # so parents[2] is the AOsim repository root.
+# REPO_ROOT = Path(__file__).resolve().parents[2]
+# sys.path.insert(0, str(REPO_ROOT))
+# os.chdir(REPO_ROOT)
+
+# from scripts.core.headless_factory import run_headless_longrun
+
+
+# # result = run_headless_longrun(
 # #     "config_ultimate.json",
 # #     {
 # #         "n_frames": 5000,          # 10 s at 500 Hz
 # #         "discard_first_s": 1.0,
-        
-# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s",
+# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
 # #         "timestamped": True,
 
 # #         "record_psfs": False,
 # #         "record_psfs_ttremoved": False,
 # #         "save_tt_series": False,
 
-# #         "write_eval_fits": True,
-# #         "write_eval_uncorrected_fits": True,
-# #         "eval_accumulate_uncorrected": True,
+# #         # Telemetry validation only: no PSF field grid for this run.
+# #         "write_eval_fits": False,
+# #         "write_eval_uncorrected_fits": False,
+# #         "eval_accumulate_uncorrected": False,
 
-# #         "eval_offaxis_arcsec": [
-# #             (-420, -420), (0, -420), (420, -420),
-# #             (-420,    0), (0,    0), (420,    0),
-# #             (-420,  420), (0,  420), (420,  420),
-# #         ],
-
-# #         "chunk_frames": 4,
-# #         "psf_roi": 256,
-
+# #         "chunk_frames": 50,
+# #         "psf_roi": 128,
 # #         "progress_every": 500,
 # #         "psf_tt_mode": "none",
 
@@ -810,58 +1368,156 @@ print("Summary JSON:", result["headless_summary_json"])
 # #     },
 # # )
 
+# result = run_headless_longrun(
+#     "config_ultimate.json",
+#     {"n_frames": 5000,
+# "discard_first_s": 1.0,
+# "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_10s",
+# "timestamped": True,
+
+# "write_eval_fits": False,
+# "write_eval_uncorrected_fits": False,
+# "eval_accumulate_uncorrected": False,
+
+# "chunk_frames": 50,
+# "psf_roi": 128,
+# "progress_every": 500,
+# "psf_tt_mode": "none",
+
+# "save_telemetry": True,
+# "telemetry_stride": 1,
+
+# "save_control_bundle": True,
+# "control_bundle_include_matrices": True,
+# "control_bundle_include_pupil": True,
+# "control_bundle_include_basis": False,
+
+# "telemetry_channels": [
+#     "slopes_err_vec",
+#     "dm_cmd",
+#     "dm_cmd_new",
+#     "dm_cmd_applied",
+#     "xhat",
+#     "tt_cmd_yx",
+#     "tt_meas_yx",
+#     "wfe_rms",
+#     "dm_phi_rms",
+#     "truth_modal_atm_total",
+#     "truth_layer_modal_atm",
+#     "truth_modal_residual_total",
+#     "truth_modal_dm_applied",
+# ],
+#     },
+#     build_reconstructor_kwargs={
+#         "chunk_modes": 32,
+#         "rcond": 8e-2,
+#     },
+# )
+
+# print("Run directory:", result["out_dir"])
+# print("Summary JSON:", result["headless_summary_json"])
 
 
-# # result = run_headless_longrun(
-# #     "config_ultimate.json",
-# #     {
-# #         "n_frames": 200,
-# #         "discard_first_s": 0.05,
-# #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
-# #         "timestamped": True,
-
-# #         "record_psfs": False,
-# #         "record_psfs_ttremoved": False,
-# #         "save_tt_series": False,
-
-# #         "write_eval_fits": False,
-# #         "write_eval_uncorrected_fits": False,
-# #         "eval_accumulate_uncorrected": False,
-
-# #         "chunk_frames": 20,
-# #         "psf_roi": 128,
-# #         "progress_every": 50,
-# #         "psf_tt_mode": "none",
-
-# #         "save_telemetry": True,
-# #         "telemetry_stride": 1,
-# #         "telemetry_channels": [
-# #             "slopes_err_vec",
-# #             "dm_cmd",
-# #             "dm_cmd_new",
-# #             "dm_cmd_applied",
-# #             "xhat",
-# #             "tt_cmd_yx",
-# #             "tt_meas_yx",
-# #             "wfe_rms",
-# #             "dm_phi_rms",
-
-# #             # Simulator-truth validation products:
-# #             "truth_modal_atm_total",
-# #             "truth_layer_modal_atm",
-# #             "truth_modal_residual_total",
-# #             "truth_modal_dm_applied",
-# #         ],
-# #     },
-# #     build_reconstructor_kwargs={
-# #         "chunk_modes": 32,
-# #         "rcond": 8e-2,
-# #     },
-# # )
 
 
-# # print("Run directory:", result["out_dir"])
-# # print("Summary JSON:", result["headless_summary_json"])
+
+
+
+
+        
+        
+
+# # "n_frames": 200,
+# # "discard_first_s": 0.05,
+# # "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
+# # "timestamped": True,
+
+# # "write_eval_fits": False,
+# # "write_eval_uncorrected_fits": False,
+# # "eval_accumulate_uncorrected": False,
+
+# # "chunk_frames": 20,
+# # "psf_roi": 128,
+# # "progress_every": 50,
+# # "psf_tt_mode": "none",
+
+# # "save_telemetry": True,
+# # "telemetry_stride": 1,
+# # # Static AO control/calibration bundle for PSF-R post-processing.
+# # "save_control_bundle": True,
+# # "control_bundle_include_matrices": True,
+# # "control_bundle_include_pupil": True,
+# # "control_bundle_include_basis": False,
+
+# # "telemetry_channels": [
+# #     "slopes_err_vec",
+# #     "dm_cmd",
+# #     "dm_cmd_new",
+# #     "dm_cmd_applied",
+# #     "xhat",
+# #     "tt_cmd_yx",
+# #     "tt_meas_yx",
+# #     "wfe_rms",
+# #     "dm_phi_rms",
+# #     "truth_modal_atm_total",
+# #     "truth_layer_modal_atm",
+# #     "truth_modal_residual_total",
+# #     "truth_modal_dm_applied",
+# # ],
+
+# # # run_headless_longrun(
+# # #     "config_ultimate.json",
+# # #     {
+# # #         "n_frames": 5000,          # 10 s at 500 Hz
+# # #         "discard_first_s": 1.0,
+        
+# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_fieldmap_10s",
+# # #         "timestamped": True,
+
+# # #         "record_psfs": False,
+# # #         "record_psfs_ttremoved": False,
+# # #         "save_tt_series": False,
+
+# # #         "write_eval_fits": True,
+# # #         "write_eval_uncorrected_fits": True,
+# # #         "eval_accumulate_uncorrected": True,
+
+# # #         "eval_offaxis_arcsec": [
+# # #             (-420, -420), (0, -420), (420, -420),
+# # #             (-420,    0), (0,    0), (420,    0),
+# # #             (-420,  420), (0,  420), (420,  420),
+# # #         ],
+
+# # #         "chunk_frames": 4,
+# # #         "psf_roi": 256,
+
+# # #         "progress_every": 500,
+# # #         "psf_tt_mode": "none",
+
+# # #         "save_telemetry": True,
+# # #         "telemetry_stride": 5,
+# # #         "telemetry_channels": [
+# # #             "slopes_err_vec",
+# # #             "dm_cmd",
+# # #             "dm_cmd_new",
+# # #             "dm_cmd_applied",
+# # #             "xhat",
+# # #             "tt_cmd_yx",
+# # #             "tt_meas_yx",
+# # #             "wfe_rms",
+# # #             "dm_phi_rms",
+# # #             "truth_modal_atm_total",
+# # #             "truth_layer_modal_atm",
+# # #             "truth_modal_residual_total",
+# # #             "truth_modal_dm_applied",
+# # #         ],
+# # #     },
+# # #     build_reconstructor_kwargs={
+# # #         "chunk_modes": 32,
+# # #         "rcond": 8e-2,
+# # #     },
+# # # )
+
 
 
 # # # result = run_headless_longrun(
@@ -869,14 +1525,13 @@ print("Summary JSON:", result["headless_summary_json"])
 # # #     {
 # # #         "n_frames": 200,
 # # #         "discard_first_s": 0.05,
-# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_smoke",
+# # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_truth_smoke",
 # # #         "timestamped": True,
 
 # # #         "record_psfs": False,
 # # #         "record_psfs_ttremoved": False,
 # # #         "save_tt_series": False,
 
-# # #         # Keep the telemetry smoke test minimal.
 # # #         "write_eval_fits": False,
 # # #         "write_eval_uncorrected_fits": False,
 # # #         "eval_accumulate_uncorrected": False,
@@ -891,11 +1546,19 @@ print("Summary JSON:", result["headless_summary_json"])
 # # #         "telemetry_channels": [
 # # #             "slopes_err_vec",
 # # #             "dm_cmd",
+# # #             "dm_cmd_new",
+# # #             "dm_cmd_applied",
 # # #             "xhat",
 # # #             "tt_cmd_yx",
 # # #             "tt_meas_yx",
 # # #             "wfe_rms",
 # # #             "dm_phi_rms",
+
+# # #             # Simulator-truth validation products:
+# # #             "truth_modal_atm_total",
+# # #             "truth_layer_modal_atm",
+# # #             "truth_modal_residual_total",
+# # #             "truth_modal_dm_applied",
 # # #         ],
 # # #     },
 # # #     build_reconstructor_kwargs={
@@ -904,36 +1567,44 @@ print("Summary JSON:", result["headless_summary_json"])
 # # #     },
 # # # )
 
+
+# # # print("Run directory:", result["out_dir"])
+# # # print("Summary JSON:", result["headless_summary_json"])
+
+
 # # # # result = run_headless_longrun(
 # # # #     "config_ultimate.json",
 # # # #     {
-# # # #         "n_frames": 5000,
-# # # #         "discard_first_s": 1.0,
-# # # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+# # # #         "n_frames": 200,
+# # # #         "discard_first_s": 0.05,
+# # # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/telemetry_smoke",
 # # # #         "timestamped": True,
 
-# # # #         # Do not record every on-axis PSF for this field-map test.
 # # # #         "record_psfs": False,
 # # # #         "record_psfs_ttremoved": False,
-# # # #         "save_tt_series": True,
+# # # #         "save_tt_series": False,
 
-# # # #         # Write long-exposure off-axis PSFs.
-# # # #         "write_eval_fits": True,
-# # # #         "write_eval_uncorrected_fits": True,
-# # # #         "eval_accumulate_uncorrected": True,
+# # # #         # Keep the telemetry smoke test minimal.
+# # # #         "write_eval_fits": False,
+# # # #         "write_eval_uncorrected_fits": False,
+# # # #         "eval_accumulate_uncorrected": False,
 
-# # # #         "eval_offaxis_arcsec": [
-# # # #             (-420, -420), (0, -420), (420, -420),
-# # # #             (-420,    0), (0,    0), (420,    0),
-# # # #             (-420,  420), (0,  420), (420,  420),
-# # # #         ],
-
-# # # #         # Important: force smaller off-axis FFT batches.
-# # # #         "chunk_frames": 4,
-
-# # # #         "psf_roi": 256,
-# # # #         "progress_every": 500,
+# # # #         "chunk_frames": 20,
+# # # #         "psf_roi": 128,
+# # # #         "progress_every": 50,
 # # # #         "psf_tt_mode": "none",
+
+# # # #         "save_telemetry": True,
+# # # #         "telemetry_stride": 1,
+# # # #         "telemetry_channels": [
+# # # #             "slopes_err_vec",
+# # # #             "dm_cmd",
+# # # #             "xhat",
+# # # #             "tt_cmd_yx",
+# # # #             "tt_meas_yx",
+# # # #             "wfe_rms",
+# # # #             "dm_phi_rms",
+# # # #         ],
 # # # #     },
 # # # #     build_reconstructor_kwargs={
 # # # #         "chunk_modes": 32,
@@ -941,5 +1612,42 @@ print("Summary JSON:", result["headless_summary_json"])
 # # # #     },
 # # # # )
 
-# # # print("Run directory:", result["out_dir"])
-# # # print("Summary JSON:", result["headless_summary_json"])
+# # # # # result = run_headless_longrun(
+# # # # #     "config_ultimate.json",
+# # # # #     {
+# # # # #         "n_frames": 5000,
+# # # # #         "discard_first_s": 1.0,
+# # # # #         "out_dir": "experiments/ultimate_wfi_psf_reco/outputs/wfi_3x3_10s_delivered_safe",
+# # # # #         "timestamped": True,
+
+# # # # #         # Do not record every on-axis PSF for this field-map test.
+# # # # #         "record_psfs": False,
+# # # # #         "record_psfs_ttremoved": False,
+# # # # #         "save_tt_series": True,
+
+# # # # #         # Write long-exposure off-axis PSFs.
+# # # # #         "write_eval_fits": True,
+# # # # #         "write_eval_uncorrected_fits": True,
+# # # # #         "eval_accumulate_uncorrected": True,
+
+# # # # #         "eval_offaxis_arcsec": [
+# # # # #             (-420, -420), (0, -420), (420, -420),
+# # # # #             (-420,    0), (0,    0), (420,    0),
+# # # # #             (-420,  420), (0,  420), (420,  420),
+# # # # #         ],
+
+# # # # #         # Important: force smaller off-axis FFT batches.
+# # # # #         "chunk_frames": 4,
+
+# # # # #         "psf_roi": 256,
+# # # # #         "progress_every": 500,
+# # # # #         "psf_tt_mode": "none",
+# # # # #     },
+# # # # #     build_reconstructor_kwargs={
+# # # # #         "chunk_modes": 32,
+# # # # #         "rcond": 8e-2,
+# # # # #     },
+# # # # # )
+
+# # # # print("Run directory:", result["out_dir"])
+# # # # print("Summary JSON:", result["headless_summary_json"])
